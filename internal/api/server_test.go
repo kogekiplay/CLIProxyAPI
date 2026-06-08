@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,19 @@ import (
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 
+	return newTestServerWithConfig(t, &proxyconfig.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeys: []string{"test-key"},
+		},
+		Debug:                  true,
+		LoggingToFile:          false,
+		UsageStatisticsEnabled: false,
+	}, nil)
+}
+
+func newTestServerWithConfig(t *testing.T, cfg *proxyconfig.Config, authManager *auth.Manager) *Server {
+	t.Helper()
+
 	gin.SetMode(gin.TestMode)
 
 	tmpDir := t.TempDir()
@@ -31,18 +45,18 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("failed to create auth dir: %v", err)
 	}
 
-	cfg := &proxyconfig.Config{
-		SDKConfig: sdkconfig.SDKConfig{
-			APIKeys: []string{"test-key"},
-		},
-		Port:                   0,
-		AuthDir:                authDir,
-		Debug:                  true,
-		LoggingToFile:          false,
-		UsageStatisticsEnabled: false,
+	if cfg == nil {
+		cfg = &proxyconfig.Config{}
 	}
-
-	authManager := auth.NewManager(nil, nil, nil)
+	if cfg.AuthDir == "" {
+		cfg.AuthDir = authDir
+	}
+	if cfg.SDKConfig.APIKeys == nil {
+		cfg.SDKConfig.APIKeys = []string{"test-key"}
+	}
+	if authManager == nil {
+		authManager = auth.NewManager(nil, nil, nil)
+	}
 	accessManager := sdkaccess.NewManager()
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -402,6 +416,192 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 		if !found {
 			t.Fatalf("expected hidden model %s in codex catalog", slug)
 		}
+	}
+}
+
+func TestModelsRespectAPIKeyAccessAuthFiles(t *testing.T) {
+	const (
+		scopedKey    = "scoped-models-key"
+		allowedAuth  = "scope-test-auth-allowed"
+		blockedAuth  = "scope-test-auth-blocked"
+		visibleModel = "scope-test-gpt-5.3-visible"
+		hiddenModel  = "scope-test-gpt-5.5-hidden"
+	)
+
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(allowedAuth, "openai", []*registry.ModelInfo{{
+		ID:      visibleModel,
+		Object:  "model",
+		OwnedBy: "test",
+		Type:    "openai",
+	}})
+	modelRegistry.RegisterClient(blockedAuth, "openai", []*registry.ModelInfo{{
+		ID:      hiddenModel,
+		Object:  "model",
+		OwnedBy: "test",
+		Type:    "openai",
+	}})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(allowedAuth)
+		modelRegistry.UnregisterClient(blockedAuth)
+	})
+
+	authManager := auth.NewManager(nil, nil, nil)
+	if _, err := authManager.Register(context.Background(), &auth.Auth{
+		ID:       allowedAuth,
+		Provider: "openai",
+		FileName: allowedAuth + ".json",
+	}); err != nil {
+		t.Fatalf("register allowed auth: %v", err)
+	}
+	if _, err := authManager.Register(context.Background(), &auth.Auth{
+		ID:       blockedAuth,
+		Provider: "openai",
+		FileName: blockedAuth + ".json",
+	}); err != nil {
+		t.Fatalf("register blocked auth: %v", err)
+	}
+
+	server := newTestServerWithConfig(t, &proxyconfig.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeys: []string{scopedKey},
+			APIKeyAccess: map[string]proxyconfig.APIKeyAccessRule{
+				scopedKey: {AuthFiles: []string{allowedAuth + ".json"}},
+			},
+		},
+		Debug:                  true,
+		LoggingToFile:          false,
+		UsageStatisticsEnabled: false,
+	}, authManager)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+scopedKey)
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v body=%s", err, rr.Body.String())
+	}
+
+	assertModelListed(t, resp.Data, visibleModel, true)
+	assertModelListed(t, resp.Data, hiddenModel, false)
+}
+
+func TestCodexClientVersionModelsRespectAPIKeyAccessAuthFiles(t *testing.T) {
+	const (
+		scopedKey    = "scoped-codex-models-key"
+		allowedAuth  = "scope-test-codex-auth-allowed"
+		blockedAuth  = "scope-test-codex-auth-blocked"
+		visibleModel = "scope-test-codex-gpt-5.3-visible"
+		hiddenModel  = "scope-test-codex-gpt-5.5-hidden"
+	)
+
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient(allowedAuth, "openai", []*registry.ModelInfo{{
+		ID:          visibleModel,
+		Object:      "model",
+		OwnedBy:     "test",
+		Type:        "openai",
+		DisplayName: "Visible Scoped Codex Model",
+	}})
+	modelRegistry.RegisterClient(blockedAuth, "openai", []*registry.ModelInfo{{
+		ID:          hiddenModel,
+		Object:      "model",
+		OwnedBy:     "test",
+		Type:        "openai",
+		DisplayName: "Hidden Scoped Codex Model",
+	}})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(allowedAuth)
+		modelRegistry.UnregisterClient(blockedAuth)
+	})
+
+	authManager := auth.NewManager(nil, nil, nil)
+	if _, err := authManager.Register(context.Background(), &auth.Auth{
+		ID:       allowedAuth,
+		Provider: "openai",
+		FileName: allowedAuth + ".json",
+	}); err != nil {
+		t.Fatalf("register allowed auth: %v", err)
+	}
+	if _, err := authManager.Register(context.Background(), &auth.Auth{
+		ID:       blockedAuth,
+		Provider: "openai",
+		FileName: blockedAuth + ".json",
+	}); err != nil {
+		t.Fatalf("register blocked auth: %v", err)
+	}
+
+	server := newTestServerWithConfig(t, &proxyconfig.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeys: []string{scopedKey},
+			APIKeyAccess: map[string]proxyconfig.APIKeyAccessRule{
+				scopedKey: {AuthFiles: []string{allowedAuth + ".json"}},
+			},
+		},
+		Debug:                  true,
+		LoggingToFile:          false,
+		UsageStatisticsEnabled: false,
+	}, authManager)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version", nil)
+	req.Header.Set("Authorization", "Bearer "+scopedKey)
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var resp struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v body=%s", err, rr.Body.String())
+	}
+
+	assertCodexModelListed(t, resp.Models, visibleModel, true)
+	assertCodexModelListed(t, resp.Models, hiddenModel, false)
+}
+
+func assertModelListed(t *testing.T, models []map[string]any, id string, want bool) {
+	t.Helper()
+
+	for _, model := range models {
+		if got, _ := model["id"].(string); got == id {
+			if !want {
+				t.Fatalf("model %q was listed but should be hidden", id)
+			}
+			return
+		}
+	}
+	if want {
+		t.Fatalf("model %q was not listed", id)
+	}
+}
+
+func assertCodexModelListed(t *testing.T, models []map[string]any, slug string, want bool) {
+	t.Helper()
+
+	for _, model := range models {
+		if got, _ := model["slug"].(string); got == slug {
+			if !want {
+				t.Fatalf("codex model %q was listed but should be hidden", slug)
+			}
+			return
+		}
+	}
+	if want {
+		t.Fatalf("codex model %q was not listed", slug)
 	}
 }
 

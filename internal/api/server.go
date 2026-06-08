@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -304,6 +305,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
+		authManager.SetConfig(cfg)
+		authManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
 	managementasset.SetCurrentConfig(cfg)
@@ -959,6 +962,10 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 				s.handleHomeCodexClientModels(c)
 				return
 			}
+			if models, scoped := s.scopedModelsForRequest(c, "openai"); scoped {
+				c.JSON(http.StatusOK, openai.CodexClientModelsResponse(models))
+				return
+			}
 			openaiHandler.OpenAIModels(c)
 			return
 		}
@@ -973,9 +980,17 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 		// Route to Claude handler if User-Agent starts with "claude-cli"
 		if strings.HasPrefix(userAgent, "claude-cli") {
 			// log.Debugf("Routing /v1/models to Claude handler for User-Agent: %s", userAgent)
+			if models, scoped := s.scopedModelsForRequest(c, "claude"); scoped {
+				writeClaudeModels(c, models)
+				return
+			}
 			claudeHandler.ClaudeModels(c)
 		} else {
 			// log.Debugf("Routing /v1/models to OpenAI handler for User-Agent: %s", userAgent)
+			if models, scoped := s.scopedModelsForRequest(c, "openai"); scoped {
+				writeOpenAIModels(c, models)
+				return
+			}
 			openaiHandler.OpenAIModels(c)
 		}
 	}
@@ -1016,6 +1031,10 @@ func (s *Server) geminiModelsHandler(geminiHandler *gemini.GeminiAPIHandler) gin
 			return
 		}
 
+		if models, scoped := s.scopedModelsForRequest(c, "gemini"); scoped {
+			writeGeminiModels(c, models)
+			return
+		}
 		geminiHandler.GeminiModels(c)
 	}
 }
@@ -1029,6 +1048,104 @@ func (s *Server) geminiGetHandler(geminiHandler *gemini.GeminiAPIHandler) gin.Ha
 
 		geminiHandler.GeminiGetHandler(c)
 	}
+}
+
+func (s *Server) scopedModelsForRequest(c *gin.Context, handlerType string) ([]map[string]any, bool) {
+	if s == nil || s.handlers == nil || s.handlers.AuthManager == nil {
+		return nil, false
+	}
+
+	auths, restricted := s.handlers.AuthManager.AllowedAuthsForContext(ginContextForScope(c))
+	if !restricted {
+		return nil, false
+	}
+	clientIDs := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		clientIDs = append(clientIDs, auth.ID)
+	}
+	return registry.GetGlobalRegistry().GetAvailableModelsForClients(handlerType, clientIDs), true
+}
+
+func ginContextForScope(c *gin.Context) context.Context {
+	ctx := context.Background()
+	if c != nil && c.Request != nil && c.Request.Context() != nil {
+		ctx = c.Request.Context()
+	}
+	return context.WithValue(ctx, "gin", c)
+}
+
+func writeOpenAIModels(c *gin.Context, allModels []map[string]any) {
+	filteredModels := make([]map[string]any, len(allModels))
+	for i, model := range allModels {
+		filteredModel := map[string]any{
+			"id":     model["id"],
+			"object": model["object"],
+		}
+		if created, exists := model["created"]; exists {
+			filteredModel["created"] = created
+		}
+		if ownedBy, exists := model["owned_by"]; exists {
+			filteredModel["owned_by"] = ownedBy
+		}
+		filteredModels[i] = filteredModel
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"object": "list",
+		"data":   filteredModels,
+	})
+}
+
+func writeClaudeModels(c *gin.Context, models []map[string]any) {
+	firstID := ""
+	lastID := ""
+	if len(models) > 0 {
+		if id, ok := models[0]["id"].(string); ok {
+			firstID = id
+		}
+		if id, ok := models[len(models)-1]["id"].(string); ok {
+			lastID = id
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":     models,
+		"has_more": false,
+		"first_id": firstID,
+		"last_id":  lastID,
+	})
+}
+
+func writeGeminiModels(c *gin.Context, rawModels []map[string]any) {
+	normalizedModels := make([]map[string]any, 0, len(rawModels))
+	defaultMethods := []string{"generateContent"}
+	for _, model := range rawModels {
+		normalizedModel := make(map[string]any, len(model))
+		for k, v := range model {
+			normalizedModel[k] = v
+		}
+		if name, ok := normalizedModel["name"].(string); ok && name != "" {
+			if !strings.HasPrefix(name, "models/") {
+				normalizedModel["name"] = "models/" + name
+			}
+			if displayName, _ := normalizedModel["displayName"].(string); displayName == "" {
+				normalizedModel["displayName"] = name
+			}
+			if description, _ := normalizedModel["description"].(string); description == "" {
+				normalizedModel["description"] = name
+			}
+		}
+		if _, ok := normalizedModel["supportedGenerationMethods"]; !ok {
+			normalizedModel["supportedGenerationMethods"] = defaultMethods
+		}
+		normalizedModels = append(normalizedModels, normalizedModel)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"models": normalizedModels,
+	})
 }
 
 type homeModelEntry struct {
@@ -1514,6 +1631,8 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	applySignatureCacheConfig(oldCfg, cfg)
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
+		s.handlers.AuthManager.SetConfig(cfg)
+		s.handlers.AuthManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
 
