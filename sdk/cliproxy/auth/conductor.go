@@ -3270,7 +3270,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			if candidate == nil || candidate.Provider != provider || candidate.Disabled {
 				continue
 			}
-			if !scope.allows(candidate) {
+			if !scope.allowsCachedAuthID(candidate) {
 				continue
 			}
 			if _, used := tried[candidate.ID]; used {
@@ -3294,14 +3294,14 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			errPick  error
 		)
 		if scope.restricted {
-			selected, errPick = m.scheduler.pickSingleScoped(ctx, provider, model, opts, tried, scope.allows)
+			selected, errPick = m.scheduler.pickSingleScoped(ctx, provider, model, opts, tried, scope.allowsCachedAuthID)
 		} else {
 			selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 		}
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 			m.syncScheduler()
 			if scope.restricted {
-				selected, errPick = m.scheduler.pickSingleScoped(ctx, provider, model, opts, tried, scope.allows)
+				selected, errPick = m.scheduler.pickSingleScoped(ctx, provider, model, opts, tried, scope.allowsCachedAuthID)
 			} else {
 				selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 			}
@@ -3480,7 +3480,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			if candidate == nil || candidate.Disabled {
 				continue
 			}
-			if !scope.allows(candidate) {
+			if !scope.allowsCachedAuthID(candidate) {
 				continue
 			}
 			if _, ok := providerSet[strings.TrimSpace(strings.ToLower(candidate.Provider))]; !ok {
@@ -3505,14 +3505,14 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			errPick     error
 		)
 		if scope.restricted {
-			selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, scope.allows)
+			selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, scope.allowsCachedAuthID)
 		} else {
 			selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, nil)
 		}
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 			m.syncScheduler()
 			if scope.restricted {
-				selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, scope.allows)
+				selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, scope.allowsCachedAuthID)
 			} else {
 				selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, nil)
 			}
