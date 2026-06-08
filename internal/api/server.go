@@ -1055,16 +1055,9 @@ func (s *Server) scopedModelsForRequest(c *gin.Context, handlerType string) ([]m
 		return nil, false
 	}
 
-	auths, restricted := s.handlers.AuthManager.AllowedAuthsForContext(ginContextForScope(c))
+	clientIDs, restricted := s.handlers.AuthManager.AllowedAuthIDsForContext(ginContextForScope(c))
 	if !restricted {
 		return nil, false
-	}
-	clientIDs := make([]string, 0, len(auths))
-	for _, auth := range auths {
-		if auth == nil || strings.TrimSpace(auth.ID) == "" {
-			continue
-		}
-		clientIDs = append(clientIDs, auth.ID)
 	}
 	return registry.GetGlobalRegistry().GetAvailableModelsForClients(handlerType, clientIDs), true
 }

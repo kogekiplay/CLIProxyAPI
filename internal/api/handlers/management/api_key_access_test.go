@@ -157,6 +157,64 @@ func TestPutPatchDeleteAPIKeyAccess_NormalizesRules(t *testing.T) {
 	}
 }
 
+func TestPatchAPIKeyAccessUpdatesAuthManagerRuntimeConfig(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "auth-a",
+		Provider: "gemini",
+		FileName: "auth-a.json",
+	}); err != nil {
+		t.Fatalf("register auth-a: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "auth-b",
+		Provider: "gemini",
+		FileName: "auth-b.json",
+	}); err != nil {
+		t.Fatalf("register auth-b: %v", err)
+	}
+	manager.SetConfig(&config.Config{})
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				APIKeys: []string{"key-1"},
+			},
+		},
+		configFilePath: writeTestConfigFile(t),
+		authManager:    manager,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/api-key-access", bytes.NewBufferString(`{
+		"key": "key-1",
+		"rule": {
+			"auth-files": ["auth-a.json"]
+		}
+	}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchAPIKeyAccess(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	checkRecorder := httptest.NewRecorder()
+	checkCtx, _ := gin.CreateTestContext(checkRecorder)
+	checkCtx.Set("userApiKey", "key-1")
+	ids, restricted := manager.AllowedAuthIDsForContext(context.WithValue(context.Background(), "gin", checkCtx))
+	if !restricted {
+		t.Fatalf("runtime access scope is unrestricted after management patch")
+	}
+	if got, want := strings.Join(ids, ","), "auth-a"; got != want {
+		t.Fatalf("runtime scoped auth ids = %q, want %q", got, want)
+	}
+}
+
 func TestGetAPIKeyAccessAuthTargets_DoNotLeakUpstreamAPIKeys(t *testing.T) {
 	t.Parallel()
 

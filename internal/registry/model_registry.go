@@ -126,6 +126,8 @@ type ModelRegistry struct {
 	mutex *sync.RWMutex
 	// availableModelsCache stores per-handler snapshots for GetAvailableModels.
 	availableModelsCache map[string]availableModelsCacheEntry
+	// scopedAvailableModelsCache stores per-handler/per-client-set snapshots for restricted API keys.
+	scopedAvailableModelsCache map[string]availableModelsCacheEntry
 	// hook is an optional callback sink for model registration changes
 	hook ModelRegistryHook
 }
@@ -138,12 +140,13 @@ var registryOnce sync.Once
 func GetGlobalRegistry() *ModelRegistry {
 	registryOnce.Do(func() {
 		globalRegistry = &ModelRegistry{
-			models:               make(map[string]*ModelRegistration),
-			clientModels:         make(map[string][]string),
-			clientModelInfos:     make(map[string]map[string]*ModelInfo),
-			clientProviders:      make(map[string]string),
-			availableModelsCache: make(map[string]availableModelsCacheEntry),
-			mutex:                &sync.RWMutex{},
+			models:                     make(map[string]*ModelRegistration),
+			clientModels:               make(map[string][]string),
+			clientModelInfos:           make(map[string]map[string]*ModelInfo),
+			clientProviders:            make(map[string]string),
+			availableModelsCache:       make(map[string]availableModelsCacheEntry),
+			scopedAvailableModelsCache: make(map[string]availableModelsCacheEntry),
+			mutex:                      &sync.RWMutex{},
 		}
 	})
 	return globalRegistry
@@ -152,13 +155,18 @@ func (r *ModelRegistry) ensureAvailableModelsCacheLocked() {
 	if r.availableModelsCache == nil {
 		r.availableModelsCache = make(map[string]availableModelsCacheEntry)
 	}
+	if r.scopedAvailableModelsCache == nil {
+		r.scopedAvailableModelsCache = make(map[string]availableModelsCacheEntry)
+	}
 }
 
 func (r *ModelRegistry) invalidateAvailableModelsCacheLocked() {
-	if len(r.availableModelsCache) == 0 {
-		return
+	if len(r.availableModelsCache) > 0 {
+		clear(r.availableModelsCache)
 	}
-	clear(r.availableModelsCache)
+	if len(r.scopedAvailableModelsCache) > 0 {
+		clear(r.scopedAvailableModelsCache)
+	}
 }
 
 // LookupModelInfo searches dynamic registry (provider-specific > global) then static definitions.
@@ -790,24 +798,54 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 // It applies the same quota and suspension visibility semantics as GetAvailableModels,
 // but only considers the supplied clients.
 func (r *ModelRegistry) GetAvailableModelsForClients(handlerType string, clientIDs []string) []map[string]any {
-	clientSet := stringSet(clientIDs)
-	if len(clientSet) == 0 {
+	cacheKey, orderedClientIDs := scopedAvailableModelsCacheKey(handlerType, clientIDs)
+	if cacheKey == "" {
 		return nil
 	}
 
 	now := time.Now()
 
 	r.mutex.RLock()
-	defer r.mutex.RUnlock()
+	if cache, ok := r.scopedAvailableModelsCache[cacheKey]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
+		models := cloneModelMaps(cache.models)
+		r.mutex.RUnlock()
+		return models
+	}
+	r.mutex.RUnlock()
 
-	modelClients := make(map[string]map[string]struct{})
-	modelInfos := make(map[string]*ModelInfo)
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.ensureAvailableModelsCacheLocked()
 
+	if cache, ok := r.scopedAvailableModelsCache[cacheKey]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
+		return cloneModelMaps(cache.models)
+	}
+
+	models, expiresAt := r.buildAvailableModelsForClientsLocked(handlerType, orderedClientIDs, now)
+	r.scopedAvailableModelsCache[cacheKey] = availableModelsCacheEntry{
+		models:    cloneModelMaps(models),
+		expiresAt: expiresAt,
+	}
+
+	return models
+}
+
+func scopedAvailableModelsCacheKey(handlerType string, clientIDs []string) (string, []string) {
+	clientSet := stringSet(clientIDs)
+	if len(clientSet) == 0 {
+		return "", nil
+	}
 	orderedClientIDs := make([]string, 0, len(clientSet))
 	for clientID := range clientSet {
 		orderedClientIDs = append(orderedClientIDs, clientID)
 	}
 	sort.Strings(orderedClientIDs)
+	return strings.TrimSpace(handlerType) + "\x00" + strings.Join(orderedClientIDs, "\x00"), orderedClientIDs
+}
+
+func (r *ModelRegistry) buildAvailableModelsForClientsLocked(handlerType string, orderedClientIDs []string, now time.Time) ([]map[string]any, time.Time) {
+	modelClients := make(map[string]map[string]struct{})
+	modelInfos := make(map[string]*ModelInfo)
 
 	for _, clientID := range orderedClientIDs {
 		modelIDs := r.clientModels[clientID]
@@ -840,7 +878,7 @@ func (r *ModelRegistry) GetAvailableModelsForClients(handlerType string, clientI
 	}
 
 	if len(modelClients) == 0 {
-		return nil
+		return nil, time.Time{}
 	}
 
 	modelIDs := make([]string, 0, len(modelClients))
@@ -850,6 +888,7 @@ func (r *ModelRegistry) GetAvailableModelsForClients(handlerType string, clientI
 	sort.Strings(modelIDs)
 
 	models := make([]map[string]any, 0, len(modelIDs))
+	var expiresAt time.Time
 	for _, modelID := range modelIDs {
 		clients := modelClients[modelID]
 		if len(clients) == 0 {
@@ -863,8 +902,12 @@ func (r *ModelRegistry) GetAvailableModelsForClients(handlerType string, clientI
 		if registration != nil {
 			for clientID := range clients {
 				if quotaTime := registration.QuotaExceededClients[clientID]; quotaTime != nil {
-					if now.Before(quotaTime.Add(modelQuotaExceededWindow)) {
+					recoveryAt := quotaTime.Add(modelQuotaExceededWindow)
+					if now.Before(recoveryAt) {
 						expiredClients++
+						if expiresAt.IsZero() || recoveryAt.Before(expiresAt) {
+							expiresAt = recoveryAt
+						}
 					}
 				}
 				if registration.SuspendedClients != nil {
@@ -898,7 +941,7 @@ func (r *ModelRegistry) GetAvailableModelsForClients(handlerType string, clientI
 		}
 	}
 
-	return models
+	return models, expiresAt
 }
 
 func stringSet(values []string) map[string]struct{} {

@@ -311,6 +311,9 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
+	if h.authManager != nil {
+		h.authManager.SetConfig(h.cfg)
+	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	return true
 }

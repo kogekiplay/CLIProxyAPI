@@ -16,6 +16,8 @@ type apiKeyAccessScope struct {
 	authFiles       map[string]struct{}
 }
 
+type apiKeyAccessScopeTable map[string]apiKeyAccessScope
+
 func (m *Manager) apiKeyAccessScopeForContext(ctx context.Context) apiKeyAccessScope {
 	if m == nil {
 		return apiKeyAccessScope{}
@@ -24,26 +26,48 @@ func (m *Manager) apiKeyAccessScopeForContext(ctx context.Context) apiKeyAccessS
 	if clientKey == "" {
 		return apiKeyAccessScope{}
 	}
-	rawCfg := m.runtimeConfig.Load()
-	cfg, _ := rawCfg.(*internalconfig.Config)
-	if cfg == nil || len(cfg.APIKeyAccess) == 0 {
+	table, _ := m.apiKeyAccessScopes.Load().(apiKeyAccessScopeTable)
+	if len(table) == 0 {
 		return apiKeyAccessScope{}
 	}
-	rule, ok := cfg.APIKeyAccess[clientKey]
+	scope, ok := table[clientKey]
 	if !ok {
 		return apiKeyAccessScope{}
 	}
-	rule = internalconfig.NormalizeAPIKeyAccessRule(rule)
-	if strings.EqualFold(rule.Access, internalconfig.APIKeyAccessAll) {
-		return apiKeyAccessScope{}
-	}
-	scope := apiKeyAccessScope{
-		restricted:      true,
-		providers:       stringSet(rule.Providers, true),
-		providerTargets: providerTargetSet(rule.ProviderTargets),
-		authFiles:       stringSet(rule.AuthFiles, false),
-	}
 	return scope
+}
+
+func (m *Manager) rebuildAPIKeyAccessScopesFromRuntimeConfig() {
+	if m == nil {
+		return
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || len(cfg.APIKeyAccess) == 0 {
+		m.apiKeyAccessScopes.Store(apiKeyAccessScopeTable(nil))
+		return
+	}
+	table := make(apiKeyAccessScopeTable, len(cfg.APIKeyAccess))
+	for rawKey, rawRule := range cfg.APIKeyAccess {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			continue
+		}
+		rule := internalconfig.NormalizeAPIKeyAccessRule(rawRule)
+		if strings.EqualFold(rule.Access, internalconfig.APIKeyAccessAll) {
+			continue
+		}
+		table[key] = apiKeyAccessScope{
+			restricted:      true,
+			providers:       stringSet(rule.Providers, true),
+			providerTargets: providerTargetSet(rule.ProviderTargets),
+			authFiles:       stringSet(rule.AuthFiles, false),
+		}
+	}
+	if len(table) == 0 {
+		m.apiKeyAccessScopes.Store(apiKeyAccessScopeTable(nil))
+		return
+	}
+	m.apiKeyAccessScopes.Store(table)
 }
 
 // AllowedAuthsForContext returns auth entries visible to the client API key in ctx.
@@ -71,6 +95,35 @@ func (m *Manager) AllowedAuthsForContext(ctx context.Context) ([]*Auth, bool) {
 		return auths[i].ID < auths[j].ID
 	})
 	return auths, true
+}
+
+// AllowedAuthIDsForContext returns IDs for auth entries visible to the client API key in ctx.
+// The boolean return is true only when the key has an explicit restricted rule.
+func (m *Manager) AllowedAuthIDsForContext(ctx context.Context) ([]string, bool) {
+	scope := m.apiKeyAccessScopeForContext(ctx)
+	if !scope.restricted {
+		return nil, false
+	}
+	if m == nil {
+		return nil, true
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	ids := make([]string, 0, len(m.auths))
+	for _, candidate := range m.auths {
+		if !scope.allows(candidate) {
+			continue
+		}
+		id := strings.TrimSpace(candidate.ID)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, true
 }
 
 func clientAPIKeyFromContext(ctx context.Context) string {
@@ -185,20 +238,23 @@ func (s apiKeyAccessScope) matchesAuthFile(auth *Auth) bool {
 	if auth == nil || len(s.authFiles) == 0 {
 		return false
 	}
-	candidates := []string{
-		strings.TrimSpace(auth.ID),
-		strings.TrimSpace(auth.FileName),
-		filepath.Base(strings.TrimSpace(auth.FileName)),
+	if s.matchesAuthFileCandidate(auth.ID) {
+		return true
 	}
-	for _, candidate := range candidates {
-		if candidate == "" || candidate == "." {
-			continue
-		}
-		if _, ok := s.authFiles[candidate]; ok {
-			return true
-		}
+	fileName := strings.TrimSpace(auth.FileName)
+	if s.matchesAuthFileCandidate(fileName) {
+		return true
 	}
-	return false
+	return s.matchesAuthFileCandidate(filepath.Base(fileName))
+}
+
+func (s apiKeyAccessScope) matchesAuthFileCandidate(candidate string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || candidate == "." {
+		return false
+	}
+	_, ok := s.authFiles[candidate]
+	return ok
 }
 
 func apiKeyAccessDeniedError() *Error {

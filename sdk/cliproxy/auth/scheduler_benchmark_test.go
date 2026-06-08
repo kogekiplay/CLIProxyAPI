@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -157,6 +158,58 @@ func BenchmarkManagerPickNextPriority1000(b *testing.B) {
 	}
 }
 
+func BenchmarkManagerPickNextScopedProvider1000(b *testing.B) {
+	manager, _, model := benchmarkManagerSetup(b, 1000, false, false)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"bench-key": {Providers: []string{"gemini"}},
+			},
+		},
+	})
+	ctx := contextWithUserAPIKey("bench-key")
+	opts := cliproxyexecutor.Options{}
+	tried := map[string]struct{}{}
+	if _, _, errWarm := manager.pickNext(ctx, "gemini", model, opts, tried); errWarm != nil {
+		b.Fatalf("warmup pickNext error = %v", errWarm)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		auth, exec, errPick := manager.pickNext(ctx, "gemini", model, opts, tried)
+		if errPick != nil || auth == nil || exec == nil {
+			b.Fatalf("pickNext failed: auth=%v exec=%v err=%v", auth, exec, errPick)
+		}
+	}
+}
+
+func BenchmarkManagerPickNextScopedSingleAuthFile1000(b *testing.B) {
+	manager, _, model := benchmarkManagerSetup(b, 1000, false, false)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"bench-key": {AuthFiles: []string{"bench-gemini-0500"}},
+			},
+		},
+	})
+	ctx := contextWithUserAPIKey("bench-key")
+	opts := cliproxyexecutor.Options{}
+	tried := map[string]struct{}{}
+	if _, _, errWarm := manager.pickNext(ctx, "gemini", model, opts, tried); errWarm != nil {
+		b.Fatalf("warmup pickNext error = %v", errWarm)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		auth, exec, errPick := manager.pickNext(ctx, "gemini", model, opts, tried)
+		if errPick != nil || auth == nil || exec == nil {
+			b.Fatalf("pickNext failed: auth=%v exec=%v err=%v", auth, exec, errPick)
+		}
+	}
+}
+
 func BenchmarkManagerPickNextMixed500(b *testing.B) {
 	manager, providers, model := benchmarkManagerSetup(b, 500, true, false)
 	ctx := context.Background()
@@ -179,6 +232,32 @@ func BenchmarkManagerPickNextMixed500(b *testing.B) {
 func BenchmarkManagerPickNextMixedPriority500(b *testing.B) {
 	manager, providers, model := benchmarkManagerSetup(b, 500, true, true)
 	ctx := context.Background()
+	opts := cliproxyexecutor.Options{}
+	tried := map[string]struct{}{}
+	if _, _, _, errWarm := manager.pickNextMixed(ctx, providers, model, opts, tried); errWarm != nil {
+		b.Fatalf("warmup pickNextMixed error = %v", errWarm)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		auth, exec, provider, errPick := manager.pickNextMixed(ctx, providers, model, opts, tried)
+		if errPick != nil || auth == nil || exec == nil || provider == "" {
+			b.Fatalf("pickNextMixed failed: auth=%v exec=%v provider=%q err=%v", auth, exec, provider, errPick)
+		}
+	}
+}
+
+func BenchmarkManagerPickNextMixedScopedProvider500(b *testing.B) {
+	manager, providers, model := benchmarkManagerSetup(b, 500, true, false)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"bench-key": {Providers: []string{"gemini", "claude"}},
+			},
+		},
+	})
+	ctx := contextWithUserAPIKey("bench-key")
 	opts := cliproxyexecutor.Options{}
 	tried := map[string]struct{}{}
 	if _, _, _, errWarm := manager.pickNextMixed(ctx, providers, model, opts, tried); errWarm != nil {
