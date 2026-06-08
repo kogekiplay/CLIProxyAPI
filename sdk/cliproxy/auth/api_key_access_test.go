@@ -240,6 +240,28 @@ func TestAPIKeyAccessScope_EmptyRuleAllowsNoAuth(t *testing.T) {
 	}
 }
 
+func TestAllowedAuthIDsForContext_ReturnsScopedIDs(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {AuthFiles: []string{"auth-1.json", "auth-3.json"}},
+			},
+		},
+	})
+	m.auths["auth-3"] = &Auth{ID: "auth-3", Provider: "test", FileName: "auth-3.json"}
+	m.auths["auth-2"] = &Auth{ID: "auth-2", Provider: "test", FileName: "auth-2.json"}
+	m.auths["auth-1"] = &Auth{ID: "auth-1", Provider: "test", FileName: "auth-1.json"}
+
+	ids, restricted := m.AllowedAuthIDsForContext(contextWithUserAPIKey("key-1"))
+	if !restricted {
+		t.Fatalf("restricted = false, want true")
+	}
+	if got, want := strings.Join(ids, ","), "auth-1,auth-3"; got != want {
+		t.Fatalf("AllowedAuthIDsForContext() = %q, want %q", got, want)
+	}
+}
+
 func TestPickNextLegacy_RespectsAPIKeyAccessScope(t *testing.T) {
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
 	m.RegisterExecutor(schedulerTestExecutor{})
@@ -307,6 +329,35 @@ func TestPickNext_ScopedKeyDoesNotUseSchedulerUnfilteredAuth(t *testing.T) {
 	}
 	if selected.ID != "auth-1" {
 		t.Fatalf("selected auth = %q, want auth-1", selected.ID)
+	}
+}
+
+func TestPickNextMixed_ScopedKeyDoesNotUseSchedulerUnfilteredAuth(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	m.RegisterExecutor(schedulerTestExecutor{})
+	m.executors["other"] = schedulerBenchmarkExecutor{id: "other"}
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {AuthFiles: []string{"auth-1.json"}},
+			},
+		},
+	})
+	auth1 := &Auth{ID: "auth-1", Provider: "test", FileName: "auth-1.json"}
+	auth2 := &Auth{ID: "auth-2", Provider: "other", FileName: "auth-2.json", Attributes: map[string]string{"priority": "10"}}
+	m.auths["auth-1"] = auth1
+	m.auths["auth-2"] = auth2
+	m.syncScheduler()
+
+	selected, _, provider, err := m.pickNextMixed(contextWithUserAPIKey("key-1"), []string{"test", "other"}, "", cliproxyexecutor.Options{}, nil)
+	if err != nil {
+		t.Fatalf("pickNextMixed() error = %v", err)
+	}
+	if selected.ID != "auth-1" {
+		t.Fatalf("selected auth = %q, want auth-1", selected.ID)
+	}
+	if provider != "test" {
+		t.Fatalf("selected provider = %q, want test", provider)
 	}
 }
 
