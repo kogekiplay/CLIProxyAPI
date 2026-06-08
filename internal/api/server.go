@@ -1055,11 +1055,11 @@ func (s *Server) scopedModelsForRequest(c *gin.Context, handlerType string) ([]m
 		return nil, false
 	}
 
-	clientIDs, restricted := s.handlers.AuthManager.AllowedAuthIDsForContext(ginContextForScope(c))
+	clientIDs, clientCacheKey, restricted := s.handlers.AuthManager.AllowedAuthIDCacheForContext(ginContextForScope(c))
 	if !restricted {
 		return nil, false
 	}
-	return registry.GetGlobalRegistry().GetAvailableModelsForClients(handlerType, clientIDs), true
+	return registry.GetGlobalRegistry().GetAvailableModelsForClientCache(handlerType, clientCacheKey, clientIDs), true
 }
 
 func ginContextForScope(c *gin.Context) context.Context {

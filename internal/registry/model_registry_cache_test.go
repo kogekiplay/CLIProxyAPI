@@ -73,6 +73,26 @@ func TestGetAvailableModelsForClientsReturnsClonedSnapshots(t *testing.T) {
 	}
 }
 
+func TestGetAvailableModelsForClientCacheUsesPrecomputedScope(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "OpenAI", []*ModelInfo{{ID: "m1", OwnedBy: "team-a", DisplayName: "Model One"}})
+	r.RegisterClient("client-2", "OpenAI", []*ModelInfo{{ID: "m2", OwnedBy: "team-b", DisplayName: "Model Two"}})
+
+	models := r.GetAvailableModelsForClientCache("openai", "client-1", []string{"client-1"})
+	if len(models) != 1 {
+		t.Fatalf("expected one scoped model, got %d", len(models))
+	}
+	if got := models[0]["id"]; got != "m1" {
+		t.Fatalf("expected scoped model m1, got %v", got)
+	}
+
+	models[0]["id"] = "mutated"
+	models = r.GetAvailableModelsForClientCache("openai", "client-1", []string{"client-1"})
+	if got := models[0]["id"]; got != "m1" {
+		t.Fatalf("expected cached scoped model clone m1, got %v", got)
+	}
+}
+
 func TestGetAvailableModelsForClientsInvalidatesCacheOnRegistryChanges(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("client-1", "OpenAI", []*ModelInfo{{ID: "m1", OwnedBy: "team-a", DisplayName: "Model One"}})

@@ -210,6 +210,30 @@ func BenchmarkManagerPickNextScopedSingleAuthFile1000(b *testing.B) {
 	}
 }
 
+func BenchmarkAllowedAuthIDCacheForContextRestricted1000(b *testing.B) {
+	manager, _, _ := benchmarkManagerSetup(b, 1000, false, false)
+	manager.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"bench-key": {Providers: []string{"gemini"}},
+			},
+		},
+	})
+	ctx := contextWithUserAPIKey("bench-key")
+	if ids, cacheKey, restricted := manager.AllowedAuthIDCacheForContext(ctx); !restricted || len(ids) != 1000 || cacheKey == "" {
+		b.Fatalf("warmup AllowedAuthIDCacheForContext restricted=%v ids=%d cacheKey=%q", restricted, len(ids), cacheKey)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ids, cacheKey, restricted := manager.AllowedAuthIDCacheForContext(ctx)
+		if !restricted || len(ids) != 1000 || cacheKey == "" {
+			b.Fatalf("AllowedAuthIDCacheForContext restricted=%v ids=%d cacheKey=%q", restricted, len(ids), cacheKey)
+		}
+	}
+}
+
 func BenchmarkManagerPickNextMixed500(b *testing.B) {
 	manager, providers, model := benchmarkManagerSetup(b, 500, true, false)
 	ctx := context.Background()

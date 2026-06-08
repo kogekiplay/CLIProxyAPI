@@ -93,6 +93,89 @@ func TestAPIKeyAccessScope_ProvidersAndAuthFilesAreIndependent(t *testing.T) {
 	}
 }
 
+func TestAllowedAuthIDCacheForContextRefreshesOnAuthChanges(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {
+					AuthFiles: []string{"auth-1.json"},
+				},
+			},
+		},
+	})
+	ctx := contextWithUserAPIKey("key-1")
+
+	ids, cacheKey, restricted := m.AllowedAuthIDCacheForContext(ctx)
+	if !restricted {
+		t.Fatalf("restricted = false, want true")
+	}
+	if len(ids) != 0 || cacheKey != "" {
+		t.Fatalf("initial ids/cacheKey = %#v/%q, want empty", ids, cacheKey)
+	}
+
+	if _, err := m.Register(context.Background(), &Auth{ID: "auth-2", Provider: "gemini", FileName: "auth-2.json"}); err != nil {
+		t.Fatalf("Register auth-2 error = %v", err)
+	}
+	ids, cacheKey, restricted = m.AllowedAuthIDCacheForContext(ctx)
+	if !restricted {
+		t.Fatalf("restricted after auth-2 = false, want true")
+	}
+	if len(ids) != 0 || cacheKey != "" {
+		t.Fatalf("ids/cacheKey after disallowed auth = %#v/%q, want empty", ids, cacheKey)
+	}
+
+	if _, err := m.Register(context.Background(), &Auth{ID: "auth-1", Provider: "gemini", FileName: "auth-1.json"}); err != nil {
+		t.Fatalf("Register auth-1 error = %v", err)
+	}
+	ids, cacheKey, restricted = m.AllowedAuthIDCacheForContext(ctx)
+	if !restricted {
+		t.Fatalf("restricted after auth-1 = false, want true")
+	}
+	if len(ids) != 1 || ids[0] != "auth-1" || cacheKey != "auth-1" {
+		t.Fatalf("ids/cacheKey after allowed auth = %#v/%q, want [auth-1]/auth-1", ids, cacheKey)
+	}
+
+	if _, err := m.Update(context.Background(), &Auth{ID: "auth-1", Provider: "gemini", FileName: "auth-other.json"}); err != nil {
+		t.Fatalf("Update auth-1 error = %v", err)
+	}
+	ids, cacheKey, restricted = m.AllowedAuthIDCacheForContext(ctx)
+	if !restricted {
+		t.Fatalf("restricted after update = false, want true")
+	}
+	if len(ids) != 0 || cacheKey != "" {
+		t.Fatalf("ids/cacheKey after update = %#v/%q, want empty", ids, cacheKey)
+	}
+}
+
+func TestAllowedAuthIDsForContextReturnsClonedCache(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, err := m.Register(context.Background(), &Auth{ID: "auth-1", Provider: "gemini"}); err != nil {
+		t.Fatalf("Register error = %v", err)
+	}
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {
+					Providers: []string{"gemini"},
+				},
+			},
+		},
+	})
+	ctx := contextWithUserAPIKey("key-1")
+
+	first, restricted := m.AllowedAuthIDsForContext(ctx)
+	if !restricted || len(first) != 1 || first[0] != "auth-1" {
+		t.Fatalf("first AllowedAuthIDsForContext restricted=%v ids=%#v", restricted, first)
+	}
+	first[0] = "mutated"
+
+	second, restricted := m.AllowedAuthIDsForContext(ctx)
+	if !restricted || len(second) != 1 || second[0] != "auth-1" {
+		t.Fatalf("second AllowedAuthIDsForContext restricted=%v ids=%#v, want [auth-1]", restricted, second)
+	}
+}
+
 func TestAPIKeyAccessScope_ProviderTargetsDistinguishBaseURL(t *testing.T) {
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
 	m.SetConfig(&internalconfig.Config{
