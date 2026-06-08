@@ -223,6 +223,8 @@ type Server struct {
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
+
+	modelsResponseCache *modelsResponseCache
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -299,6 +301,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
 		pluginHost:          optionState.pluginHost,
+		modelsResponseCache: newModelsResponseCache(),
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
@@ -962,8 +965,8 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 				s.handleHomeCodexClientModels(c)
 				return
 			}
-			if models, scoped := s.scopedModelsForRequest(c, "openai"); scoped {
-				c.JSON(http.StatusOK, openai.CodexClientModelsResponse(models))
+			if snapshot := s.scopedModelsForRequest(c, "openai"); snapshot.scoped {
+				s.writeScopedModelsResponse(c, snapshot, scopedModelsResponseCodexClient)
 				return
 			}
 			openaiHandler.OpenAIModels(c)
@@ -980,15 +983,15 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 		// Route to Claude handler if User-Agent starts with "claude-cli"
 		if strings.HasPrefix(userAgent, "claude-cli") {
 			// log.Debugf("Routing /v1/models to Claude handler for User-Agent: %s", userAgent)
-			if models, scoped := s.scopedModelsForRequest(c, "claude"); scoped {
-				writeClaudeModels(c, models)
+			if snapshot := s.scopedModelsForRequest(c, "claude"); snapshot.scoped {
+				s.writeScopedModelsResponse(c, snapshot, scopedModelsResponseClaude)
 				return
 			}
 			claudeHandler.ClaudeModels(c)
 		} else {
 			// log.Debugf("Routing /v1/models to OpenAI handler for User-Agent: %s", userAgent)
-			if models, scoped := s.scopedModelsForRequest(c, "openai"); scoped {
-				writeOpenAIModels(c, models)
+			if snapshot := s.scopedModelsForRequest(c, "openai"); snapshot.scoped {
+				s.writeScopedModelsResponse(c, snapshot, scopedModelsResponseOpenAI)
 				return
 			}
 			openaiHandler.OpenAIModels(c)
@@ -1031,8 +1034,8 @@ func (s *Server) geminiModelsHandler(geminiHandler *gemini.GeminiAPIHandler) gin
 			return
 		}
 
-		if models, scoped := s.scopedModelsForRequest(c, "gemini"); scoped {
-			writeGeminiModels(c, models)
+		if snapshot := s.scopedModelsForRequest(c, "gemini"); snapshot.scoped {
+			s.writeScopedModelsResponse(c, snapshot, scopedModelsResponseGemini)
 			return
 		}
 		geminiHandler.GeminiModels(c)
@@ -1050,16 +1053,25 @@ func (s *Server) geminiGetHandler(geminiHandler *gemini.GeminiAPIHandler) gin.Ha
 	}
 }
 
-func (s *Server) scopedModelsForRequest(c *gin.Context, handlerType string) ([]map[string]any, bool) {
+func (s *Server) scopedModelsForRequest(c *gin.Context, handlerType string) scopedModelsSnapshot {
 	if s == nil || s.handlers == nil || s.handlers.AuthManager == nil {
-		return nil, false
+		return scopedModelsSnapshot{}
 	}
 
 	clientIDs, clientCacheKey, restricted := s.handlers.AuthManager.AllowedAuthIDCacheForAPIKey(ginUserAPIKey(c))
 	if !restricted {
-		return nil, false
+		return scopedModelsSnapshot{}
 	}
-	return registry.GetGlobalRegistry().GetAvailableModelsForClientCache(handlerType, clientCacheKey, clientIDs), true
+	reg := registry.GetGlobalRegistry()
+	models, expiresAt, version := reg.GetAvailableModelsForClientCacheSnapshot(handlerType, clientCacheKey, clientIDs)
+	return scopedModelsSnapshot{
+		models:          models,
+		handlerType:     handlerType,
+		clientCacheKey:  clientCacheKey,
+		registryVersion: version,
+		expiresAt:       expiresAt,
+		scoped:          true,
+	}
 }
 
 func ginUserAPIKey(c *gin.Context) string {
@@ -1083,74 +1095,30 @@ func ginUserAPIKey(c *gin.Context) string {
 }
 
 func writeOpenAIModels(c *gin.Context, allModels []map[string]any) {
-	filteredModels := make([]map[string]any, len(allModels))
-	for i, model := range allModels {
-		filteredModel := map[string]any{
-			"id":     model["id"],
-			"object": model["object"],
-		}
-		if created, exists := model["created"]; exists {
-			filteredModel["created"] = created
-		}
-		if ownedBy, exists := model["owned_by"]; exists {
-			filteredModel["owned_by"] = ownedBy
-		}
-		filteredModels[i] = filteredModel
+	body, err := marshalOpenAIModels(allModels)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode models response"})
+		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"object": "list",
-		"data":   filteredModels,
-	})
+	writeModelsJSONBody(c, body)
 }
 
 func writeClaudeModels(c *gin.Context, models []map[string]any) {
-	firstID := ""
-	lastID := ""
-	if len(models) > 0 {
-		if id, ok := models[0]["id"].(string); ok {
-			firstID = id
-		}
-		if id, ok := models[len(models)-1]["id"].(string); ok {
-			lastID = id
-		}
+	body, err := marshalClaudeModels(models)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode models response"})
+		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"data":     models,
-		"has_more": false,
-		"first_id": firstID,
-		"last_id":  lastID,
-	})
+	writeModelsJSONBody(c, body)
 }
 
 func writeGeminiModels(c *gin.Context, rawModels []map[string]any) {
-	normalizedModels := make([]map[string]any, 0, len(rawModels))
-	defaultMethods := []string{"generateContent"}
-	for _, model := range rawModels {
-		normalizedModel := make(map[string]any, len(model))
-		for k, v := range model {
-			normalizedModel[k] = v
-		}
-		if name, ok := normalizedModel["name"].(string); ok && name != "" {
-			if !strings.HasPrefix(name, "models/") {
-				normalizedModel["name"] = "models/" + name
-			}
-			if displayName, _ := normalizedModel["displayName"].(string); displayName == "" {
-				normalizedModel["displayName"] = name
-			}
-			if description, _ := normalizedModel["description"].(string); description == "" {
-				normalizedModel["description"] = name
-			}
-		}
-		if _, ok := normalizedModel["supportedGenerationMethods"]; !ok {
-			normalizedModel["supportedGenerationMethods"] = defaultMethods
-		}
-		normalizedModels = append(normalizedModels, normalizedModel)
+	body, err := marshalGeminiModels(rawModels)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode models response"})
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"models": normalizedModels,
-	})
+	writeModelsJSONBody(c, body)
 }
 
 type homeModelEntry struct {

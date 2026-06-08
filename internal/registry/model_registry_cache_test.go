@@ -93,6 +93,49 @@ func TestGetAvailableModelsForClientCacheUsesPrecomputedScope(t *testing.T) {
 	}
 }
 
+func TestGetAvailableModelsForClientCacheSnapshotTracksVersionAndExpiry(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "OpenAI", []*ModelInfo{{ID: "m1", OwnedBy: "team-a", DisplayName: "Model One"}})
+
+	models, expiresAt, version := r.GetAvailableModelsForClientCacheSnapshot("openai", "client-1", []string{"client-1"})
+	if len(models) != 1 {
+		t.Fatalf("expected one scoped model, got %d", len(models))
+	}
+	if !expiresAt.IsZero() {
+		t.Fatalf("expected initial snapshot not to expire, got %s", expiresAt)
+	}
+	if version == 0 {
+		t.Fatal("expected non-zero cache version")
+	}
+
+	r.RegisterClient("client-1", "OpenAI", []*ModelInfo{{ID: "m1", OwnedBy: "team-a", DisplayName: "Model One Updated"}})
+	models, expiresAt, updatedVersion := r.GetAvailableModelsForClientCacheSnapshot("openai", "client-1", []string{"client-1"})
+	if len(models) != 1 {
+		t.Fatalf("expected one updated scoped model, got %d", len(models))
+	}
+	if got := models[0]["display_name"]; got != "Model One Updated" {
+		t.Fatalf("expected updated display_name, got %v", got)
+	}
+	if !expiresAt.IsZero() {
+		t.Fatalf("expected updated snapshot not to expire, got %s", expiresAt)
+	}
+	if updatedVersion <= version {
+		t.Fatalf("expected cache version to increase after registry change, got %d then %d", version, updatedVersion)
+	}
+
+	r.SetModelQuotaExceeded("client-1", "m1")
+	models, expiresAt, quotaVersion := r.GetAvailableModelsForClientCacheSnapshot("openai", "client-1", []string{"client-1"})
+	if len(models) != 1 {
+		t.Fatalf("expected quota-cooling model to remain listed, got %d", len(models))
+	}
+	if expiresAt.IsZero() {
+		t.Fatal("expected quota snapshot to expire at recovery time")
+	}
+	if quotaVersion <= updatedVersion {
+		t.Fatalf("expected cache version to increase after quota change, got %d then %d", updatedVersion, quotaVersion)
+	}
+}
+
 func TestGetAvailableModelsForClientsInvalidatesCacheOnRegistryChanges(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("client-1", "OpenAI", []*ModelInfo{{ID: "m1", OwnedBy: "team-a", DisplayName: "Model One"}})
