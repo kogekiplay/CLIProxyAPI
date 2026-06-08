@@ -148,6 +148,37 @@ func TestAllowedAuthIDCacheForContextRefreshesOnAuthChanges(t *testing.T) {
 	}
 }
 
+func TestAllowedAuthIDCacheForAPIKeyMatchesContextLookup(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, err := m.Register(context.Background(), &Auth{ID: "auth-1", Provider: "gemini"}); err != nil {
+		t.Fatalf("Register auth-1 error = %v", err)
+	}
+	if _, err := m.Register(context.Background(), &Auth{ID: "auth-2", Provider: "claude"}); err != nil {
+		t.Fatalf("Register auth-2 error = %v", err)
+	}
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {
+					Providers: []string{"gemini"},
+				},
+			},
+		},
+	})
+
+	contextIDs, contextCacheKey, contextRestricted := m.AllowedAuthIDCacheForContext(contextWithUserAPIKey("key-1"))
+	keyIDs, keyCacheKey, keyRestricted := m.AllowedAuthIDCacheForAPIKey("key-1")
+	if contextRestricted != keyRestricted {
+		t.Fatalf("restricted mismatch: context=%v key=%v", contextRestricted, keyRestricted)
+	}
+	if contextCacheKey != keyCacheKey {
+		t.Fatalf("cache key mismatch: context=%q key=%q", contextCacheKey, keyCacheKey)
+	}
+	if strings.Join(contextIDs, ",") != strings.Join(keyIDs, ",") {
+		t.Fatalf("ids mismatch: context=%#v key=%#v", contextIDs, keyIDs)
+	}
+}
+
 func TestAllowedAuthIDsForContextReturnsClonedCache(t *testing.T) {
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
 	if _, err := m.Register(context.Background(), &Auth{ID: "auth-1", Provider: "gemini"}); err != nil {

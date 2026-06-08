@@ -21,10 +21,14 @@ type apiKeyAccessScope struct {
 type apiKeyAccessScopeTable map[string]apiKeyAccessScope
 
 func (m *Manager) apiKeyAccessScopeForContext(ctx context.Context) apiKeyAccessScope {
+	return m.apiKeyAccessScopeForAPIKey(clientAPIKeyFromContext(ctx))
+}
+
+func (m *Manager) apiKeyAccessScopeForAPIKey(clientKey string) apiKeyAccessScope {
 	if m == nil {
 		return apiKeyAccessScope{}
 	}
-	clientKey := clientAPIKeyFromContext(ctx)
+	clientKey = strings.TrimSpace(clientKey)
 	if clientKey == "" {
 		return apiKeyAccessScope{}
 	}
@@ -170,7 +174,15 @@ func (m *Manager) allowedAuthIDsForScope(scope apiKeyAccessScope) []string {
 // The returned ID slice is an immutable cache view; callers must not mutate it.
 // The boolean return is true only when the key has an explicit restricted rule.
 func (m *Manager) AllowedAuthIDCacheForContext(ctx context.Context) ([]string, string, bool) {
-	scope := m.apiKeyAccessScopeForContext(ctx)
+	return m.AllowedAuthIDCacheForAPIKey(clientAPIKeyFromContext(ctx))
+}
+
+// AllowedAuthIDCacheForAPIKey returns the sorted auth IDs visible to the supplied client API key
+// plus a stable cache key for downstream scoped model caches.
+// The returned ID slice is an immutable cache view; callers must not mutate it.
+// The boolean return is true only when the key has an explicit restricted rule.
+func (m *Manager) AllowedAuthIDCacheForAPIKey(apiKey string) ([]string, string, bool) {
+	scope := m.apiKeyAccessScopeForAPIKey(apiKey)
 	if !scope.restricted {
 		return nil, "", false
 	}
