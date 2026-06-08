@@ -244,6 +244,40 @@ func TestBuildConfigChangeDetails_APIKeyAccessRedacted(t *testing.T) {
 	if strings.Contains(joined, "sk-new-secret") {
 		t.Fatalf("diff leaked new client API key: %v", details)
 	}
+	if strings.Contains(joined, "auth-1.json") || strings.Contains(joined, "gemini") {
+		t.Fatalf("diff leaked access targets: %v", details)
+	}
+}
+
+func TestBuildConfigChangeDetails_APIKeyAccessCanonicalizesSets(t *testing.T) {
+	oldCfg := &config.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeyAccess: map[string]config.APIKeyAccessRule{
+				"sk-client": {
+					Providers: []string{" Gemini ", "claude", "gemini"},
+					AuthFiles: []string{" auth-b.json ", "auth-a.json", "auth-a.json"},
+				},
+			},
+		},
+	}
+	newCfg := &config.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeyAccess: map[string]config.APIKeyAccessRule{
+				"sk-client": {
+					Providers: []string{"CLAUDE", "gemini"},
+					AuthFiles: []string{"auth-a.json", "auth-b.json"},
+				},
+			},
+		},
+	}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+
+	for _, detail := range details {
+		if strings.Contains(detail, "api-key-access") {
+			t.Fatalf("unexpected api-key-access diff for equivalent sets: %v", details)
+		}
+	}
 }
 
 func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {

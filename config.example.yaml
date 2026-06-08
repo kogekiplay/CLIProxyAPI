@@ -44,9 +44,9 @@ api-keys:
 # Optional per-client API key access scopes.
 # A key without a rule keeps unrestricted access.
 api-key-access:
-  example-admin-key:
+  your-api-key-1:
     access: all
-  example-limited-key:
+  your-api-key-2:
     providers:
       - gemini
       - claude
