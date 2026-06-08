@@ -62,7 +62,7 @@ func TestAPIKeyAccessScope_AllowsUnconfiguredKey(t *testing.T) {
 	}
 }
 
-func TestAPIKeyAccessScope_ProviderAndAuthFileIntersection(t *testing.T) {
+func TestAPIKeyAccessScope_ProvidersAndAuthFilesAreIndependent(t *testing.T) {
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
 	m.SetConfig(&internalconfig.Config{
 		SDKConfig: internalconfig.SDKConfig{
@@ -82,11 +82,14 @@ func TestAPIKeyAccessScope_ProviderAndAuthFileIntersection(t *testing.T) {
 	if !scope.allows(&Auth{ID: "auth-1", Provider: "gemini", FileName: "auth-1.json"}) {
 		t.Fatalf("matching provider and auth file should be allowed")
 	}
-	if scope.allows(&Auth{ID: "auth-2", Provider: "gemini", FileName: "auth-2.json"}) {
-		t.Fatalf("auth-2 should not be allowed")
+	if !scope.allows(&Auth{ID: "auth-2", Provider: "gemini", FileName: "auth-2.json"}) {
+		t.Fatalf("matching provider should be allowed without an auth-file match")
 	}
-	if scope.allows(&Auth{ID: "auth-1", Provider: "claude", FileName: "auth-1.json"}) {
-		t.Fatalf("claude should not be allowed")
+	if !scope.allows(&Auth{ID: "auth-1", Provider: "claude", FileName: "auth-1.json"}) {
+		t.Fatalf("matching auth file should be allowed without a provider match")
+	}
+	if scope.allows(&Auth{ID: "auth-3", Provider: "claude", FileName: "auth-3.json"}) {
+		t.Fatalf("auth without a matching provider or auth file should not be allowed")
 	}
 }
 
@@ -122,7 +125,7 @@ func TestAPIKeyAccessScope_ProviderTargetsDistinguishBaseURL(t *testing.T) {
 	}) {
 		t.Fatalf("matching provider target and auth file should be allowed")
 	}
-	if scoped.allows(&Auth{
+	if !scoped.allows(&Auth{
 		ID:       "claude-b",
 		Provider: "claude",
 		FileName: "claude-b.json",
@@ -130,9 +133,9 @@ func TestAPIKeyAccessScope_ProviderTargetsDistinguishBaseURL(t *testing.T) {
 			"base_url": "https://b.example.com",
 		},
 	}) {
-		t.Fatalf("same provider with a different base URL should not be allowed")
+		t.Fatalf("matching auth file should be allowed even with a different base URL")
 	}
-	if scoped.allows(&Auth{
+	if !scoped.allows(&Auth{
 		ID:       "claude-c",
 		Provider: "claude",
 		FileName: "claude-c.json",
@@ -140,7 +143,17 @@ func TestAPIKeyAccessScope_ProviderTargetsDistinguishBaseURL(t *testing.T) {
 			"base_url": "https://a.example.com",
 		},
 	}) {
-		t.Fatalf("matching provider target without matching auth file should not be allowed")
+		t.Fatalf("matching provider target without matching auth file should be allowed")
+	}
+	if scoped.allows(&Auth{
+		ID:       "claude-d",
+		Provider: "claude",
+		FileName: "claude-d.json",
+		Attributes: map[string]string{
+			"base_url": "https://b.example.com",
+		},
+	}) {
+		t.Fatalf("auth without matching provider target or auth file should not be allowed")
 	}
 
 	legacyProvider := m.apiKeyAccessScopeForContext(contextWithUserAPIKey("key-2"))
@@ -153,6 +166,58 @@ func TestAPIKeyAccessScope_ProviderTargetsDistinguishBaseURL(t *testing.T) {
 		},
 	}) {
 		t.Fatalf("legacy provider allow-list should allow any base URL for that provider")
+	}
+}
+
+func TestAPIKeyAccessScope_ProviderTargetsAndAuthFilesAreIndependent(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {
+					ProviderTargets: []internalconfig.APIKeyAccessProviderTarget{
+						{Provider: "codex", BaseURL: "https://a.example.com/v1"},
+					},
+					AuthFiles: []string{"codex-q981612327@outlook.com-pro.json"},
+				},
+			},
+		},
+	})
+
+	scope := m.apiKeyAccessScopeForContext(contextWithUserAPIKey("key-1"))
+	if !scope.allows(&Auth{
+		ID:       "codex-q981612327@outlook.com-pro.json",
+		Provider: "codex",
+		FileName: "codex-q981612327@outlook.com-pro.json",
+	}) {
+		t.Fatalf("matching auth file should be allowed even when it has no provider base URL")
+	}
+	if !scope.allows(&Auth{
+		ID:       "codex-api-key-a",
+		Provider: "codex",
+		FileName: "codex-api-key-a",
+		Attributes: map[string]string{
+			"base_url": "https://a.example.com/v1",
+		},
+	}) {
+		t.Fatalf("matching provider target should be allowed even when it is not an auth-file target")
+	}
+	if scope.allows(&Auth{
+		ID:       "codex-other-file.json",
+		Provider: "codex",
+		FileName: "codex-other-file.json",
+	}) {
+		t.Fatalf("unlisted auth file without matching provider target should not be allowed")
+	}
+	if scope.allows(&Auth{
+		ID:       "codex-api-key-b",
+		Provider: "codex",
+		FileName: "codex-api-key-b",
+		Attributes: map[string]string{
+			"base_url": "https://b.example.com/v1",
+		},
+	}) {
+		t.Fatalf("different provider target should not be allowed")
 	}
 }
 
