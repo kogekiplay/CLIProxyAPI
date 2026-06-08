@@ -18,6 +18,8 @@
 
 管理页面本身不是这个仓库里的普通前端源码。CPA 会从 `router-for-me/Cli-Proxy-API-Management-Center` 下载 `management.html`。所以这个仓库负责后端管理 API；页面 UI 要去管理中心那个仓库改。
 
+访问范围是授权硬边界，不是调度偏好。额度耗尽、冷却、重试、模型 fallback、provider fallback、认证文件 fallback，都只能在当前 API key 被授权的认证文件和 provider 里面发生。
+
 ## 方案选择
 
 1. 直接把 `api-keys` 从字符串列表改成对象列表。
@@ -87,6 +89,8 @@ api-key-access:
 
 如果某个 key 因为访问范围过滤后没有任何可用认证文件，返回 `auth_not_found`，错误信息说明是 access scope 导致，但不能暴露原始 API key。
 
+你刚问的例子也按这个规则处理：如果密钥 1 只授权了认证文件 1，认证文件 1 和认证文件 2 都有 `gpt5.5`，但认证文件 1 的 `gpt5.5` 额度没了，那么密钥 1 不能去用认证文件 2 的 `gpt5.5` 额度。它只能在密钥 1 被授权的范围内 fallback，比如用认证文件 1 仍然可用的其他模型，或者直接返回无可用认证。
+
 ## 管理 API
 
 新增管理接口：
@@ -139,6 +143,7 @@ api-key-access:
 - 受限规则为空时，返回 `auth_not_found`。
 - 管理 API 的增删改查能保存配置，并且响应和日志 diff 不泄露原始 key。
 - scheduler 路径和 legacy 路径限制结果一致。
+- 额度耗尽和 fallback 不会逃逸当前 key 的授权范围。只授权认证文件 1 的 key，不能因为认证文件 2 有额度就使用认证文件 2。
 
 至少运行：
 

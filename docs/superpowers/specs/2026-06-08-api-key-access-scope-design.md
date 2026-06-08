@@ -12,6 +12,8 @@ Runtime auth selection happens in `sdk/cliproxy/auth`. `Manager.SetConfig` alrea
 
 The management control panel HTML is downloaded from `router-for-me/Cli-Proxy-API-Management-Center` via `internal/managementasset`. This repo owns the backend management API and asset updater; the UI source lives in the management center repo.
 
+Access scopes are an authorization boundary, not a scheduling preference. Quota exhaustion, cooldown, retry, model fallback, provider fallback, and auth-file fallback must only consider credentials allowed by the current client API key.
+
 ## Approaches Considered
 
 1. Add scopes directly into `api-keys` by changing it from `[]string` to a list of objects. This is compact for new installs, but it risks breaking existing config parsing and every management client that expects a string list.
@@ -75,6 +77,8 @@ The filter must happen after normal provider/model eligibility checks and before
 
 When scope filtering removes every candidate, return an `auth_not_found` error with a message that identifies access scope as the reason without logging or returning the raw API key.
 
+The scope filter must remain active for every fallback path. For example, if key 1 is only allowed to use auth file 1, and auth file 1 and auth file 2 both advertise `gpt-5.5`, key 1 still cannot use auth file 2 when auth file 1 has no `gpt-5.5` quota left. It may only fall back to models, providers, or credentials that are allowed by key 1's configured scope.
+
 ## Management API
 
 Add management endpoints:
@@ -127,6 +131,7 @@ Backend unit and integration coverage:
 - Restricted empty rules produce `auth_not_found`.
 - Management API CRUD persists config and redacts keys in responses/loggable diff output.
 - Scheduler and legacy selection paths apply the same restrictions.
+- Quota exhaustion and fallback do not escape the current key scope. A key limited to auth file 1 cannot use auth file 2 even when auth file 2 has quota for the requested model.
 
 Run at minimum:
 
