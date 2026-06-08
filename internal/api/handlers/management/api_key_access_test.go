@@ -206,7 +206,6 @@ func TestGetAPIKeyAccessAuthTargets_ReturnsProviderTargetMetadata(t *testing.T) 
 		Label:    "Claude A",
 		Attributes: map[string]string{
 			"base_url": "https://a.example.com",
-			"api_key":  "upstream-secret-key-123456",
 		},
 	}); err != nil {
 		t.Fatalf("register auth: %v", err)
@@ -327,5 +326,70 @@ func TestGetAPIKeyAccessProviderTargetsComeFromConfiguredProviderEndpoints(t *te
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("provider-targets = %#v, want %#v; body=%s", got, want, rec.Body.String())
+	}
+}
+
+func TestGetAPIKeyAccessAuthTargetsExcludeAPIKeyCredentials(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "claude-apikey-1",
+		Provider: "claude",
+		FileName: "",
+		Label:    "Claude API key",
+		Attributes: map[string]string{
+			"api_key":  "upstream-secret-key-123456",
+			"base_url": "https://aigw.c5y.moe",
+		},
+	}); err != nil {
+		t.Fatalf("register api key auth: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-user",
+		Provider: "codex",
+		FileName: "codex-user.json",
+		Label:    "Codex User",
+		Metadata: map[string]any{
+			"email": "user@example.com",
+		},
+	}); err != nil {
+		t.Fatalf("register oauth auth: %v", err)
+	}
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+		authManager:    manager,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/api-key-access", nil)
+
+	h.GetAPIKeyAccess(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body struct {
+		AuthTargets []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			AccountType string `json:"account_type"`
+		} `json:"auth-targets"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("decode response: %v; body=%s", errDecode, rec.Body.String())
+	}
+	if got, want := len(body.AuthTargets), 1; got != want {
+		t.Fatalf("auth-targets len = %d, want %d; targets=%#v; body=%s", got, want, body.AuthTargets, rec.Body.String())
+	}
+	if got, want := body.AuthTargets[0].ID, "codex-user"; got != want {
+		t.Fatalf("auth-target id = %q, want %q; body=%s", got, want, rec.Body.String())
+	}
+	if body.AuthTargets[0].AccountType == "api_key" || strings.Contains(rec.Body.String(), "claude-apikey") {
+		t.Fatalf("auth-targets includes API key credential: %#v; body=%s", body.AuthTargets, rec.Body.String())
 	}
 }
