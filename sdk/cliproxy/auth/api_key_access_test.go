@@ -90,6 +90,72 @@ func TestAPIKeyAccessScope_ProviderAndAuthFileIntersection(t *testing.T) {
 	}
 }
 
+func TestAPIKeyAccessScope_ProviderTargetsDistinguishBaseURL(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {
+					ProviderTargets: []internalconfig.APIKeyAccessProviderTarget{
+						{Provider: "claude", BaseURL: "https://a.example.com"},
+					},
+					AuthFiles: []string{"claude-a.json", "claude-b.json"},
+				},
+				"key-2": {
+					Providers: []string{"claude"},
+				},
+			},
+		},
+	})
+
+	scoped := m.apiKeyAccessScopeForContext(contextWithUserAPIKey("key-1"))
+	if !scoped.restricted {
+		t.Fatalf("scope.restricted = false, want true")
+	}
+	if !scoped.allows(&Auth{
+		ID:       "claude-a",
+		Provider: "claude",
+		FileName: "claude-a.json",
+		Attributes: map[string]string{
+			"base_url": "https://a.example.com",
+		},
+	}) {
+		t.Fatalf("matching provider target and auth file should be allowed")
+	}
+	if scoped.allows(&Auth{
+		ID:       "claude-b",
+		Provider: "claude",
+		FileName: "claude-b.json",
+		Attributes: map[string]string{
+			"base_url": "https://b.example.com",
+		},
+	}) {
+		t.Fatalf("same provider with a different base URL should not be allowed")
+	}
+	if scoped.allows(&Auth{
+		ID:       "claude-c",
+		Provider: "claude",
+		FileName: "claude-c.json",
+		Attributes: map[string]string{
+			"base_url": "https://a.example.com",
+		},
+	}) {
+		t.Fatalf("matching provider target without matching auth file should not be allowed")
+	}
+
+	legacyProvider := m.apiKeyAccessScopeForContext(contextWithUserAPIKey("key-2"))
+	if !legacyProvider.allows(&Auth{
+		ID:       "claude-b",
+		Provider: "claude",
+		FileName: "claude-b.json",
+		Attributes: map[string]string{
+			"base_url": "https://b.example.com",
+		},
+	}) {
+		t.Fatalf("legacy provider allow-list should allow any base URL for that provider")
+	}
+}
+
 func TestAPIKeyAccessScope_EmptyRuleAllowsNoAuth(t *testing.T) {
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
 	m.SetConfig(&internalconfig.Config{

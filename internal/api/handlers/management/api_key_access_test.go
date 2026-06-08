@@ -194,3 +194,71 @@ func TestGetAPIKeyAccessAuthTargets_DoNotLeakUpstreamAPIKeys(t *testing.T) {
 		t.Fatalf("response leaks upstream API key: %s", rec.Body.String())
 	}
 }
+
+func TestGetAPIKeyAccessAuthTargets_ReturnsProviderTargetMetadata(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "claude-a",
+		Provider: "claude",
+		FileName: "claude-a.json",
+		Label:    "Claude A",
+		Attributes: map[string]string{
+			"base_url": "https://a.example.com",
+			"api_key":  "upstream-secret-key-123456",
+		},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+		authManager:    manager,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/api-key-access", nil)
+
+	h.GetAPIKeyAccess(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body struct {
+		AuthTargets []map[string]any `json:"auth-targets"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("decode response: %v; body=%s", errDecode, rec.Body.String())
+	}
+	if len(body.AuthTargets) != 1 {
+		t.Fatalf("auth-targets len = %d, want 1; body=%s", len(body.AuthTargets), rec.Body.String())
+	}
+	target := body.AuthTargets[0]
+	if got, want := target["base-url"], "https://a.example.com"; got != want {
+		t.Fatalf("base-url = %#v, want %#v; target=%#v", got, want, target)
+	}
+	if got, want := target["base_url"], "https://a.example.com"; got != want {
+		t.Fatalf("base_url = %#v, want %#v; target=%#v", got, want, target)
+	}
+	providerTarget, ok := target["provider-target"].(map[string]any)
+	if !ok {
+		t.Fatalf("provider-target missing or wrong type: %#v", target["provider-target"])
+	}
+	if got, want := providerTarget["provider"], "claude"; got != want {
+		t.Fatalf("provider-target.provider = %#v, want %#v", got, want)
+	}
+	if got, want := providerTarget["base-url"], "https://a.example.com"; got != want {
+		t.Fatalf("provider-target.base-url = %#v, want %#v", got, want)
+	}
+	providerTargetSnake, ok := target["provider_target"].(map[string]any)
+	if !ok {
+		t.Fatalf("provider_target missing or wrong type: %#v", target["provider_target"])
+	}
+	if got, want := providerTargetSnake["base_url"], "https://a.example.com"; got != want {
+		t.Fatalf("provider_target.base_url = %#v, want %#v", got, want)
+	}
+}

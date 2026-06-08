@@ -362,6 +362,12 @@ func canonicalAPIKeyAccessRules(rules map[string]config.APIKeyAccessRule) map[st
 	canonical := config.CloneAPIKeyAccessRules(normalized)
 	for key, rule := range canonical {
 		sort.Strings(rule.Providers)
+		sort.Slice(rule.ProviderTargets, func(i, j int) bool {
+			if rule.ProviderTargets[i].Provider != rule.ProviderTargets[j].Provider {
+				return rule.ProviderTargets[i].Provider < rule.ProviderTargets[j].Provider
+			}
+			return rule.ProviderTargets[i].BaseURL < rule.ProviderTargets[j].BaseURL
+		})
 		sort.Strings(rule.AuthFiles)
 		canonical[key] = rule
 	}
