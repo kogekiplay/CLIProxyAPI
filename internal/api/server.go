@@ -1055,19 +1055,31 @@ func (s *Server) scopedModelsForRequest(c *gin.Context, handlerType string) ([]m
 		return nil, false
 	}
 
-	clientIDs, clientCacheKey, restricted := s.handlers.AuthManager.AllowedAuthIDCacheForContext(ginContextForScope(c))
+	clientIDs, clientCacheKey, restricted := s.handlers.AuthManager.AllowedAuthIDCacheForAPIKey(ginUserAPIKey(c))
 	if !restricted {
 		return nil, false
 	}
 	return registry.GetGlobalRegistry().GetAvailableModelsForClientCache(handlerType, clientCacheKey, clientIDs), true
 }
 
-func ginContextForScope(c *gin.Context) context.Context {
-	ctx := context.Background()
-	if c != nil && c.Request != nil && c.Request.Context() != nil {
-		ctx = c.Request.Context()
+func ginUserAPIKey(c *gin.Context) string {
+	if c == nil {
+		return ""
 	}
-	return context.WithValue(ctx, "gin", c)
+	raw, ok := c.Get("userApiKey")
+	if !ok {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	case fmt.Stringer:
+		return strings.TrimSpace(value.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
 }
 
 func writeOpenAIModels(c *gin.Context, allModels []map[string]any) {
