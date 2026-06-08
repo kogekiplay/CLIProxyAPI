@@ -262,3 +262,70 @@ func TestGetAPIKeyAccessAuthTargets_ReturnsProviderTargetMetadata(t *testing.T) 
 		t.Fatalf("provider_target.base_url = %#v, want %#v", got, want)
 	}
 }
+
+func TestGetAPIKeyAccessProviderTargetsComeFromConfiguredProviderEndpoints(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "codex-oauth-default",
+		Provider: "codex",
+		FileName: "codex-oauth-default.json",
+		Label:    "Codex OAuth default",
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := &Handler{
+		cfg: &config.Config{
+			CodexKey: []config.CodexKey{
+				{APIKey: "codex-key-a", BaseURL: "https://aigw.c5y.moe/v1"},
+				{APIKey: "codex-key-b", BaseURL: "https://muyuan.do/v1"},
+			},
+		},
+		configFilePath: writeTestConfigFile(t),
+		authManager:    manager,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/api-key-access", nil)
+
+	h.GetAPIKeyAccess(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var body struct {
+		ProviderTargets []struct {
+			Provider string `json:"provider"`
+			BaseURL  string `json:"base-url"`
+		} `json:"provider-targets"`
+		AuthTargets []map[string]any `json:"auth-targets"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("decode response: %v; body=%s", errDecode, rec.Body.String())
+	}
+
+	if len(body.AuthTargets) != 1 {
+		t.Fatalf("auth-targets len = %d, want 1; body=%s", len(body.AuthTargets), rec.Body.String())
+	}
+	if got, want := len(body.ProviderTargets), 2; got != want {
+		t.Fatalf("provider-targets len = %d, want %d; body=%s", got, want, rec.Body.String())
+	}
+	got := make([]string, 0, len(body.ProviderTargets))
+	for _, target := range body.ProviderTargets {
+		got = append(got, target.Provider+" "+target.BaseURL)
+		if target.BaseURL == "" {
+			t.Fatalf("provider-targets includes empty/default base-url target: %#v; body=%s", target, rec.Body.String())
+		}
+	}
+	want := []string{
+		"codex https://aigw.c5y.moe/v1",
+		"codex https://muyuan.do/v1",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("provider-targets = %#v, want %#v; body=%s", got, want, rec.Body.String())
+	}
+}

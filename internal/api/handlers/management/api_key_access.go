@@ -22,14 +22,16 @@ func (h *Handler) GetAPIKeyAccess(c *gin.Context) {
 	}
 
 	var (
-		apiKeys []string
-		rules   map[string]config.APIKeyAccessRule
-		manager *coreauth.Manager
+		apiKeys         []string
+		rules           map[string]config.APIKeyAccessRule
+		providerTargets = []gin.H{}
+		manager         *coreauth.Manager
 	)
 	h.mu.Lock()
 	if h.cfg != nil {
 		apiKeys = append([]string(nil), h.cfg.APIKeys...)
 		rules = config.CloneAPIKeyAccessRules(h.cfg.APIKeyAccess)
+		providerTargets = buildAPIKeyAccessProviderTargets(h.cfg)
 	}
 	manager = h.authManager
 	h.mu.Unlock()
@@ -39,9 +41,10 @@ func (h *Handler) GetAPIKeyAccess(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"api-key-access": rules,
-		"api-keys":       buildAPIKeyAccessKeyViews(apiKeys, rules),
-		"auth-targets":   buildAPIKeyAccessAuthTargets(manager),
+		"api-key-access":   rules,
+		"api-keys":         buildAPIKeyAccessKeyViews(apiKeys, rules),
+		"auth-targets":     buildAPIKeyAccessAuthTargets(manager),
+		"provider-targets": providerTargets,
 	})
 }
 
@@ -248,6 +251,63 @@ func redactedAPIKeyAccessLabel(key string) string {
 		return "<redacted>"
 	}
 	return label
+}
+
+func buildAPIKeyAccessProviderTargets(cfg *config.Config) []gin.H {
+	targets := []gin.H{}
+	if cfg == nil {
+		return targets
+	}
+
+	seen := map[string]struct{}{}
+	addTarget := func(provider, baseURL string) {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		baseURL = strings.TrimSpace(baseURL)
+		if provider == "" || baseURL == "" {
+			return
+		}
+		key := provider + "\x00" + baseURL
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, gin.H{
+			"provider": provider,
+			"base-url": baseURL,
+			"base_url": baseURL,
+		})
+	}
+
+	for _, entry := range cfg.GeminiKey {
+		addTarget("gemini", entry.BaseURL)
+	}
+	for _, entry := range cfg.ClaudeKey {
+		addTarget("claude", entry.BaseURL)
+	}
+	for _, entry := range cfg.CodexKey {
+		addTarget("codex", entry.BaseURL)
+	}
+	for _, entry := range cfg.VertexCompatAPIKey {
+		addTarget("vertex", entry.BaseURL)
+	}
+	for _, entry := range cfg.OpenAICompatibility {
+		if entry.Disabled {
+			continue
+		}
+		addTarget(entry.Name, entry.BaseURL)
+	}
+
+	sort.Slice(targets, func(i, j int) bool {
+		providerI, _ := targets[i]["provider"].(string)
+		providerJ, _ := targets[j]["provider"].(string)
+		if !strings.EqualFold(providerI, providerJ) {
+			return strings.ToLower(providerI) < strings.ToLower(providerJ)
+		}
+		baseI, _ := targets[i]["base-url"].(string)
+		baseJ, _ := targets[j]["base-url"].(string)
+		return baseI < baseJ
+	})
+	return targets
 }
 
 func buildAPIKeyAccessAuthTargets(manager *coreauth.Manager) []gin.H {
