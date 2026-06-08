@@ -128,6 +128,8 @@ type ModelRegistry struct {
 	availableModelsCache map[string]availableModelsCacheEntry
 	// scopedAvailableModelsCache stores per-handler/per-client-set snapshots for restricted API keys.
 	scopedAvailableModelsCache map[string]availableModelsCacheEntry
+	// cacheVersion increments whenever available model snapshots are invalidated.
+	cacheVersion uint64
 	// hook is an optional callback sink for model registration changes
 	hook ModelRegistryHook
 }
@@ -167,6 +169,17 @@ func (r *ModelRegistry) invalidateAvailableModelsCacheLocked() {
 	if len(r.scopedAvailableModelsCache) > 0 {
 		clear(r.scopedAvailableModelsCache)
 	}
+	r.cacheVersion++
+}
+
+// CacheVersion returns the current available-model snapshot version.
+func (r *ModelRegistry) CacheVersion() uint64 {
+	if r == nil {
+		return 0
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	return r.cacheVersion
 }
 
 // LookupModelInfo searches dynamic registry (provider-specific > global) then static definitions.
@@ -767,13 +780,19 @@ func (r *ModelRegistry) ClientSupportsModel(clientID, modelID string) bool {
 // Returns:
 //   - []map[string]any: List of available models in the requested format
 func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any {
+	models, _, _ := r.getAvailableModelsSnapshot(handlerType)
+	return models
+}
+
+func (r *ModelRegistry) getAvailableModelsSnapshot(handlerType string) ([]map[string]any, time.Time, uint64) {
 	now := time.Now()
 
 	r.mutex.RLock()
 	if cache, ok := r.availableModelsCache[handlerType]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
 		models := cloneModelMaps(cache.models)
+		version := r.cacheVersion
 		r.mutex.RUnlock()
-		return models
+		return models, cache.expiresAt, version
 	}
 	r.mutex.RUnlock()
 
@@ -782,7 +801,7 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 	r.ensureAvailableModelsCacheLocked()
 
 	if cache, ok := r.availableModelsCache[handlerType]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
-		return cloneModelMaps(cache.models)
+		return cloneModelMaps(cache.models), cache.expiresAt, r.cacheVersion
 	}
 
 	models, expiresAt := r.buildAvailableModelsLocked(handlerType, now)
@@ -791,7 +810,7 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 		expiresAt: expiresAt,
 	}
 
-	return models
+	return models, expiresAt, r.cacheVersion
 }
 
 // GetAvailableModelsForClients returns available models registered by the given client IDs.
@@ -805,16 +824,28 @@ func (r *ModelRegistry) GetAvailableModelsForClients(handlerType string, clientI
 // GetAvailableModelsForClientCache returns scoped models using a precomputed sorted client cache key.
 // orderedClientIDs must contain the same trimmed client IDs represented by clientCacheKey.
 func (r *ModelRegistry) GetAvailableModelsForClientCache(handlerType, clientCacheKey string, orderedClientIDs []string) []map[string]any {
+	models, _, _ := r.GetAvailableModelsForClientCacheSnapshot(handlerType, clientCacheKey, orderedClientIDs)
+	return models
+}
+
+// GetAvailableModelsForClientCacheSnapshot returns scoped models plus cache metadata.
+// orderedClientIDs must contain the same trimmed client IDs represented by clientCacheKey.
+func (r *ModelRegistry) GetAvailableModelsForClientCacheSnapshot(handlerType, clientCacheKey string, orderedClientIDs []string) ([]map[string]any, time.Time, uint64) {
 	if clientCacheKey == "" {
-		return nil
+		return nil, time.Time{}, r.CacheVersion()
 	}
 	cacheKey := strings.TrimSpace(handlerType) + "\x00" + clientCacheKey
-	return r.getAvailableModelsForClientCache(handlerType, cacheKey, orderedClientIDs)
+	return r.getAvailableModelsForClientCacheSnapshot(handlerType, cacheKey, orderedClientIDs)
 }
 
 func (r *ModelRegistry) getAvailableModelsForClientCache(handlerType, cacheKey string, orderedClientIDs []string) []map[string]any {
+	models, _, _ := r.getAvailableModelsForClientCacheSnapshot(handlerType, cacheKey, orderedClientIDs)
+	return models
+}
+
+func (r *ModelRegistry) getAvailableModelsForClientCacheSnapshot(handlerType, cacheKey string, orderedClientIDs []string) ([]map[string]any, time.Time, uint64) {
 	if cacheKey == "" {
-		return nil
+		return nil, time.Time{}, r.CacheVersion()
 	}
 
 	now := time.Now()
@@ -822,8 +853,9 @@ func (r *ModelRegistry) getAvailableModelsForClientCache(handlerType, cacheKey s
 	r.mutex.RLock()
 	if cache, ok := r.scopedAvailableModelsCache[cacheKey]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
 		models := cloneModelMaps(cache.models)
+		version := r.cacheVersion
 		r.mutex.RUnlock()
-		return models
+		return models, cache.expiresAt, version
 	}
 	r.mutex.RUnlock()
 
@@ -832,7 +864,7 @@ func (r *ModelRegistry) getAvailableModelsForClientCache(handlerType, cacheKey s
 	r.ensureAvailableModelsCacheLocked()
 
 	if cache, ok := r.scopedAvailableModelsCache[cacheKey]; ok && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
-		return cloneModelMaps(cache.models)
+		return cloneModelMaps(cache.models), cache.expiresAt, r.cacheVersion
 	}
 
 	models, expiresAt := r.buildAvailableModelsForClientsLocked(handlerType, orderedClientIDs, now)
@@ -841,7 +873,7 @@ func (r *ModelRegistry) getAvailableModelsForClientCache(handlerType, cacheKey s
 		expiresAt: expiresAt,
 	}
 
-	return models
+	return models, expiresAt, r.cacheVersion
 }
 
 func scopedAvailableModelsCacheKey(handlerType string, clientIDs []string) (string, []string) {
