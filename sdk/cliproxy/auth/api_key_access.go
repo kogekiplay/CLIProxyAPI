@@ -9,9 +9,10 @@ import (
 )
 
 type apiKeyAccessScope struct {
-	restricted bool
-	providers  map[string]struct{}
-	authFiles  map[string]struct{}
+	restricted      bool
+	providers       map[string]struct{}
+	providerTargets map[string]struct{}
+	authFiles       map[string]struct{}
 }
 
 func (m *Manager) apiKeyAccessScopeForContext(ctx context.Context) apiKeyAccessScope {
@@ -36,9 +37,10 @@ func (m *Manager) apiKeyAccessScopeForContext(ctx context.Context) apiKeyAccessS
 		return apiKeyAccessScope{}
 	}
 	scope := apiKeyAccessScope{
-		restricted: true,
-		providers:  stringSet(rule.Providers, true),
-		authFiles:  stringSet(rule.AuthFiles, false),
+		restricted:      true,
+		providers:       stringSet(rule.Providers, true),
+		providerTargets: providerTargetSet(rule.ProviderTargets),
+		authFiles:       stringSet(rule.AuthFiles, false),
 	}
 	return scope
 }
@@ -79,6 +81,32 @@ func stringSet(values []string, lower bool) map[string]struct{} {
 	return out
 }
 
+func providerTargetSet(values []internalconfig.APIKeyAccessProviderTarget) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		key := providerTargetKey(raw.Provider, raw.BaseURL)
+		if key == "" {
+			continue
+		}
+		out[key] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func providerTargetKey(provider, baseURL string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return ""
+	}
+	return provider + "\x00" + strings.TrimSpace(baseURL)
+}
+
 func (s apiKeyAccessScope) allows(auth *Auth) bool {
 	if !s.restricted {
 		return true
@@ -86,12 +114,11 @@ func (s apiKeyAccessScope) allows(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
-	if len(s.providers) == 0 && len(s.authFiles) == 0 {
+	if len(s.providers) == 0 && len(s.providerTargets) == 0 && len(s.authFiles) == 0 {
 		return false
 	}
-	if len(s.providers) > 0 {
-		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-		if _, ok := s.providers[provider]; !ok {
+	if len(s.providers) > 0 || len(s.providerTargets) > 0 {
+		if !s.matchesProvider(auth) {
 			return false
 		}
 	}
@@ -99,6 +126,31 @@ func (s apiKeyAccessScope) allows(auth *Auth) bool {
 		return false
 	}
 	return true
+}
+
+func (s apiKeyAccessScope) matchesProvider(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider == "" {
+		return false
+	}
+	if _, ok := s.providers[provider]; ok {
+		return true
+	}
+	if len(s.providerTargets) == 0 {
+		return false
+	}
+	baseURL := ""
+	if auth.Attributes != nil {
+		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+		if baseURL == "" {
+			baseURL = strings.TrimSpace(auth.Attributes["base-url"])
+		}
+	}
+	_, ok := s.providerTargets[providerTargetKey(provider, baseURL)]
+	return ok
 }
 
 func (s apiKeyAccessScope) matchesAuthFile(auth *Auth) bool {

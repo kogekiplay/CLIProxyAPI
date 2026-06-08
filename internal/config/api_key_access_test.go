@@ -13,11 +13,20 @@ func TestNormalizeAPIKeyAccessRules(t *testing.T) {
 	rules := NormalizeAPIKeyAccessRules(map[string]APIKeyAccessRule{
 		" key-limited ": {
 			Providers: []string{" Claude ", "claude", "GEMINI", ""},
+			ProviderTargets: []APIKeyAccessProviderTarget{
+				{Provider: " Claude ", BaseURL: " https://a.example.com "},
+				{Provider: "claude", BaseURL: "https://a.example.com"},
+				{Provider: "Claude", BaseURL: "https://b.example.com"},
+				{Provider: "", BaseURL: "https://ignored.example.com"},
+			},
 			AuthFiles: []string{" claude-a.json ", "claude-a.json", "gemini-b.json"},
 		},
 		"key-all": {
 			Access:    " ALL ",
 			Providers: []string{"claude"},
+			ProviderTargets: []APIKeyAccessProviderTarget{
+				{Provider: "claude", BaseURL: "https://a.example.com"},
+			},
 			AuthFiles: []string{"claude-a.json"},
 		},
 		" ": {Providers: []string{"gemini"}},
@@ -27,13 +36,19 @@ func TestNormalizeAPIKeyAccessRules(t *testing.T) {
 	if got, want := limited.Providers, []string{"claude", "gemini"}; !equalStringSlices(got, want) {
 		t.Fatalf("providers = %#v, want %#v", got, want)
 	}
+	if got, want := limited.ProviderTargets, []APIKeyAccessProviderTarget{
+		{Provider: "claude", BaseURL: "https://a.example.com"},
+		{Provider: "claude", BaseURL: "https://b.example.com"},
+	}; !equalProviderTargetSlices(got, want) {
+		t.Fatalf("provider-targets = %#v, want %#v", got, want)
+	}
 	if got, want := limited.AuthFiles, []string{"claude-a.json", "gemini-b.json"}; !equalStringSlices(got, want) {
 		t.Fatalf("auth-files = %#v, want %#v", got, want)
 	}
 	if _, ok := rules[" "]; ok {
 		t.Fatalf("blank key rule was retained")
 	}
-	if got := rules["key-all"]; got.Access != APIKeyAccessAll || len(got.Providers) != 0 || len(got.AuthFiles) != 0 {
+	if got := rules["key-all"]; got.Access != APIKeyAccessAll || len(got.Providers) != 0 || len(got.ProviderTargets) != 0 || len(got.AuthFiles) != 0 {
 		t.Fatalf("access all rule = %#v, want only access=all", got)
 	}
 }
@@ -50,6 +65,13 @@ api-key-access:
     access: all
   key-limited:
     providers: ["Claude", "gemini"]
+    provider-targets:
+      - provider: Claude
+        base-url: " https://a.example.com "
+      - provider: claude
+        base-url: https://a.example.com
+      - provider: Claude
+        base-url: https://b.example.com
     auth-files:
       - " claude-a.json "
       - "gemini-b.json"
@@ -70,13 +92,19 @@ api-key-access:
 	if got, want := cfg.APIKeyAccess["key-limited"].Providers, []string{"claude", "gemini"}; !equalStringSlices(got, want) {
 		t.Fatalf("providers = %#v, want %#v", got, want)
 	}
+	if got, want := cfg.APIKeyAccess["key-limited"].ProviderTargets, []APIKeyAccessProviderTarget{
+		{Provider: "claude", BaseURL: "https://a.example.com"},
+		{Provider: "claude", BaseURL: "https://b.example.com"},
+	}; !equalProviderTargetSlices(got, want) {
+		t.Fatalf("provider-targets = %#v, want %#v", got, want)
+	}
 	if got, want := cfg.APIKeyAccess["key-limited"].AuthFiles, []string{"claude-a.json", "gemini-b.json"}; !equalStringSlices(got, want) {
 		t.Fatalf("auth-files = %#v, want %#v", got, want)
 	}
 	if _, ok := cfg.APIKeyAccess["key-empty"]; !ok {
 		t.Fatalf("empty restricted rule should be retained")
 	}
-	if got := cfg.APIKeyAccess["key-all"]; got.Access != APIKeyAccessAll || len(got.Providers) != 0 || len(got.AuthFiles) != 0 {
+	if got := cfg.APIKeyAccess["key-all"]; got.Access != APIKeyAccessAll || len(got.Providers) != 0 || len(got.ProviderTargets) != 0 || len(got.AuthFiles) != 0 {
 		t.Fatalf("access all rule = %#v, want only access=all", got)
 	}
 
@@ -89,6 +117,8 @@ api-key-access:
 	}
 	for _, fragment := range []string{
 		"access: all",
+		"provider-targets:",
+		"base-url: https://a.example.com",
 		"- claude-a.json",
 		"- gemini-b.json",
 		"key-empty: {}",
@@ -108,6 +138,15 @@ api-key-access:
     auth-files: ["claude-a.json"]
   key-limited:
     providers: [" Claude ", "claude", "GEMINI", ""]
+    provider-targets:
+      - provider: " Claude "
+        base-url: " https://a.example.com "
+      - provider: "claude"
+        base-url: "https://a.example.com"
+      - provider: "Claude"
+        base-url: "https://b.example.com"
+      - provider: ""
+        base-url: "https://ignored.example.com"
     auth-files:
       - " claude-a.json "
       - "claude-a.json"
@@ -133,12 +172,30 @@ api-key-access:
 	if got, want := cfg.APIKeyAccess["key-limited"].Providers, []string{"claude", "gemini"}; !equalStringSlices(got, want) {
 		t.Fatalf("providers = %#v, want %#v", got, want)
 	}
+	if got, want := cfg.APIKeyAccess["key-limited"].ProviderTargets, []APIKeyAccessProviderTarget{
+		{Provider: "claude", BaseURL: "https://a.example.com"},
+		{Provider: "claude", BaseURL: "https://b.example.com"},
+	}; !equalProviderTargetSlices(got, want) {
+		t.Fatalf("provider-targets = %#v, want %#v", got, want)
+	}
 	if got, want := cfg.APIKeyAccess["key-limited"].AuthFiles, []string{"claude-a.json", "gemini-b.json"}; !equalStringSlices(got, want) {
 		t.Fatalf("auth-files = %#v, want %#v", got, want)
 	}
 }
 
 func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalProviderTargetSlices(a, b []APIKeyAccessProviderTarget) bool {
 	if len(a) != len(b) {
 		return false
 	}

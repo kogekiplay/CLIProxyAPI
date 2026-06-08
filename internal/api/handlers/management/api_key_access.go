@@ -273,6 +273,11 @@ func buildAPIKeyAccessAuthTargets(manager *coreauth.Manager) []gin.H {
 		if !strings.EqualFold(nameI, nameJ) {
 			return strings.ToLower(nameI) < strings.ToLower(nameJ)
 		}
+		baseI, _ := targets[i]["base-url"].(string)
+		baseJ, _ := targets[j]["base-url"].(string)
+		if baseI != baseJ {
+			return baseI < baseJ
+		}
 		idI, _ := targets[i]["id"].(string)
 		idJ, _ := targets[j]["id"].(string)
 		return idI < idJ
@@ -290,18 +295,28 @@ func buildAPIKeyAccessAuthTarget(auth *coreauth.Auth) gin.H {
 		name = strings.TrimSpace(auth.ID)
 	}
 	provider := strings.TrimSpace(auth.Provider)
+	baseURL := apiKeyAccessAuthBaseURL(auth)
+	providerTarget := gin.H{
+		"provider": provider,
+		"base-url": baseURL,
+		"base_url": baseURL,
+	}
 	entry := gin.H{
-		"id":          auth.ID,
-		"auth-index":  auth.Index,
-		"auth_index":  auth.Index,
-		"name":        name,
-		"filename":    strings.TrimSpace(auth.FileName),
-		"provider":    provider,
-		"type":        provider,
-		"label":       auth.Label,
-		"status":      auth.Status,
-		"disabled":    auth.Disabled,
-		"unavailable": auth.Unavailable,
+		"id":              auth.ID,
+		"auth-index":      auth.Index,
+		"auth_index":      auth.Index,
+		"name":            name,
+		"filename":        strings.TrimSpace(auth.FileName),
+		"provider":        provider,
+		"type":            provider,
+		"base-url":        baseURL,
+		"base_url":        baseURL,
+		"provider-target": providerTarget,
+		"provider_target": providerTarget,
+		"label":           auth.Label,
+		"status":          auth.Status,
+		"disabled":        auth.Disabled,
+		"unavailable":     auth.Unavailable,
 	}
 	if path := strings.TrimSpace(authAttribute(auth, "path")); path != "" {
 		entry["path"] = path
@@ -321,4 +336,15 @@ func buildAPIKeyAccessAuthTarget(auth *coreauth.Auth) gin.H {
 		}
 	}
 	return entry
+}
+
+func apiKeyAccessAuthBaseURL(auth *coreauth.Auth) string {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return ""
+	}
+	baseURL := strings.TrimSpace(auth.Attributes["base_url"])
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(auth.Attributes["base-url"])
+	}
+	return baseURL
 }
