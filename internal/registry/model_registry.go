@@ -799,6 +799,20 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 // but only considers the supplied clients.
 func (r *ModelRegistry) GetAvailableModelsForClients(handlerType string, clientIDs []string) []map[string]any {
 	cacheKey, orderedClientIDs := scopedAvailableModelsCacheKey(handlerType, clientIDs)
+	return r.getAvailableModelsForClientCache(handlerType, cacheKey, orderedClientIDs)
+}
+
+// GetAvailableModelsForClientCache returns scoped models using a precomputed sorted client cache key.
+// orderedClientIDs must contain the same trimmed client IDs represented by clientCacheKey.
+func (r *ModelRegistry) GetAvailableModelsForClientCache(handlerType, clientCacheKey string, orderedClientIDs []string) []map[string]any {
+	if clientCacheKey == "" {
+		return nil
+	}
+	cacheKey := strings.TrimSpace(handlerType) + "\x00" + clientCacheKey
+	return r.getAvailableModelsForClientCache(handlerType, cacheKey, orderedClientIDs)
+}
+
+func (r *ModelRegistry) getAvailableModelsForClientCache(handlerType, cacheKey string, orderedClientIDs []string) []map[string]any {
 	if cacheKey == "" {
 		return nil
 	}

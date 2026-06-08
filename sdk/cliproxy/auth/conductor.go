@@ -1168,6 +1168,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	m.rebuildAPIKeyAccessScopesFromRuntimeConfig()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
@@ -1205,6 +1206,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	m.rebuildAPIKeyAccessScopesFromRuntimeConfig()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
@@ -1249,6 +1251,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	}
 	m.mu.Unlock()
 
+	m.rebuildAPIKeyAccessScopesFromRuntimeConfig()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(id)
@@ -1300,6 +1303,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
+	m.rebuildAPIKeyAccessScopesFromRuntimeConfig()
 	m.syncScheduler()
 	return nil
 }
