@@ -110,6 +110,11 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	} else if !reflect.DeepEqual(trimStrings(oldCfg.APIKeys), trimStrings(newCfg.APIKeys)) {
 		changes = append(changes, "api-keys: values updated (count unchanged, redacted)")
 	}
+	oldAccess := config.NormalizeAPIKeyAccessRules(oldCfg.APIKeyAccess)
+	newAccess := config.NormalizeAPIKeyAccessRules(newCfg.APIKeyAccess)
+	if len(oldAccess) != len(newAccess) || !reflect.DeepEqual(oldAccess, newAccess) {
+		changes = append(changes, fmt.Sprintf("api-key-access: updated (%d -> %d rules, redacted)", len(oldAccess), len(newAccess)))
+	}
 	if len(oldCfg.GeminiKey) != len(newCfg.GeminiKey) {
 		changes = append(changes, fmt.Sprintf("gemini-api-key count: %d -> %d", len(oldCfg.GeminiKey), len(newCfg.GeminiKey)))
 	} else {
