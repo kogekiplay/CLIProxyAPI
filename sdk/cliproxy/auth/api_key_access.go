@@ -146,14 +146,14 @@ func (s apiKeyAccessScope) allows(auth *Auth) bool {
 		return false
 	}
 	if len(s.providers) > 0 || len(s.providerTargets) > 0 {
-		if !s.matchesProvider(auth) {
-			return false
+		if s.matchesProvider(auth) {
+			return true
 		}
 	}
-	if len(s.authFiles) > 0 && !s.matchesAuthFile(auth) {
-		return false
+	if len(s.authFiles) > 0 {
+		return s.matchesAuthFile(auth)
 	}
-	return true
+	return false
 }
 
 func (s apiKeyAccessScope) matchesProvider(auth *Auth) bool {

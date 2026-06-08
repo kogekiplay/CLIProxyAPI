@@ -466,7 +466,12 @@ func TestModelsRespectAPIKeyAccessAuthFiles(t *testing.T) {
 		SDKConfig: sdkconfig.SDKConfig{
 			APIKeys: []string{scopedKey},
 			APIKeyAccess: map[string]proxyconfig.APIKeyAccessRule{
-				scopedKey: {AuthFiles: []string{allowedAuth + ".json"}},
+				scopedKey: {
+					ProviderTargets: []proxyconfig.APIKeyAccessProviderTarget{
+						{Provider: "openai", BaseURL: "https://provider.example.com/v1"},
+					},
+					AuthFiles: []string{allowedAuth + ".json"},
+				},
 			},
 		},
 		Debug:                  true,
@@ -544,7 +549,12 @@ func TestCodexClientVersionModelsRespectAPIKeyAccessAuthFiles(t *testing.T) {
 		SDKConfig: sdkconfig.SDKConfig{
 			APIKeys: []string{scopedKey},
 			APIKeyAccess: map[string]proxyconfig.APIKeyAccessRule{
-				scopedKey: {AuthFiles: []string{allowedAuth + ".json"}},
+				scopedKey: {
+					ProviderTargets: []proxyconfig.APIKeyAccessProviderTarget{
+						{Provider: "openai", BaseURL: "https://provider.example.com/v1"},
+					},
+					AuthFiles: []string{allowedAuth + ".json"},
+				},
 			},
 		},
 		Debug:                  true,
