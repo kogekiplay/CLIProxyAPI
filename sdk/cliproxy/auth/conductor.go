@@ -3165,6 +3165,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	scope := m.apiKeyAccessScopeForContext(ctx)
 
 	m.mu.RLock()
 	executor, okExecutor := m.executors[provider]
@@ -3186,6 +3187,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if candidate.Provider != provider || candidate.Disabled {
 			continue
 		}
+		if !scope.allows(candidate) {
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
@@ -3202,6 +3206,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if scope.restricted {
+			return nil, nil, apiKeyAccessDeniedError()
+		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
@@ -3237,6 +3244,9 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return auth, exec, err
 	}
 
+	if m.apiKeyAccessScopeForContext(ctx).restricted {
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
 	if !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
@@ -3300,6 +3310,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	scope := m.apiKeyAccessScopeForContext(ctx)
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -3328,6 +3339,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if candidate == nil || candidate.Disabled {
 			continue
 		}
+		if !scope.allows(candidate) {
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
@@ -3354,6 +3368,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if scope.restricted {
+			return nil, nil, "", apiKeyAccessDeniedError()
+		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
@@ -3394,6 +3411,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
+	if m.apiKeyAccessScopeForContext(ctx).restricted {
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
 	if !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
@@ -3731,6 +3751,7 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	scope := m.apiKeyAccessScopeForContext(ctx)
 	executionSessionID := homeExecutionSessionIDFromMetadata(opts.Metadata)
 	count := homeAuthCountFromMetadata(opts.Metadata)
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && executionSessionID != "" && count <= 1 {
@@ -3738,6 +3759,9 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 			_, alreadyTried := tried[pinnedAuthID]
 			if !alreadyTried {
 				if auth, executor, providerKey, ok := m.homeRuntimeAuthByID(executionSessionID, pinnedAuthID); ok {
+					if !scope.allows(auth) {
+						return nil, nil, "", apiKeyAccessDeniedError()
+					}
 					return auth, executor, providerKey, nil
 				}
 			}
@@ -3805,6 +3829,9 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
 	if providerKey == "" {
 		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned auth without provider", HTTPStatus: http.StatusBadGateway}
+	}
+	if !scope.allows(&auth) {
+		return nil, nil, "", apiKeyAccessDeniedError()
 	}
 
 	homeAuthIndex := strings.TrimSpace(dispatch.AuthIndex)
