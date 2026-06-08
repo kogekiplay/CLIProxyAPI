@@ -15,6 +15,7 @@ type apiKeyAccessScope struct {
 	providerTargets       map[string]struct{}
 	authFiles             map[string]struct{}
 	allowedAuthIDs        []string
+	allowedAuthIDSet      map[string]struct{}
 	allowedAuthIDCacheKey string
 }
 
@@ -99,7 +100,12 @@ func (s *apiKeyAccessScope) rebuildAllowedAuthIDCache(auths map[string]*Auth) {
 		return
 	}
 	sort.Strings(ids)
+	idSet := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		idSet[id] = struct{}{}
+	}
 	s.allowedAuthIDs = ids
+	s.allowedAuthIDSet = idSet
 	s.allowedAuthIDCacheKey = strings.Join(ids, "\x00")
 }
 
@@ -273,6 +279,24 @@ func (s apiKeyAccessScope) allows(auth *Auth) bool {
 		return s.matchesAuthFile(auth)
 	}
 	return false
+}
+
+func (s apiKeyAccessScope) allowsCachedAuthID(auth *Auth) bool {
+	if !s.restricted {
+		return true
+	}
+	if len(s.allowedAuthIDSet) == 0 {
+		return s.allows(auth)
+	}
+	if auth == nil {
+		return false
+	}
+	id := strings.TrimSpace(auth.ID)
+	if id == "" {
+		return false
+	}
+	_, ok := s.allowedAuthIDSet[id]
+	return ok
 }
 
 func (s apiKeyAccessScope) matchesProvider(auth *Auth) bool {

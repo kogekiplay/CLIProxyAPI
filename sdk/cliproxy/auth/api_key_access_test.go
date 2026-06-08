@@ -179,6 +179,30 @@ func TestAllowedAuthIDCacheForAPIKeyMatchesContextLookup(t *testing.T) {
 	}
 }
 
+func TestAPIKeyAccessScope_AllowsCachedAuthIDUsesPrecomputedIDs(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, err := m.Register(context.Background(), &Auth{ID: "auth-1", Provider: "gemini"}); err != nil {
+		t.Fatalf("Register auth-1 error = %v", err)
+	}
+	m.SetConfig(&internalconfig.Config{
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {
+					Providers: []string{"gemini"},
+				},
+			},
+		},
+	})
+
+	scope := m.apiKeyAccessScopeForContext(contextWithUserAPIKey("key-1"))
+	if !scope.allowsCachedAuthID(&Auth{ID: "auth-1", Provider: "claude"}) {
+		t.Fatalf("cached auth ID should be allowed without re-evaluating provider fields")
+	}
+	if scope.allowsCachedAuthID(&Auth{ID: "auth-2", Provider: "gemini"}) {
+		t.Fatalf("matching provider should not be allowed when auth ID is absent from the precomputed cache")
+	}
+}
+
 func TestAllowedAuthIDsForContextReturnsClonedCache(t *testing.T) {
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
 	if _, err := m.Register(context.Background(), &Auth{ID: "auth-1", Provider: "gemini"}); err != nil {
