@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,11 +12,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
+
+func init() {
+	gin.SetMode(gin.TestMode)
+}
 
 func TestGetAPIKeyAccess_RedactsKeyLabelsAndReturnsRules(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	const rawKey = "sk-secret-123456"
 	h := &Handler{
@@ -78,7 +83,6 @@ func TestGetAPIKeyAccess_RedactsKeyLabelsAndReturnsRules(t *testing.T) {
 
 func TestPutPatchDeleteAPIKeyAccess_NormalizesRules(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -150,5 +154,43 @@ func TestPutPatchDeleteAPIKeyAccess_NormalizesRules(t *testing.T) {
 	}
 	if _, ok := h.cfg.APIKeyAccess["key-2"]; !ok {
 		t.Fatalf("key-2 rule was removed: %#v", h.cfg.APIKeyAccess)
+	}
+}
+
+func TestGetAPIKeyAccessAuthTargets_DoNotLeakUpstreamAPIKeys(t *testing.T) {
+	t.Parallel()
+
+	const upstreamAPIKey = "upstream-secret-key-123456"
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "gemini-auth",
+		Provider: "gemini",
+		FileName: "gemini-auth.json",
+		Label:    "Gemini auth",
+		Attributes: map[string]string{
+			"api_key": upstreamAPIKey,
+			"path":    "/tmp/gemini-auth.json",
+		},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := &Handler{
+		cfg:            &config.Config{},
+		configFilePath: writeTestConfigFile(t),
+		authManager:    manager,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/api-key-access", nil)
+
+	h.GetAPIKeyAccess(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), upstreamAPIKey) {
+		t.Fatalf("response leaks upstream API key: %s", rec.Body.String())
 	}
 }

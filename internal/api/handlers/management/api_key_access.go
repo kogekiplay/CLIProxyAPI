@@ -316,7 +316,7 @@ func buildAPIKeyAccessAuthTarget(auth *coreauth.Auth) gin.H {
 		if accountType != "" {
 			entry["account_type"] = accountType
 		}
-		if account != "" {
+		if account != "" && !strings.EqualFold(accountType, "api_key") {
 			entry["account"] = account
 		}
 	}
