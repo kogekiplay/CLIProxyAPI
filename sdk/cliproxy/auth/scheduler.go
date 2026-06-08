@@ -32,11 +32,12 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
+	mu               sync.Mutex
+	strategy         schedulerStrategy
+	providers        map[string]*providerScheduler
+	authProviders    map[string]string
+	mixedCursors     map[string]int
+	mixedPairCursors map[mixedPairCursorKey]int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -71,6 +72,12 @@ type scheduledAuth struct {
 	auth        *Auth
 	state       scheduledState
 	nextRetryAt time.Time
+}
+
+type mixedPairCursorKey struct {
+	firstProvider  string
+	secondProvider string
+	model          string
 }
 
 // readyBucket keeps the ready views for one priority level.
@@ -166,10 +173,11 @@ func normalizeCursor(cursor, size int) int {
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
-		strategy:      selectorStrategy(selector),
-		providers:     make(map[string]*providerScheduler),
-		authProviders: make(map[string]string),
-		mixedCursors:  make(map[string]int),
+		strategy:         selectorStrategy(selector),
+		providers:        make(map[string]*providerScheduler),
+		authProviders:    make(map[string]string),
+		mixedCursors:     make(map[string]int),
+		mixedPairCursors: make(map[mixedPairCursorKey]int),
 	}
 }
 
@@ -194,6 +202,7 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+	clear(s.mixedPairCursors)
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -206,6 +215,7 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	s.providers = make(map[string]*providerScheduler)
 	s.authProviders = make(map[string]string)
 	s.mixedCursors = make(map[string]int)
+	s.mixedPairCursors = make(map[mixedPairCursorKey]int)
 	now := time.Now()
 	for _, auth := range auths {
 		s.upsertAuthLocked(auth, now)
@@ -290,19 +300,18 @@ func (s *authScheduler) pickSingleWithFilter(ctx context.Context, provider, mode
 
 // pickMixed returns the next auth and provider for a mixed-provider request.
 func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, string, error) {
-	return s.pickMixedWithFilter(ctx, providers, model, opts, tried, nil)
+	return s.pickMixedNormalized(ctx, normalizeProviderKeys(providers), model, opts, tried, nil)
 }
 
 // pickMixedScoped returns the next mixed-provider auth matching an additional auth allow predicate.
 func (s *authScheduler) pickMixedScoped(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool) (*Auth, string, error) {
-	return s.pickMixedWithFilter(ctx, providers, model, opts, tried, allowAuth)
+	return s.pickMixedNormalized(ctx, normalizeProviderKeys(providers), model, opts, tried, allowAuth)
 }
 
-func (s *authScheduler) pickMixedWithFilter(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool) (*Auth, string, error) {
+func (s *authScheduler) pickMixedNormalized(ctx context.Context, normalized []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool) (*Auth, string, error) {
 	if s == nil {
 		return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	normalized := normalizeProviderKeys(providers)
 	if len(normalized) == 0 {
 		return nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
@@ -395,7 +404,6 @@ func (s *authScheduler) pickMixedWithFilter(ctx context.Context, providers []str
 		return nil, "", s.mixedUnavailableErrorWithPredicateLocked(normalized, model, predicate)
 	}
 
-	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
 	weights := make([]int, len(normalized))
 	segmentStarts := make([]int, len(normalized))
 	segmentEnds := make([]int, len(normalized))
@@ -412,7 +420,7 @@ func (s *authScheduler) pickMixedWithFilter(ctx context.Context, providers []str
 		return nil, "", s.mixedUnavailableErrorWithPredicateLocked(normalized, model, predicate)
 	}
 
-	startSlot := s.mixedCursors[cursorKey] % totalWeight
+	startSlot := s.mixedCursor(normalized, modelKey) % totalWeight
 	startProviderIndex := -1
 	for providerIndex := range normalized {
 		if weights[providerIndex] == 0 {
@@ -445,10 +453,33 @@ func (s *authScheduler) pickMixedWithFilter(ctx context.Context, providers []str
 		if picked == nil {
 			continue
 		}
-		s.mixedCursors[cursorKey] = slot + 1
+		s.setMixedCursor(normalized, modelKey, slot+1)
 		return picked, providerKey, nil
 	}
 	return nil, "", s.mixedUnavailableErrorWithPredicateLocked(normalized, model, predicate)
+}
+
+func (s *authScheduler) mixedCursor(normalized []string, modelKey string) int {
+	if len(normalized) == 2 {
+		return s.mixedPairCursors[mixedPairCursorKey{
+			firstProvider:  normalized[0],
+			secondProvider: normalized[1],
+			model:          modelKey,
+		}]
+	}
+	return s.mixedCursors[strings.Join(normalized, ",")+":"+modelKey]
+}
+
+func (s *authScheduler) setMixedCursor(normalized []string, modelKey string, cursor int) {
+	if len(normalized) == 2 {
+		s.mixedPairCursors[mixedPairCursorKey{
+			firstProvider:  normalized[0],
+			secondProvider: normalized[1],
+			model:          modelKey,
+		}] = cursor
+		return
+	}
+	s.mixedCursors[strings.Join(normalized, ",")+":"+modelKey] = cursor
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.

@@ -334,6 +334,35 @@ func TestSchedulerPick_MixedProvidersUsesWeightedProviderRotationOverReadyCandid
 	}
 }
 
+func TestSchedulerPickMixedNormalized_UsesWeightedProviderRotation(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "gemini-a", Provider: "gemini"},
+		&Auth{ID: "gemini-b", Provider: "gemini"},
+		&Auth{ID: "claude-a", Provider: "claude"},
+	)
+
+	wantProviders := []string{"gemini", "gemini", "claude", "gemini"}
+	wantIDs := []string{"gemini-a", "gemini-b", "claude-a", "gemini-a"}
+	for index := range wantProviders {
+		got, provider, errPick := scheduler.pickMixedNormalized(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil, nil)
+		if errPick != nil {
+			t.Fatalf("pickMixedNormalized() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickMixedNormalized() #%d auth = nil", index)
+		}
+		if provider != wantProviders[index] {
+			t.Fatalf("pickMixedNormalized() #%d provider = %q, want %q", index, provider, wantProviders[index])
+		}
+		if got.ID != wantIDs[index] {
+			t.Fatalf("pickMixedNormalized() #%d auth.ID = %q, want %q", index, got.ID, wantIDs[index])
+		}
+	}
+}
+
 func TestSchedulerPickMixedScoped_ExcludesDisallowedHigherPriorityAuth(t *testing.T) {
 	t.Parallel()
 

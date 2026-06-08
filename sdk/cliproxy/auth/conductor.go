@@ -3501,16 +3501,16 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			errPick     error
 		)
 		if scope.restricted {
-			selected, providerKey, errPick = m.scheduler.pickMixedScoped(ctx, eligibleProviders, model, opts, tried, scope.allows)
+			selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, scope.allows)
 		} else {
-			selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
+			selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, nil)
 		}
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
 			m.syncScheduler()
 			if scope.restricted {
-				selected, providerKey, errPick = m.scheduler.pickMixedScoped(ctx, eligibleProviders, model, opts, tried, scope.allows)
+				selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, scope.allows)
 			} else {
-				selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
+				selected, providerKey, errPick = m.scheduler.pickMixedNormalized(ctx, eligibleProviders, model, opts, tried, nil)
 			}
 		}
 		if errPick != nil {
