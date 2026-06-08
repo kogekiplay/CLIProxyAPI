@@ -67,8 +67,17 @@ api-key-access:
 	if cfg.APIKeyAccess["key-limited"].Providers[0] != "claude" {
 		t.Fatalf("provider was not normalized: %#v", cfg.APIKeyAccess["key-limited"])
 	}
+	if got, want := cfg.APIKeyAccess["key-limited"].Providers, []string{"claude", "gemini"}; !equalStringSlices(got, want) {
+		t.Fatalf("providers = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.APIKeyAccess["key-limited"].AuthFiles, []string{"claude-a.json", "gemini-b.json"}; !equalStringSlices(got, want) {
+		t.Fatalf("auth-files = %#v, want %#v", got, want)
+	}
 	if _, ok := cfg.APIKeyAccess["key-empty"]; !ok {
 		t.Fatalf("empty restricted rule should be retained")
+	}
+	if got := cfg.APIKeyAccess["key-all"]; got.Access != APIKeyAccessAll || len(got.Providers) != 0 || len(got.AuthFiles) != 0 {
+		t.Fatalf("access all rule = %#v, want only access=all", got)
 	}
 
 	rendered, err := yaml.Marshal(cfg)
@@ -77,6 +86,55 @@ api-key-access:
 	}
 	if !strings.Contains(string(rendered), "api-key-access:") {
 		t.Fatalf("rendered YAML does not include api-key-access:\n%s", rendered)
+	}
+	for _, fragment := range []string{
+		"access: all",
+		"- claude-a.json",
+		"- gemini-b.json",
+		"key-empty: {}",
+	} {
+		if !strings.Contains(string(rendered), fragment) {
+			t.Fatalf("rendered YAML does not include %q:\n%s", fragment, rendered)
+		}
+	}
+}
+
+func TestParseConfigBytes_APIKeyAccess(t *testing.T) {
+	cfg, err := ParseConfigBytes([]byte(`
+api-key-access:
+  key-all:
+    access: " ALL "
+    providers: ["Claude"]
+    auth-files: ["claude-a.json"]
+  key-limited:
+    providers: [" Claude ", "claude", "GEMINI", ""]
+    auth-files:
+      - " claude-a.json "
+      - "claude-a.json"
+      - "gemini-b.json"
+      - ""
+  key-empty: {}
+  " ":
+    providers: ["gemini"]
+`))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", err)
+	}
+
+	if _, ok := cfg.APIKeyAccess[" "]; ok {
+		t.Fatalf("blank key rule was retained")
+	}
+	if _, ok := cfg.APIKeyAccess["key-empty"]; !ok {
+		t.Fatalf("empty restricted rule should be retained")
+	}
+	if got := cfg.APIKeyAccess["key-all"]; got.Access != APIKeyAccessAll || len(got.Providers) != 0 || len(got.AuthFiles) != 0 {
+		t.Fatalf("access all rule = %#v, want only access=all", got)
+	}
+	if got, want := cfg.APIKeyAccess["key-limited"].Providers, []string{"claude", "gemini"}; !equalStringSlices(got, want) {
+		t.Fatalf("providers = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.APIKeyAccess["key-limited"].AuthFiles, []string{"claude-a.json", "gemini-b.json"}; !equalStringSlices(got, want) {
+		t.Fatalf("auth-files = %#v, want %#v", got, want)
 	}
 }
 
