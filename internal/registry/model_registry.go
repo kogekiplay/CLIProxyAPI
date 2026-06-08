@@ -786,6 +786,139 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 	return models
 }
 
+// GetAvailableModelsForClients returns available models registered by the given client IDs.
+// It applies the same quota and suspension visibility semantics as GetAvailableModels,
+// but only considers the supplied clients.
+func (r *ModelRegistry) GetAvailableModelsForClients(handlerType string, clientIDs []string) []map[string]any {
+	clientSet := stringSet(clientIDs)
+	if len(clientSet) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	modelClients := make(map[string]map[string]struct{})
+	modelInfos := make(map[string]*ModelInfo)
+
+	orderedClientIDs := make([]string, 0, len(clientSet))
+	for clientID := range clientSet {
+		orderedClientIDs = append(orderedClientIDs, clientID)
+	}
+	sort.Strings(orderedClientIDs)
+
+	for _, clientID := range orderedClientIDs {
+		modelIDs := r.clientModels[clientID]
+		if len(modelIDs) == 0 {
+			continue
+		}
+		clientInfos := r.clientModelInfos[clientID]
+		seenForClient := make(map[string]struct{}, len(modelIDs))
+		for _, modelID := range modelIDs {
+			modelID = strings.TrimSpace(modelID)
+			if modelID == "" {
+				continue
+			}
+			if _, seen := seenForClient[modelID]; seen {
+				continue
+			}
+			seenForClient[modelID] = struct{}{}
+			clients := modelClients[modelID]
+			if clients == nil {
+				clients = make(map[string]struct{})
+				modelClients[modelID] = clients
+			}
+			clients[clientID] = struct{}{}
+			if modelInfos[modelID] == nil && clientInfos != nil {
+				if info := clientInfos[modelID]; info != nil {
+					modelInfos[modelID] = info
+				}
+			}
+		}
+	}
+
+	if len(modelClients) == 0 {
+		return nil
+	}
+
+	modelIDs := make([]string, 0, len(modelClients))
+	for modelID := range modelClients {
+		modelIDs = append(modelIDs, modelID)
+	}
+	sort.Strings(modelIDs)
+
+	models := make([]map[string]any, 0, len(modelIDs))
+	for _, modelID := range modelIDs {
+		clients := modelClients[modelID]
+		if len(clients) == 0 {
+			continue
+		}
+
+		registration := r.models[modelID]
+		expiredClients := 0
+		cooldownSuspended := 0
+		otherSuspended := 0
+		if registration != nil {
+			for clientID := range clients {
+				if quotaTime := registration.QuotaExceededClients[clientID]; quotaTime != nil {
+					if now.Before(quotaTime.Add(modelQuotaExceededWindow)) {
+						expiredClients++
+					}
+				}
+				if registration.SuspendedClients != nil {
+					if reason, ok := registration.SuspendedClients[clientID]; ok {
+						if strings.EqualFold(reason, "quota") {
+							cooldownSuspended++
+							continue
+						}
+						otherSuspended++
+					}
+				}
+			}
+		}
+
+		availableClients := len(clients)
+		effectiveClients := availableClients - expiredClients - otherSuspended
+		if effectiveClients < 0 {
+			effectiveClients = 0
+		}
+
+		if effectiveClients <= 0 && !(availableClients > 0 && (expiredClients > 0 || cooldownSuspended > 0) && otherSuspended == 0) {
+			continue
+		}
+
+		info := modelInfos[modelID]
+		if info == nil && registration != nil {
+			info = registration.Info
+		}
+		if model := r.convertModelToMap(info, handlerType); model != nil {
+			models = append(models, model)
+		}
+	}
+
+	return models
+}
+
+func stringSet(values []string) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		out[value] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.Time) ([]map[string]any, time.Time) {
 	models := make([]map[string]any, 0, len(r.models))
 	var expiresAt time.Time

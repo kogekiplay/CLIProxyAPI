@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -43,6 +44,33 @@ func (m *Manager) apiKeyAccessScopeForContext(ctx context.Context) apiKeyAccessS
 		authFiles:       stringSet(rule.AuthFiles, false),
 	}
 	return scope
+}
+
+// AllowedAuthsForContext returns auth entries visible to the client API key in ctx.
+// The boolean return is true only when the key has an explicit restricted rule.
+func (m *Manager) AllowedAuthsForContext(ctx context.Context) ([]*Auth, bool) {
+	scope := m.apiKeyAccessScopeForContext(ctx)
+	if !scope.restricted {
+		return nil, false
+	}
+	if m == nil {
+		return nil, true
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	auths := make([]*Auth, 0, len(m.auths))
+	for _, candidate := range m.auths {
+		if !scope.allows(candidate) {
+			continue
+		}
+		auths = append(auths, candidate.Clone())
+	}
+	sort.Slice(auths, func(i, j int) bool {
+		return auths[i].ID < auths[j].ID
+	})
+	return auths, true
 }
 
 func clientAPIKeyFromContext(ctx context.Context) string {
