@@ -318,6 +318,9 @@ func buildAPIKeyAccessAuthTargets(manager *coreauth.Manager) []gin.H {
 	auths := manager.List()
 	targets = make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
+		if apiKeyAccessAuthTargetIsAPIKeyCredential(auth) {
+			continue
+		}
 		if entry := buildAPIKeyAccessAuthTarget(auth); entry != nil {
 			targets = append(targets, entry)
 		}
@@ -343,6 +346,11 @@ func buildAPIKeyAccessAuthTargets(manager *coreauth.Manager) []gin.H {
 		return idI < idJ
 	})
 	return targets
+}
+
+func apiKeyAccessAuthTargetIsAPIKeyCredential(auth *coreauth.Auth) bool {
+	accountType, _ := auth.AccountInfo()
+	return strings.EqualFold(strings.TrimSpace(accountType), "api_key")
 }
 
 func buildAPIKeyAccessAuthTarget(auth *coreauth.Auth) gin.H {
