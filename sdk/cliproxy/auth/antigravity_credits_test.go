@@ -172,6 +172,56 @@ func TestManagerExecuteStream_CodexOnlyDoesNotEnterAntigravityCreditsFallback(t 
 	}
 }
 
+func TestManagerExecuteStream_AntigravityCreditsFallbackRespectsAPIKeyAccessScope(t *testing.T) {
+	const model = "claude-opus-4-6-thinking"
+	executor := &antigravityCreditsFallbackExecutor{}
+	manager := NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"key-1": {AuthFiles: []string{"codex-allowed"}},
+			},
+		},
+	})
+	manager.RegisterExecutor(executor)
+	manager.RegisterExecutor(codexOnlyFailureExecutor{})
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("codex-allowed", "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient("ag-credits", "antigravity", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("codex-allowed")
+		reg.UnregisterClient("ag-credits")
+	})
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "codex-allowed", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register codex auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "ag-credits", Provider: "antigravity"}); errRegister != nil {
+		t.Fatalf("register antigravity auth: %v", errRegister)
+	}
+
+	streamResult, errExecute := manager.ExecuteStream(contextWithUserAPIKey("key-1"), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		var payload []byte
+		if streamResult != nil {
+			for chunk := range streamResult.Chunks {
+				if chunk.Err != nil {
+					payload = append(payload, []byte(chunk.Err.Error())...)
+					continue
+				}
+				payload = append(payload, chunk.Payload...)
+			}
+		}
+		t.Fatalf("ExecuteStream() error = nil, payload=%q, want access-scope failure", string(payload))
+	}
+	if got := errExecute.Error(); !strings.Contains(got, "access scope") {
+		t.Fatalf("ExecuteStream() error = %q, want access-scope failure", got)
+	}
+	if len(executor.streamCreditsRequested) != 0 {
+		t.Fatalf("antigravity credits stream calls = %v, want none", executor.streamCreditsRequested)
+	}
+}
+
 func TestStatusCodeFromError_UnwrapsStreamBootstrap429(t *testing.T) {
 	bootstrapErr := newStreamBootstrapError(&Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}, nil)
 	wrappedErr := fmt.Errorf("conductor stream failed: %w", bootstrapErr)

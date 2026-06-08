@@ -2,11 +2,15 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -19,10 +23,29 @@ func (g *apiKeyAccessTestGinContext) Get(key string) (any, bool) {
 	return v, ok
 }
 
+func (g *apiKeyAccessTestGinContext) Set(key string, value any) {
+	if g.values == nil {
+		g.values = make(map[string]any)
+	}
+	g.values[key] = value
+}
+
 func contextWithUserAPIKey(key string) context.Context {
 	return context.WithValue(context.Background(), "gin", &apiKeyAccessTestGinContext{
 		values: map[string]any{"userApiKey": key},
 	})
+}
+
+type apiKeyAccessHomeDispatcher struct {
+	response homeAuthDispatchResponse
+}
+
+func (d *apiKeyAccessHomeDispatcher) HeartbeatOK() bool {
+	return true
+}
+
+func (d *apiKeyAccessHomeDispatcher) RPopAuth(context.Context, string, string, http.Header, int) ([]byte, error) {
+	return json.Marshal(d.response)
 }
 
 func TestAPIKeyAccessScope_AllowsUnconfiguredKey(t *testing.T) {
@@ -89,6 +112,13 @@ func TestAPIKeyAccessScope_EmptyRuleAllowsNoAuth(t *testing.T) {
 func TestPickNextLegacy_RespectsAPIKeyAccessScope(t *testing.T) {
 	m := NewManager(nil, &RoundRobinSelector{}, nil)
 	m.RegisterExecutor(schedulerTestExecutor{})
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("auth-1", "test", []*registry.ModelInfo{{ID: "gpt5.5"}})
+	reg.RegisterClient("auth-2", "test", []*registry.ModelInfo{{ID: "gpt5.5"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("auth-1")
+		reg.UnregisterClient("auth-2")
+	})
 	m.SetConfig(&internalconfig.Config{
 		SDKConfig: internalconfig.SDKConfig{
 			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
@@ -105,6 +135,10 @@ func TestPickNextLegacy_RespectsAPIKeyAccessScope(t *testing.T) {
 				Status:         StatusError,
 				Unavailable:    true,
 				NextRetryAfter: time.Now().Add(time.Hour),
+				Quota: QuotaState{
+					Exceeded:      true,
+					NextRecoverAt: time.Now().Add(time.Hour),
+				},
 			},
 		},
 	}
@@ -114,8 +148,9 @@ func TestPickNextLegacy_RespectsAPIKeyAccessScope(t *testing.T) {
 	if err == nil {
 		t.Fatalf("pickNextLegacy() error = nil, want access-scope bounded failure")
 	}
-	if got := err.Error(); !strings.Contains(got, "cooling down") && !strings.Contains(got, "access scope") {
-		t.Fatalf("pickNextLegacy() error = %q, want scoped cooldown or access error", got)
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) {
+		t.Fatalf("pickNextLegacy() error = %v, want model cooldown error", err)
 	}
 }
 
@@ -141,5 +176,44 @@ func TestPickNext_ScopedKeyDoesNotUseSchedulerUnfilteredAuth(t *testing.T) {
 	}
 	if selected.ID != "auth-1" {
 		t.Fatalf("selected auth = %q, want auth-1", selected.ID)
+	}
+}
+
+func TestAPIKeyAccessScope_HomeDispatchUsesDispatchedAPIKey(t *testing.T) {
+	dispatcher := &apiKeyAccessHomeDispatcher{
+		response: homeAuthDispatchResponse{
+			UserAPIKey: "effective-key",
+			Auth: Auth{
+				ID:       "home-auth-outside",
+				Provider: "test",
+				Status:   StatusActive,
+			},
+		},
+	}
+	oldCurrentHomeDispatcher := currentHomeDispatcher
+	currentHomeDispatcher = func() homeAuthDispatcher {
+		return dispatcher
+	}
+	t.Cleanup(func() {
+		currentHomeDispatcher = oldCurrentHomeDispatcher
+	})
+
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	m.RegisterExecutor(schedulerTestExecutor{})
+	m.SetConfig(&internalconfig.Config{
+		Home: internalconfig.HomeConfig{Enabled: true},
+		SDKConfig: internalconfig.SDKConfig{
+			APIKeyAccess: map[string]internalconfig.APIKeyAccessRule{
+				"effective-key": {AuthFiles: []string{"home-auth-allowed"}},
+			},
+		},
+	})
+
+	selected, executor, provider, err := m.pickNextViaHome(contextWithUserAPIKey("client-key"), "gpt5.5", cliproxyexecutor.Options{}, nil)
+	if err == nil {
+		t.Fatalf("pickNextViaHome() error = nil, selected=%#v executor=%#v provider=%q, want access-scope failure", selected, executor, provider)
+	}
+	if got := err.Error(); !strings.Contains(got, "access scope") {
+		t.Fatalf("pickNextViaHome() error = %q, want access-scope failure", got)
 	}
 }

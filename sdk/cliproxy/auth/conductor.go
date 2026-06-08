@@ -3751,7 +3751,7 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	scope := m.apiKeyAccessScopeForContext(ctx)
+	clientScope := m.apiKeyAccessScopeForContext(ctx)
 	executionSessionID := homeExecutionSessionIDFromMetadata(opts.Metadata)
 	count := homeAuthCountFromMetadata(opts.Metadata)
 	if cliproxyexecutor.DownstreamWebsocket(ctx) && executionSessionID != "" && count <= 1 {
@@ -3759,7 +3759,7 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 			_, alreadyTried := tried[pinnedAuthID]
 			if !alreadyTried {
 				if auth, executor, providerKey, ok := m.homeRuntimeAuthByID(executionSessionID, pinnedAuthID); ok {
-					if !scope.allows(auth) {
+					if !clientScope.allows(auth) {
 						return nil, nil, "", apiKeyAccessDeniedError()
 					}
 					return auth, executor, providerKey, nil
@@ -3807,6 +3807,7 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned invalid auth payload", HTTPStatus: http.StatusBadGateway}
 	}
 	setHomeUserAPIKeyOnGinContext(ctx, dispatch.UserAPIKey)
+	scope := m.apiKeyAccessScopeForContext(ctx)
 	auth := dispatch.Auth
 	if strings.TrimSpace(auth.ID) == "" {
 		// Backward compatibility: older home instances returned the auth directly.
@@ -3882,11 +3883,12 @@ func requestedModelFromMetadata(metadata map[string]any, fallback string) string
 	return fallback
 }
 
-func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opts cliproxyexecutor.Options) []creditsCandidateEntry {
+func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, routeModel string, opts cliproxyexecutor.Options) []creditsCandidateEntry {
 	if m == nil {
 		return nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	scope := m.apiKeyAccessScopeForContext(ctx)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var known []creditsCandidateEntry
@@ -3896,6 +3898,9 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opt
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
+			continue
+		}
+		if !scope.allows(auth) {
 			continue
 		}
 		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
@@ -3986,7 +3991,7 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 
 func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool) {
 	routeModel := req.Model
-	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	candidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, opts)
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return cliproxyexecutor.Response{}, false
@@ -4034,7 +4039,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 
 func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool) {
 	routeModel := req.Model
-	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	candidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, opts)
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return nil, false
