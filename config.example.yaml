@@ -41,6 +41,19 @@ api-keys:
   - "your-api-key-2"
   - "your-api-key-3"
 
+# Optional per-client API key access scopes.
+# A key without a rule keeps unrestricted access.
+api-key-access:
+  example-admin-key:
+    access: all
+  example-limited-key:
+    providers:
+      - gemini
+      - claude
+    auth-files:
+      - user@gmail.com-project.json
+      - claude-user@example.com.json
+
 # Enable debug logging
 debug: false
 
