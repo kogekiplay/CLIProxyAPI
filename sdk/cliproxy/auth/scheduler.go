@@ -15,9 +15,10 @@ import (
 type schedulerStrategy int
 
 const (
-	schedulerStrategyCustom schedulerStrategy = iota
-	schedulerStrategyRoundRobin
-	schedulerStrategyFillFirst
+	schedulerStrategyCurrent    schedulerStrategy = -1
+	schedulerStrategyCustom     schedulerStrategy = 0
+	schedulerStrategyRoundRobin schedulerStrategy = 1
+	schedulerStrategyFillFirst  schedulerStrategy = 2
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -248,15 +249,19 @@ func (s *authScheduler) removeAuth(authID string) {
 
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
 func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
-	return s.pickSingleWithFilter(ctx, provider, model, opts, tried, nil)
+	return s.pickSingleWithFilterAndStrategy(ctx, provider, model, opts, tried, nil, schedulerStrategyCurrent)
 }
 
 // pickSingleScoped returns the next auth matching an additional auth allow predicate.
 func (s *authScheduler) pickSingleScoped(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool) (*Auth, error) {
-	return s.pickSingleWithFilter(ctx, provider, model, opts, tried, allowAuth)
+	return s.pickSingleWithFilterAndStrategy(ctx, provider, model, opts, tried, allowAuth, schedulerStrategyCurrent)
 }
 
-func (s *authScheduler) pickSingleWithFilter(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool) (*Auth, error) {
+func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, strategy schedulerStrategy) (*Auth, error) {
+	return s.pickSingleWithFilterAndStrategy(ctx, provider, model, opts, tried, nil, strategy)
+}
+
+func (s *authScheduler) pickSingleWithFilterAndStrategy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool, strategy schedulerStrategy) (*Auth, error) {
 	if s == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -267,6 +272,9 @@ func (s *authScheduler) pickSingleWithFilter(ctx context.Context, provider, mode
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if strategy == schedulerStrategyCurrent {
+		strategy = s.strategy
+	}
 	providerState := s.providers[providerKey]
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -292,7 +300,7 @@ func (s *authScheduler) pickSingleWithFilter(ctx context.Context, provider, mode
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -300,15 +308,23 @@ func (s *authScheduler) pickSingleWithFilter(ctx context.Context, provider, mode
 
 // pickMixed returns the next auth and provider for a mixed-provider request.
 func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, string, error) {
-	return s.pickMixedNormalized(ctx, normalizeProviderKeys(providers), model, opts, tried, nil)
+	return s.pickMixedWithFilterAndStrategy(ctx, normalizeProviderKeys(providers), model, opts, tried, nil, schedulerStrategyCurrent)
 }
 
 // pickMixedScoped returns the next mixed-provider auth matching an additional auth allow predicate.
 func (s *authScheduler) pickMixedScoped(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool) (*Auth, string, error) {
-	return s.pickMixedNormalized(ctx, normalizeProviderKeys(providers), model, opts, tried, allowAuth)
+	return s.pickMixedWithFilterAndStrategy(ctx, normalizeProviderKeys(providers), model, opts, tried, allowAuth, schedulerStrategyCurrent)
 }
 
 func (s *authScheduler) pickMixedNormalized(ctx context.Context, normalized []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool) (*Auth, string, error) {
+	return s.pickMixedWithFilterAndStrategy(ctx, normalized, model, opts, tried, allowAuth, schedulerStrategyCurrent)
+}
+
+func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, strategy schedulerStrategy) (*Auth, string, error) {
+	return s.pickMixedWithFilterAndStrategy(ctx, normalizeProviderKeys(providers), model, opts, tried, nil, strategy)
+}
+
+func (s *authScheduler) pickMixedWithFilterAndStrategy(ctx context.Context, normalized []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, allowAuth func(*Auth) bool, strategy schedulerStrategy) (*Auth, string, error) {
 	if s == nil {
 		return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -319,7 +335,7 @@ func (s *authScheduler) pickMixedNormalized(ctx context.Context, normalized []st
 		// When a single provider is eligible, reuse pickSingle so provider-specific preferences
 		// (for example Codex websocket transport) are applied consistently.
 		providerKey := normalized[0]
-		picked, errPick := s.pickSingleWithFilter(ctx, providerKey, model, opts, tried, allowAuth)
+		picked, errPick := s.pickSingleWithFilterAndStrategy(ctx, providerKey, model, opts, tried, allowAuth, strategy)
 		if errPick != nil {
 			return nil, "", errPick
 		}
@@ -333,6 +349,9 @@ func (s *authScheduler) pickMixedNormalized(ctx context.Context, normalized []st
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if strategy == schedulerStrategyCurrent {
+		strategy = s.strategy
+	}
 	if pinnedAuthID != "" {
 		providerKey := s.authProviders[pinnedAuthID]
 		if providerKey == "" || !containsProvider(normalized, providerKey) {
@@ -356,7 +375,7 @@ func (s *authScheduler) pickMixedNormalized(ctx context.Context, normalized []st
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -390,13 +409,13 @@ func (s *authScheduler) pickMixedNormalized(ctx context.Context, normalized []st
 		return nil, "", s.mixedUnavailableErrorWithPredicateLocked(normalized, model, predicate)
 	}
 
-	if s.strategy == schedulerStrategyFillFirst {
+	if strategy == schedulerStrategyFillFirst {
 		for providerIndex, providerKey := range normalized {
 			shard := candidateShards[providerIndex]
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
