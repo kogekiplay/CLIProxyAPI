@@ -3,6 +3,7 @@ package pluginhost
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -176,12 +177,12 @@ func TestHostApplyConfigDispatchesInterceptorRPCMethods(t *testing.T) {
 	}
 
 	caps := h.Snapshot().records[0].plugin.Capabilities
-	reqResp, errReq := caps.RequestInterceptor.InterceptRequest(context.Background(), pluginapi.RequestInterceptRequest{Body: []byte("request")})
+	reqResp, errReq := caps.RequestInterceptor.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{Body: []byte("request")})
 	if errReq != nil {
-		t.Fatalf("InterceptRequest() error = %v", errReq)
+		t.Fatalf("InterceptRequestBeforeAuth() error = %v", errReq)
 	}
 	if got := string(reqResp.Body); got != "request|rpc" {
-		t.Fatalf("InterceptRequest() body = %q, want request|rpc", got)
+		t.Fatalf("InterceptRequestBeforeAuth() body = %q, want request|rpc", got)
 	}
 
 	respResp, errResp := caps.ResponseInterceptor.InterceptResponse(context.Background(), pluginapi.ResponseInterceptRequest{Body: []byte("response")})
@@ -202,8 +203,11 @@ func TestHostApplyConfigDispatchesInterceptorRPCMethods(t *testing.T) {
 }
 
 func TestInterceptorHelpersReturnErrorsWhenCallbackMissing(t *testing.T) {
-	if _, errReq := (requestInterceptorFunc(nil)).InterceptRequest(context.Background(), pluginapi.RequestInterceptRequest{}); errReq == nil {
-		t.Fatal("InterceptRequest() error = nil, want missing request interceptor callback")
+	if _, errReq := (requestInterceptorFunc(nil)).InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{}); errReq == nil {
+		t.Fatal("InterceptRequestBeforeAuth() error = nil, want missing request interceptor callback")
+	}
+	if _, errReq := (requestInterceptorFunc(nil)).InterceptRequestAfterAuth(context.Background(), pluginapi.RequestInterceptRequest{}); errReq == nil {
+		t.Fatal("InterceptRequestAfterAuth() error = nil, want missing request interceptor callback")
 	}
 	if _, errResp := (responseInterceptorFunc{interceptResponse: nil}).InterceptResponse(context.Background(), pluginapi.ResponseInterceptRequest{}); errResp == nil {
 		t.Fatal("InterceptResponse() error = nil, want missing response interceptor callback")
@@ -220,15 +224,26 @@ func TestRPCInterceptorsIncludeHostCallbackID(t *testing.T) {
 		client: client,
 	}
 
-	if _, errReq := adapter.InterceptRequest(context.Background(), pluginapi.RequestInterceptRequest{Body: []byte("request")}); errReq != nil {
-		t.Fatalf("InterceptRequest() error = %v", errReq)
+	if _, errReq := adapter.InterceptRequestBeforeAuth(context.Background(), pluginapi.RequestInterceptRequest{Body: []byte("request")}); errReq != nil {
+		t.Fatalf("InterceptRequestBeforeAuth() error = %v", errReq)
 	}
 	var req rpcRequestInterceptRequest
 	if errDecode := json.Unmarshal(client.requests[pluginabi.MethodRequestInterceptBefore], &req); errDecode != nil {
 		t.Fatalf("decode request interceptor request: %v", errDecode)
 	}
 	if req.HostCallbackID == "" {
-		t.Fatal("request interceptor host_callback_id is empty")
+		t.Fatal("request interceptor before-auth host_callback_id is empty")
+	}
+
+	if _, errReq := adapter.InterceptRequestAfterAuth(context.Background(), pluginapi.RequestInterceptRequest{Body: []byte("request")}); errReq != nil {
+		t.Fatalf("InterceptRequestAfterAuth() error = %v", errReq)
+	}
+	var reqAfter rpcRequestInterceptRequest
+	if errDecode := json.Unmarshal(client.requests[pluginabi.MethodRequestInterceptAfter], &reqAfter); errDecode != nil {
+		t.Fatalf("decode after-auth request interceptor request: %v", errDecode)
+	}
+	if reqAfter.HostCallbackID == "" {
+		t.Fatal("request interceptor after-auth host_callback_id is empty")
 	}
 
 	if _, errResp := adapter.InterceptResponse(context.Background(), pluginapi.ResponseInterceptRequest{Body: []byte("response")}); errResp != nil {
@@ -251,6 +266,40 @@ func TestRPCInterceptorsIncludeHostCallbackID(t *testing.T) {
 	}
 	if chunk.HostCallbackID == "" {
 		t.Fatal("stream chunk interceptor host_callback_id is empty")
+	}
+}
+
+func TestRPCManagementIncludesHostCallbackID(t *testing.T) {
+	client := &capturePluginClient{}
+	host := New()
+	adapter := &rpcPluginAdapter{
+		host:   host,
+		client: client,
+	}
+
+	if _, errHandle := adapter.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/management/plugins/test/status",
+		Body:   []byte("request"),
+	}); errHandle != nil {
+		t.Fatalf("HandleManagement() error = %v", errHandle)
+	}
+	var req rpcManagementRequest
+	if errDecode := json.Unmarshal(client.requests[pluginabi.MethodManagementHandle], &req); errDecode != nil {
+		t.Fatalf("decode management request: %v", errDecode)
+	}
+	if req.HostCallbackID == "" {
+		t.Fatal("management handle host_callback_id is empty")
+	}
+	if req.Method != http.MethodGet || req.Path != "/v0/management/plugins/test/status" || string(req.Body) != "request" {
+		t.Fatalf("management request = %#v, want forwarded request fields", req.ManagementRequest)
+	}
+
+	host.callbackContexts.mu.RLock()
+	_, exists := host.callbackContexts.contexts[req.HostCallbackID]
+	host.callbackContexts.mu.RUnlock()
+	if exists {
+		t.Fatal("management host_callback_id scope was not closed")
 	}
 }
 
