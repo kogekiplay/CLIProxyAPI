@@ -114,6 +114,38 @@ func TestMergeAntigravityFunctionCallPartReplayMergesSignatureIntoExistingFuncti
 	}
 }
 
+func TestPrepareAntigravityGeminiReasoningReplayPayloadAppendsStaleThoughtSignatureWithoutNullParts(t *testing.T) {
+	internalcache.ClearAntigravityReasoningReplayCache()
+	t.Cleanup(internalcache.ClearAntigravityReasoningReplayCache)
+
+	item := []byte(`{"type":"thought_signature","contentIndex":8,"partIndex":3,"thoughtSignature":"sig-text-0123456789"}`)
+	if !internalcache.CacheAntigravityReasoningReplayItems("gemini-3-flash-agent", "session:sess-stale-text", [][]byte{item}) {
+		t.Fatal("cache write failed")
+	}
+
+	payload := []byte(`{"sessionId":"sess-stale-text","request":{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"text":"visible answer"}]},{"role":"user","parts":[{"text":"next"}]}]}}`)
+	out, _, err := prepareAntigravityGeminiReasoningReplayPayload(context.Background(), "gemini-3-flash-agent", cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parts := gjson.GetBytes(out, "request.contents.1.parts").Array()
+	if len(parts) != 2 {
+		t.Fatalf("parts length = %d, want 2; body=%s", len(parts), out)
+	}
+	for i, part := range parts {
+		if part.Type == gjson.Null {
+			t.Fatalf("parts.%d is null; body=%s", i, out)
+		}
+	}
+	if got := parts[0].Get("text").String(); got != "visible answer" {
+		t.Fatalf("text part = %q, want visible answer; body=%s", got, out)
+	}
+	if got := parts[1].Get("thoughtSignature").String(); got != "sig-text-0123456789" {
+		t.Fatalf("thoughtSignature = %q, want sig-text-0123456789; body=%s", got, out)
+	}
+}
+
 func TestAntigravityReasoningReplayScopeUsesStableSessionWithoutSessionId(t *testing.T) {
 	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"stable-user-text"}]}]}}`)
 	scope := antigravityReasoningReplayScopeFromPayload("gemini-3-flash-agent", payload)
