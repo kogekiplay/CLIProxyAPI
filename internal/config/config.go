@@ -668,6 +668,9 @@ type OpenAICompatibilityAPIKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// Source records the system that created this API key entry.
+	Source string `yaml:"source,omitempty" json:"source,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,

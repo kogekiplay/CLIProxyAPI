@@ -214,6 +214,9 @@ func TestOpenCodeGoSyncProviderUpsertsOpenAICompatibilityEntry(t *testing.T) {
 	if provider.APIKeyEntries[0].APIKey != "sk-open-1" {
 		t.Fatalf("api key entry = %q", provider.APIKeyEntries[0].APIKey)
 	}
+	if provider.APIKeyEntries[0].Source != "opencode-go:acc_1" {
+		t.Fatalf("api key source = %q, want opencode-go:acc_1", provider.APIKeyEntries[0].Source)
+	}
 	if !h.cfg.OpenCodeGo.Accounts[0].APIKeySynced || h.cfg.OpenCodeGo.Accounts[0].ProviderSyncedAt == "" || h.cfg.OpenCodeGo.Accounts[0].ProviderSyncError != "" {
 		t.Fatalf("account sync state not updated: %#v", h.cfg.OpenCodeGo.Accounts[0])
 	}
@@ -227,7 +230,7 @@ func TestOpenCodeGoSyncProviderUpsertsOpenAICompatibilityEntry(t *testing.T) {
 	}
 }
 
-func TestOpenCodeGoSyncProviderDoesNotRetargetExistingProviderWithDifferentBaseURL(t *testing.T) {
+func TestOpenCodeGoSyncProviderRejectsExistingProviderWithDifferentBaseURL(t *testing.T) {
 	t.Parallel()
 	h := &Handler{cfg: &config.Config{
 		OpenCodeGo: config.OpenCodeGoConfig{
@@ -248,11 +251,14 @@ func TestOpenCodeGoSyncProviderDoesNotRetargetExistingProviderWithDifferentBaseU
 	}, configFilePath: writeTestConfigFile(t)}
 
 	rec := performOpenCodeGoRouteJSON(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/sync-provider", nil, openCodeGoTestRouter(h))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
-	if got := len(h.cfg.OpenAICompatibility); got != 2 {
-		t.Fatalf("openai compatibility len = %d, want 2", got)
+	if !strings.Contains(rec.Body.String(), "different base-url") {
+		t.Fatalf("missing base-url conflict error: %s", rec.Body.String())
+	}
+	if got := len(h.cfg.OpenAICompatibility); got != 1 {
+		t.Fatalf("openai compatibility len = %d, want 1", got)
 	}
 	if got := h.cfg.OpenAICompatibility[0].BaseURL; got != "https://manual.example/v1" {
 		t.Fatalf("manual provider base-url = %q, want unchanged", got)
@@ -260,14 +266,12 @@ func TestOpenCodeGoSyncProviderDoesNotRetargetExistingProviderWithDifferentBaseU
 	if got := h.cfg.OpenAICompatibility[0].APIKeyEntries[0].APIKey; got != "sk-manual" {
 		t.Fatalf("manual provider key = %q, want sk-manual", got)
 	}
-	if got := h.cfg.OpenAICompatibility[1].BaseURL; got != "https://go.example/v1" {
-		t.Fatalf("opencode provider base-url = %q, want https://go.example/v1", got)
+	account := h.cfg.OpenCodeGo.Accounts[0]
+	if account.ProviderKeyManaged {
+		t.Fatalf("provider-key-managed = true, want false after provider-name conflict")
 	}
-	if got := h.cfg.OpenAICompatibility[1].APIKeyEntries[0].APIKey; got != "sk-open-1" {
-		t.Fatalf("opencode provider key = %q, want sk-open-1", got)
-	}
-	if !h.cfg.OpenCodeGo.Accounts[0].ProviderKeyManaged {
-		t.Fatalf("provider-key-managed = false, want true for newly appended provider key")
+	if !strings.Contains(account.ProviderSyncError, "different base-url") {
+		t.Fatalf("provider sync error = %q, want base-url conflict", account.ProviderSyncError)
 	}
 }
 
@@ -308,6 +312,34 @@ func TestOpenCodeGoDeleteDoesNotRemovePreexistingProviderKey(t *testing.T) {
 	}
 }
 
+func TestOpenCodeGoDeleteDoesNotRemoveProviderKeyWithStaleManagedFlag(t *testing.T) {
+	t.Parallel()
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{
+			ProviderName: "opencode-go",
+			BaseURL:      "https://go.example/v1",
+			Accounts: []config.OpenCodeGoAccount{
+				{ID: "acc_1", APIKey: "sk-existing", BaseURL: "https://go.example/v1", ProviderKeyManaged: true},
+			},
+		},
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name: "opencode-go", BaseURL: "https://go.example/v1",
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "sk-existing"}},
+		}},
+	}, configFilePath: writeTestConfigFile(t)}
+
+	rec := performOpenCodeGoRouteJSON(http.MethodDelete, "/v0/management/opencode-go/accounts/acc_1?remove-provider-key=true", nil, openCodeGoTestRouter(h))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := len(h.cfg.OpenAICompatibility[0].APIKeyEntries); got != 1 {
+		t.Fatalf("provider key entries len = %d, want stale manual key preserved", got)
+	}
+	if got := h.cfg.OpenAICompatibility[0].APIKeyEntries[0].APIKey; got != "sk-existing" {
+		t.Fatalf("remaining provider key = %q, want sk-existing", got)
+	}
+}
+
 func TestOpenCodeGoDeleteOptionallyRemovesProviderKey(t *testing.T) {
 	t.Parallel()
 	h := &Handler{cfg: &config.Config{
@@ -321,7 +353,7 @@ func TestOpenCodeGoDeleteOptionallyRemovesProviderKey(t *testing.T) {
 		},
 		OpenAICompatibility: []config.OpenAICompatibility{{
 			Name: "opencode-go", BaseURL: "https://go.example/v1",
-			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "sk-open-1"}, {APIKey: "sk-open-2"}},
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "sk-open-1", Source: "opencode-go:acc_1"}, {APIKey: "sk-open-2", Source: "opencode-go:acc_2"}},
 		}},
 	}, configFilePath: writeTestConfigFile(t)}
 

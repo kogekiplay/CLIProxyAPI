@@ -3,6 +3,7 @@ package management
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 )
 
 const defaultOpenCodeGoProviderName = "opencode-go"
+const openCodeGoProviderKeySourcePrefix = "opencode-go:"
 
 type openCodeGoSyncRequest struct {
 	ID          string                          `json:"id"`
@@ -200,12 +202,28 @@ func (h *Handler) SyncOpenCodeGoProvider(c *gin.Context) {
 		return
 	}
 
-	if upsertOpenCodeGoProviderKey(h.cfg, providerName, baseURL, apiKey) {
-		account.ProviderKeyManaged = true
+	source := openCodeGoProviderKeySource(account.ID)
+	managed, errSync := upsertOpenCodeGoProviderKey(h.cfg, providerName, baseURL, apiKey, source)
+	if errSync != nil {
+		msg := errSync.Error()
+		account.ProviderName = providerName
+		account.BaseURL = baseURL
+		account.ProviderSyncError = msg
+		account.UpdatedAt = now
+		snapshot, ok := h.saveConfigAndSnapshotLocked(c)
+		if !ok {
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Unlock()
+		h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+		return
 	}
 	account.ProviderName = providerName
 	account.BaseURL = baseURL
 	account.APIKeySynced = true
+	account.ProviderKeyManaged = managed
 	account.ProviderSyncedAt = now
 	account.ProviderSyncError = ""
 	account.UpdatedAt = now
@@ -250,7 +268,7 @@ func (h *Handler) DeleteOpenCodeGoAccount(c *gin.Context) {
 			baseURL = strings.TrimSpace(h.cfg.OpenCodeGo.BaseURL)
 		}
 		if account.ProviderKeyManaged {
-			removeOpenCodeGoProviderKey(h.cfg, providerName, baseURL, account.APIKey)
+			removeOpenCodeGoProviderKey(h.cfg, providerName, baseURL, account.APIKey, openCodeGoProviderKeySource(account.ID))
 		}
 	}
 
@@ -370,6 +388,14 @@ func openCodeGoAccountID(id, workspaceID, apiKey string) string {
 	return "opencode_go_" + hex.EncodeToString(sum[:])[:12]
 }
 
+func openCodeGoProviderKeySource(accountID string) string {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return openCodeGoProviderKeySourcePrefix + "unknown"
+	}
+	return openCodeGoProviderKeySourcePrefix + accountID
+}
+
 func maskOpenCodeGoSecret(secret string) string {
 	secret = strings.TrimSpace(secret)
 	if secret == "" {
@@ -381,48 +407,55 @@ func maskOpenCodeGoSecret(secret string) string {
 	return secret[:4] + "***" + secret[len(secret)-4:]
 }
 
-func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey string) bool {
+func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey, source string) (bool, error) {
 	if cfg == nil {
-		return false
+		return false, nil
 	}
 	providerName = strings.TrimSpace(providerName)
 	baseURL = strings.TrimSpace(baseURL)
 	apiKey = strings.TrimSpace(apiKey)
+	source = strings.TrimSpace(source)
 	if providerName == "" || baseURL == "" || apiKey == "" {
-		return false
+		return false, nil
 	}
+	hasSameNameDifferentBaseURL := false
 	for i := range cfg.OpenAICompatibility {
 		provider := &cfg.OpenAICompatibility[i]
 		if !strings.EqualFold(strings.TrimSpace(provider.Name), providerName) {
 			continue
 		}
 		if strings.TrimSpace(provider.BaseURL) != baseURL {
+			hasSameNameDifferentBaseURL = true
 			continue
 		}
 		for j := range provider.APIKeyEntries {
 			if strings.TrimSpace(provider.APIKeyEntries[j].APIKey) == apiKey {
-				return false
+				return strings.TrimSpace(provider.APIKeyEntries[j].Source) == source, nil
 			}
 		}
-		provider.APIKeyEntries = append(provider.APIKeyEntries, config.OpenAICompatibilityAPIKey{APIKey: apiKey})
-		return true
+		provider.APIKeyEntries = append(provider.APIKeyEntries, config.OpenAICompatibilityAPIKey{APIKey: apiKey, Source: source})
+		return true, nil
+	}
+	if hasSameNameDifferentBaseURL {
+		return false, fmt.Errorf("provider %q already exists with a different base-url; use a unique provider-name or align opencode-go base-url", providerName)
 	}
 	cfg.OpenAICompatibility = append(cfg.OpenAICompatibility, config.OpenAICompatibility{
 		Name:          providerName,
 		BaseURL:       baseURL,
-		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: apiKey}},
+		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: apiKey, Source: source}},
 	})
-	return true
+	return true, nil
 }
 
-func removeOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey string) {
+func removeOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey, source string) {
 	if cfg == nil {
 		return
 	}
 	providerName = strings.TrimSpace(providerName)
 	baseURL = strings.TrimSpace(baseURL)
 	apiKey = strings.TrimSpace(apiKey)
-	if providerName == "" || baseURL == "" || apiKey == "" {
+	source = strings.TrimSpace(source)
+	if providerName == "" || baseURL == "" || apiKey == "" || source == "" {
 		return
 	}
 	for i := range cfg.OpenAICompatibility {
@@ -435,7 +468,7 @@ func removeOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiK
 		}
 		filtered := provider.APIKeyEntries[:0]
 		for _, entry := range provider.APIKeyEntries {
-			if strings.TrimSpace(entry.APIKey) != apiKey || strings.TrimSpace(entry.ProxyURL) != "" {
+			if strings.TrimSpace(entry.APIKey) != apiKey || strings.TrimSpace(entry.ProxyURL) != "" || strings.TrimSpace(entry.Source) != source {
 				filtered = append(filtered, entry)
 			}
 		}

@@ -151,7 +151,7 @@ func sampleCloneRuntimeConfig() *Config {
 		}},
 		OpenAICompatibility: []OpenAICompatibility{{
 			Name:          "compat",
-			APIKeyEntries: []OpenAICompatibilityAPIKey{{APIKey: "compat-key", ProxyURL: "http://proxy.local"}},
+			APIKeyEntries: []OpenAICompatibilityAPIKey{{APIKey: "compat-key", ProxyURL: "http://proxy.local", Source: "test-source"}},
 			Models: []OpenAICompatibilityModel{{
 				Name:     "compat-upstream",
 				Alias:    "compat-client",
