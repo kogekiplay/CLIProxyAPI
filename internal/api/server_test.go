@@ -144,7 +144,7 @@ func TestOpenCodeGoManagementRoutesHitRealServer(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer sk-open-1" {
+		if got := r.Header.Get("Authorization"); !strings.HasPrefix(got, "Bearer sk-") {
 			t.Fatalf("authorization = %q, want bearer api key", got)
 		}
 		_, _ = w.Write([]byte(`{"data":[{"id":"opencode-go"}]}`))
@@ -184,6 +184,9 @@ func TestOpenCodeGoManagementRoutesHitRealServer(t *testing.T) {
 	sync := doRequest(http.MethodPost, "/v0/management/opencode-go/sync", `{"id":"acc_route","api-key":"sk-route"}`)
 	if sync.Code != http.StatusOK {
 		t.Fatalf("sync status = %d, want 200; body=%s", sync.Code, sync.Body.String())
+	}
+	if !strings.Contains(sync.Body.String(), `"api-key-synced":true`) {
+		t.Fatalf("sync response did not auto-sync provider: %s", sync.Body.String())
 	}
 
 	provider := doRequest(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/sync-provider", "")

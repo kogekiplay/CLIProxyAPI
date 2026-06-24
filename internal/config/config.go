@@ -656,8 +656,8 @@ type OpenCodeGoUsageSnapshot struct {
 
 // OpenCodeGoUsageWindow stores usage and reset metadata for one time window.
 type OpenCodeGoUsageWindow struct {
-	Used    float64 `yaml:"used,omitempty" json:"used,omitempty"`
-	Limit   float64 `yaml:"limit,omitempty" json:"limit,omitempty"`
+	Used    float64 `yaml:"used,omitempty" json:"used"`
+	Limit   float64 `yaml:"limit,omitempty" json:"limit"`
 	ResetAt string  `yaml:"reset-at,omitempty" json:"reset-at,omitempty"`
 }
 

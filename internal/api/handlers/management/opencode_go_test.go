@@ -2,11 +2,13 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -63,7 +65,7 @@ func newOpenCodeGoModelsTestServer(t *testing.T, modelIDs []string) *httptest.Se
 			http.NotFound(w, r)
 			return
 		}
-		if got := r.Header.Get("Authorization"); got != "Bearer sk-open" && got != "Bearer sk-open-1" && got != "Bearer sk-open-2" && got != "Bearer sk-existing" {
+		if got := r.Header.Get("Authorization"); !strings.HasPrefix(got, "Bearer sk-") {
 			t.Fatalf("authorization = %q, want bearer api key", got)
 		}
 		var items []map[string]string
@@ -98,7 +100,7 @@ func TestOpenCodeGoRefreshUsageFetchesFromOpenCode(t *testing.T) {
 		if got := r.URL.Query().Get("id"); got != "2222222222222222222222222222222222222222222222222222222222222222" {
 			t.Fatalf("server id = %q", got)
 		}
-		_, _ = w.Write([]byte(`rollingUsage:$R[1],weeklyUsage:$R[2],monthlyUsage:{usagePercent:20,resetInSec:30,status:"ok"};$R[1]={usagePercent:100,resetInSec:60,status:"ok"};$R[2]={usagePercent:40,resetInSec:120,status:"ok"}`))
+		_, _ = w.Write([]byte(`rollingUsage:$R[1],weeklyUsage:$R[2],monthlyUsage:{usagePercent:20,resetInSec:30,status:"ok"};$R[1]={usagePercent:0,resetInSec:60,status:"ok"};$R[2]={usagePercent:40,resetInSec:120,status:"ok"}`))
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
@@ -121,14 +123,108 @@ func TestOpenCodeGoRefreshUsageFetchesFromOpenCode(t *testing.T) {
 	if account.WorkspaceID != "wrk_test123" {
 		t.Fatalf("workspace id = %q, want wrk_test123", account.WorkspaceID)
 	}
-	if account.Usage.Rolling.Used != 100 || account.Usage.Rolling.Limit != 100 {
-		t.Fatalf("rolling usage = %#v", account.Usage.Rolling)
+	if account.Usage.Rolling.Used != 0 || account.Usage.Weekly.Used != 0 || account.Usage.Monthly.Used != 0 {
+		t.Fatalf("usage persisted to config: %#v", account.Usage)
 	}
-	if account.Usage.Weekly.Used != 40 || account.Usage.Monthly.Used != 20 {
-		t.Fatalf("usage snapshot = %#v", account.Usage)
+	var body struct {
+		Account struct {
+			Usage config.OpenCodeGoUsageSnapshot `json:"usage"`
+		} `json:"account"`
 	}
-	if account.Usage.Rolling.ResetAt == "" {
-		t.Fatalf("rolling reset-at empty")
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"used":0`) {
+		t.Fatalf("response omitted zero usage: %s", rec.Body.String())
+	}
+	if body.Account.Usage.Rolling.Used != 0 || body.Account.Usage.Rolling.Limit != 100 {
+		t.Fatalf("response rolling usage = %#v", body.Account.Usage.Rolling)
+	}
+	if body.Account.Usage.Weekly.Used != 40 || body.Account.Usage.Monthly.Used != 20 {
+		t.Fatalf("response usage snapshot = %#v", body.Account.Usage)
+	}
+	if body.Account.Usage.Rolling.ResetAt == "" {
+		t.Fatalf("response rolling reset-at empty")
+	}
+}
+
+func TestOpenCodeGoListAccountsOmitsPersistedUsage(t *testing.T) {
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{
+			Accounts: []config.OpenCodeGoAccount{{
+				ID:     "acc_1",
+				Cookie: "session=secret",
+				Usage: config.OpenCodeGoUsageSnapshot{
+					Rolling: config.OpenCodeGoUsageWindow{Used: 99, Limit: 100, ResetAt: "2026-06-24T12:00:00Z"},
+				},
+			}},
+		},
+	}, configFilePath: writeTestConfigFile(t)}
+
+	rec := performOpenCodeGoRouteJSON(http.MethodGet, "/v0/management/opencode-go/accounts", nil, openCodeGoTestRouter(h))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"usage"`) || strings.Contains(rec.Body.String(), "99") {
+		t.Fatalf("list response leaked persisted usage: %s", rec.Body.String())
+	}
+}
+
+func TestOpenCodeGoRefreshUsageRejectsLocaleOnlyCookie(t *testing.T) {
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{
+			Accounts: []config.OpenCodeGoAccount{{
+				ID:          "acc_1",
+				WorkspaceID: "wrk_test123",
+				Cookie:      "oc_locale=zh",
+			}},
+		},
+	}, configFilePath: writeTestConfigFile(t)}
+
+	rec := performOpenCodeGoRouteJSON(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/refresh-usage", nil, openCodeGoTestRouter(h))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "cookie") || !strings.Contains(rec.Body.String(), "authentication") {
+		t.Fatalf("body = %s, want authentication cookie error", rec.Body.String())
+	}
+}
+
+func TestOpenCodeGoFetchUsageFetchesWorkspacePagesConcurrently(t *testing.T) {
+	clearOpenCodeGoLiteSubscriptionHashCache("")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/workspace/wrk_page123", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(250 * time.Millisecond)
+		_, _ = w.Write([]byte(`<script src="/_build/assets/app.js"></script>`))
+	})
+	mux.HandleFunc("/workspace/wrk_page123/go", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(250 * time.Millisecond)
+		_, _ = w.Write([]byte(`<script src="/_build/assets/app.js"></script>`))
+	})
+	mux.HandleFunc("/_build/assets/app.js", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`const b=createServerReference("2222222222222222222222222222222222222222222222222222222222222222");query(b,"lite.subscription.get")`))
+	})
+	mux.HandleFunc("/_server", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`rollingUsage:{usagePercent:40,resetInSec:60,status:"ok"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	oldSiteURL := openCodeGoSiteURL
+	openCodeGoSiteURL = server.URL
+	defer func() { openCodeGoSiteURL = oldSiteURL }()
+
+	start := time.Now()
+	workspaceID, usage, err := fetchOpenCodeGoUsage(context.Background(), "session=secret", "wrk_page123")
+	if err != nil {
+		t.Fatalf("fetch usage: %v", err)
+	}
+	if workspaceID != "wrk_page123" || usage.Rolling.Used != 40 {
+		t.Fatalf("usage = workspace %q snapshot %#v", workspaceID, usage)
+	}
+	if elapsed := time.Since(start); elapsed >= 400*time.Millisecond {
+		t.Fatalf("usage fetch took %s, want concurrent page fetch under 400ms", elapsed)
 	}
 }
 
@@ -149,9 +245,41 @@ func TestOpenCodeGoJSDependencyURLsResolveBuildAssetPaths(t *testing.T) {
 	}
 }
 
+func TestFindOpenCodeGoLiteSubscriptionHashSearchesScriptsConcurrently(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow.js", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		_, _ = w.Write([]byte(`const a=createServerReference("1111111111111111111111111111111111111111111111111111111111111111");query(a,"other.fn")`))
+	})
+	mux.HandleFunc("/fast.js", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`const b=createServerReference("2222222222222222222222222222222222222222222222222222222222222222");query(b,"lite.subscription.get")`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	start := time.Now()
+	hash, err := findOpenCodeGoLiteSubscriptionHash(context.Background(), []string{
+		server.URL + "/slow.js",
+		server.URL + "/fast.js",
+	}, "session=secret", server.URL+"/go")
+	if err != nil {
+		t.Fatalf("find hash: %v", err)
+	}
+	if hash != "2222222222222222222222222222222222222222222222222222222222222222" {
+		t.Fatalf("hash = %q", hash)
+	}
+	if elapsed := time.Since(start); elapsed >= 300*time.Millisecond {
+		t.Fatalf("hash lookup took %s, want concurrent lookup under 300ms", elapsed)
+	}
+}
+
 func TestOpenCodeGoSyncCreatesAccountAndRedactsList(t *testing.T) {
 	t.Parallel()
-	h := &Handler{cfg: &config.Config{}, configFilePath: writeTestConfigFile(t)}
+	modelsServer := newOpenCodeGoModelsTestServer(t, []string{"opencode-go"})
+	defer modelsServer.Close()
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{BaseURL: modelsServer.URL},
+	}, configFilePath: writeTestConfigFile(t)}
 
 	rec := performOpenCodeGoJSON(http.MethodPost, "/v0/management/opencode-go/sync", map[string]any{
 		"alias":        "main",
@@ -169,6 +297,15 @@ func TestOpenCodeGoSyncCreatesAccountAndRedactsList(t *testing.T) {
 	}
 	if got := len(h.cfg.OpenCodeGo.Accounts); got != 1 {
 		t.Fatalf("accounts len = %d, want 1", got)
+	}
+	if got := len(h.cfg.OpenAICompatibility); got != 1 {
+		t.Fatalf("openai compatibility len = %d, want 1 after auto provider sync", got)
+	}
+	if got := h.cfg.OpenAICompatibility[0].APIKeyEntries[0].Source; got != "opencode-go:"+h.cfg.OpenCodeGo.Accounts[0].ID {
+		t.Fatalf("provider key source = %q, want opencode-go account source", got)
+	}
+	if !h.cfg.OpenCodeGo.Accounts[0].APIKeySynced || !h.cfg.OpenCodeGo.Accounts[0].ProviderKeyManaged {
+		t.Fatalf("account provider sync state = %#v, want synced managed", h.cfg.OpenCodeGo.Accounts[0])
 	}
 
 	list := performOpenCodeGoJSON(http.MethodGet, "/v0/management/opencode-go/accounts", nil, h.ListOpenCodeGoAccounts)
@@ -203,7 +340,11 @@ func TestOpenCodeGoSyncCreatesAccountAndRedactsList(t *testing.T) {
 
 func TestOpenCodeGoSyncUpdatesByWorkspaceAndPreservesOldUsageWhenOmitted(t *testing.T) {
 	t.Parallel()
-	h := &Handler{cfg: &config.Config{}, configFilePath: writeTestConfigFile(t)}
+	modelsServer := newOpenCodeGoModelsTestServer(t, []string{"opencode-go"})
+	defer modelsServer.Close()
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{BaseURL: modelsServer.URL},
+	}, configFilePath: writeTestConfigFile(t)}
 
 	performOpenCodeGoJSON(http.MethodPost, "/v0/management/opencode-go/sync", map[string]any{
 		"alias":        "before",
@@ -242,8 +383,7 @@ func TestOpenCodeGoGinRoutesHitAccountsAndSync(t *testing.T) {
 	}
 
 	sync := performOpenCodeGoRouteJSON(http.MethodPost, "/v0/management/opencode-go/sync", map[string]any{
-		"id":      "acc_route",
-		"api-key": "sk-route",
+		"id": "acc_route",
 	}, router)
 	if sync.Code != http.StatusOK {
 		t.Fatalf("sync status = %d, want 200; body=%s", sync.Code, sync.Body.String())
@@ -476,7 +616,7 @@ func TestOpenCodeGoDeleteDoesNotRemoveProviderKeyWithStaleManagedFlag(t *testing
 	}
 }
 
-func TestOpenCodeGoDeleteOptionallyRemovesProviderKey(t *testing.T) {
+func TestOpenCodeGoDeleteRemovesManagedProviderKeyByDefault(t *testing.T) {
 	t.Parallel()
 	h := &Handler{cfg: &config.Config{
 		OpenCodeGo: config.OpenCodeGoConfig{
@@ -493,7 +633,7 @@ func TestOpenCodeGoDeleteOptionallyRemovesProviderKey(t *testing.T) {
 		}},
 	}, configFilePath: writeTestConfigFile(t)}
 
-	rec := performOpenCodeGoRouteJSON(http.MethodDelete, "/v0/management/opencode-go/accounts/acc_1?remove-provider-key=true", nil, openCodeGoTestRouter(h))
+	rec := performOpenCodeGoRouteJSON(http.MethodDelete, "/v0/management/opencode-go/accounts/acc_1", nil, openCodeGoTestRouter(h))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}

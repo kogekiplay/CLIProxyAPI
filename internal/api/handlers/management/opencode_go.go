@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,6 +26,11 @@ const openCodeGoProviderKeySourcePrefix = "opencode-go:"
 
 var openCodeGoSiteURL = defaultOpenCodeGoSiteURL
 var openCodeGoHTTPClient = http.DefaultClient
+var openCodeGoSubscriptionHashCache = struct {
+	sync.Mutex
+	hash      string
+	expiresAt time.Time
+}{}
 
 const openCodeGoBrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 
@@ -40,24 +46,32 @@ type openCodeGoSyncRequest struct {
 }
 
 type openCodeGoAccountResponse struct {
-	ID                 string                         `json:"id"`
-	Alias              string                         `json:"alias,omitempty"`
-	Email              string                         `json:"email,omitempty"`
-	Username           string                         `json:"username,omitempty"`
-	WorkspaceID        string                         `json:"workspace-id,omitempty"`
-	APIKeyPreview      string                         `json:"api-key-preview,omitempty"`
-	HasAPIKey          bool                           `json:"has-api-key"`
-	HasCookie          bool                           `json:"has-cookie"`
-	Usage              config.OpenCodeGoUsageSnapshot `json:"usage,omitempty"`
-	ProviderName       string                         `json:"provider-name,omitempty"`
-	BaseURL            string                         `json:"base-url,omitempty"`
-	APIKeySynced       bool                           `json:"api-key-synced"`
-	ProviderKeyManaged bool                           `json:"provider-key-managed"`
-	ProviderSyncedAt   string                         `json:"provider-synced-at,omitempty"`
-	ProviderSyncError  string                         `json:"provider-sync-error,omitempty"`
-	CreatedAt          string                         `json:"created-at,omitempty"`
-	UpdatedAt          string                         `json:"updated-at,omitempty"`
-	LastSyncedAt       string                         `json:"last-synced-at,omitempty"`
+	ID                 string                          `json:"id"`
+	Alias              string                          `json:"alias,omitempty"`
+	Email              string                          `json:"email,omitempty"`
+	Username           string                          `json:"username,omitempty"`
+	WorkspaceID        string                          `json:"workspace-id,omitempty"`
+	APIKeyPreview      string                          `json:"api-key-preview,omitempty"`
+	HasAPIKey          bool                            `json:"has-api-key"`
+	HasCookie          bool                            `json:"has-cookie"`
+	Usage              *config.OpenCodeGoUsageSnapshot `json:"usage,omitempty"`
+	ProviderName       string                          `json:"provider-name,omitempty"`
+	BaseURL            string                          `json:"base-url,omitempty"`
+	APIKeySynced       bool                            `json:"api-key-synced"`
+	ProviderKeyManaged bool                            `json:"provider-key-managed"`
+	ProviderSyncedAt   string                          `json:"provider-synced-at,omitempty"`
+	ProviderSyncError  string                          `json:"provider-sync-error,omitempty"`
+	CreatedAt          string                          `json:"created-at,omitempty"`
+	UpdatedAt          string                          `json:"updated-at,omitempty"`
+	LastSyncedAt       string                          `json:"last-synced-at,omitempty"`
+}
+
+type openCodeGoProviderSyncPlan struct {
+	AccountID    string
+	ProviderName string
+	BaseURL      string
+	APIKey       string
+	Source       string
 }
 
 func (h *Handler) ListOpenCodeGoAccounts(c *gin.Context) {
@@ -145,6 +159,40 @@ func (h *Handler) SyncOpenCodeGoAccount(c *gin.Context) {
 		h.cfg.OpenCodeGo.Accounts[idx] = account
 	} else {
 		h.cfg.OpenCodeGo.Accounts = append(h.cfg.OpenCodeGo.Accounts, account)
+	}
+
+	syncPlan, syncErr := openCodeGoProviderSyncPlanForAccount(h.cfg, account)
+	if syncErr != nil {
+		idx = findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, account.ID, "", "")
+		if idx >= 0 {
+			if syncPlan.ProviderName != "" {
+				h.cfg.OpenCodeGo.Accounts[idx].ProviderName = syncPlan.ProviderName
+			}
+			if syncPlan.BaseURL != "" {
+				h.cfg.OpenCodeGo.Accounts[idx].BaseURL = syncPlan.BaseURL
+			}
+			h.cfg.OpenCodeGo.Accounts[idx].ProviderSyncError = syncErr.Error()
+			h.cfg.OpenCodeGo.Accounts[idx].UpdatedAt = now
+			account = h.cfg.OpenCodeGo.Accounts[idx]
+		}
+	}
+	if syncPlan.APIKey != "" && syncErr == nil {
+		h.mu.Unlock()
+		models, errModels := fetchOpenCodeGoModels(c.Request.Context(), syncPlan.BaseURL, syncPlan.APIKey)
+		h.mu.Lock()
+		if h.cfg == nil {
+			h.mu.Unlock()
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+			return
+		}
+		idx = findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, syncPlan.AccountID, "", "")
+		if idx < 0 {
+			h.mu.Unlock()
+			c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+			return
+		}
+		applyOpenCodeGoProviderSyncResult(h.cfg, &h.cfg.OpenCodeGo.Accounts[idx], syncPlan, models, errModels, now)
+		account = h.cfg.OpenCodeGo.Accounts[idx]
 	}
 
 	snapshot, ok := h.saveConfigAndSnapshotLocked(c)
@@ -336,6 +384,10 @@ func (h *Handler) RefreshOpenCodeGoUsage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "account cookie is empty"})
 		return
 	}
+	if openCodeGoCookieLooksUnauthenticated(cookie) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "opencode cookie does not include authentication cookies; resync with Tampermonkey cookie access enabled"})
+		return
+	}
 
 	workspaceID, usage, err := fetchOpenCodeGoUsage(c.Request.Context(), cookie, account.WorkspaceID)
 	if err != nil {
@@ -357,9 +409,9 @@ func (h *Handler) RefreshOpenCodeGoUsage(c *gin.Context) {
 		return
 	}
 	h.cfg.OpenCodeGo.Accounts[idx].WorkspaceID = workspaceID
-	h.cfg.OpenCodeGo.Accounts[idx].Usage = usage
 	h.cfg.OpenCodeGo.Accounts[idx].UpdatedAt = now
 	view := openCodeGoAccountView(h.cfg.OpenCodeGo.Accounts[idx], h.cfg.OpenCodeGo)
+	view.Usage = &usage
 	snapshot, ok := h.saveConfigAndSnapshotLocked(c)
 	if !ok {
 		h.mu.Unlock()
@@ -374,6 +426,9 @@ func fetchOpenCodeGoUsage(ctx context.Context, cookie, workspaceID string) (stri
 	cookie = strings.TrimSpace(cookie)
 	if cookie == "" {
 		return "", config.OpenCodeGoUsageSnapshot{}, fmt.Errorf("account cookie is empty")
+	}
+	if openCodeGoCookieLooksUnauthenticated(cookie) {
+		return "", config.OpenCodeGoUsageSnapshot{}, fmt.Errorf("opencode cookie does not include authentication cookies; resync with Tampermonkey cookie access enabled")
 	}
 
 	workspaceID = strings.TrimSpace(workspaceID)
@@ -390,16 +445,7 @@ func fetchOpenCodeGoUsage(ctx context.Context, cookie, workspaceID string) (stri
 
 	workspaceURL := openCodeGoSitePath("/workspace/" + url.PathEscape(workspaceID))
 	goURL := openCodeGoSitePath("/workspace/" + url.PathEscape(workspaceID) + "/go")
-	scriptURLs := make([]string, 0, 16)
-	for _, pageURL := range []string{workspaceURL, goURL} {
-		body, err := fetchOpenCodeGoText(ctx, pageURL, cookie, workspaceURL)
-		if err != nil {
-			return "", config.OpenCodeGoUsageSnapshot{}, err
-		}
-		scriptURLs = append(scriptURLs, extractOpenCodeGoScriptURLs(body, pageURL)...)
-	}
-
-	hash, err := findOpenCodeGoLiteSubscriptionHash(ctx, scriptURLs, cookie, goURL)
+	scriptURLs, err := fetchOpenCodeGoScriptURLs(ctx, []string{workspaceURL, goURL}, cookie, workspaceURL)
 	if err != nil {
 		return "", config.OpenCodeGoUsageSnapshot{}, err
 	}
@@ -408,11 +454,26 @@ func fetchOpenCodeGoUsage(ctx context.Context, cookie, workspaceID string) (stri
 	if err != nil {
 		return "", config.OpenCodeGoUsageSnapshot{}, err
 	}
-	serverURL := openCodeGoSitePath("/_server") + "?id=" + url.QueryEscape(hash) + "&args=" + url.QueryEscape(string(args))
-	body, err := fetchOpenCodeGoTextWithHeaders(ctx, serverURL, cookie, goURL, map[string]string{
-		"X-Server-Id":       hash,
-		"X-Server-Instance": "server-fn:0",
-	})
+
+	hash, cacheHit := getOpenCodeGoLiteSubscriptionHashCache()
+	if hash == "" {
+		hash, err = findOpenCodeGoLiteSubscriptionHash(ctx, scriptURLs, cookie, goURL)
+		if err != nil {
+			return "", config.OpenCodeGoUsageSnapshot{}, err
+		}
+		setOpenCodeGoLiteSubscriptionHashCache(hash)
+	}
+
+	body, err := fetchOpenCodeGoUsageServer(ctx, hash, args, cookie, goURL)
+	if err != nil && cacheHit {
+		clearOpenCodeGoLiteSubscriptionHashCache(hash)
+		hash, err = findOpenCodeGoLiteSubscriptionHash(ctx, scriptURLs, cookie, goURL)
+		if err != nil {
+			return "", config.OpenCodeGoUsageSnapshot{}, err
+		}
+		setOpenCodeGoLiteSubscriptionHashCache(hash)
+		body, err = fetchOpenCodeGoUsageServer(ctx, hash, args, cookie, goURL)
+	}
 	if err != nil {
 		return "", config.OpenCodeGoUsageSnapshot{}, err
 	}
@@ -422,6 +483,108 @@ func fetchOpenCodeGoUsage(ctx context.Context, cookie, workspaceID string) (stri
 		return "", config.OpenCodeGoUsageSnapshot{}, err
 	}
 	return workspaceID, usage, nil
+}
+
+func fetchOpenCodeGoScriptURLs(ctx context.Context, pageURLs []string, cookie, referer string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pageCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type pageResult struct {
+		pageURL    string
+		scriptURLs []string
+		err        error
+	}
+
+	results := make(chan pageResult, len(pageURLs))
+	for _, pageURL := range pageURLs {
+		pageURL := pageURL
+		go func() {
+			body, err := fetchOpenCodeGoText(pageCtx, pageURL, cookie, referer)
+			if err != nil {
+				results <- pageResult{err: err}
+				return
+			}
+			results <- pageResult{
+				pageURL:    pageURL,
+				scriptURLs: extractOpenCodeGoScriptURLs(body, pageURL),
+			}
+		}()
+	}
+
+	scriptURLs := make([]string, 0, len(pageURLs)*8)
+	for range pageURLs {
+		result := <-results
+		if result.err != nil {
+			cancel()
+			return nil, result.err
+		}
+		scriptURLs = append(scriptURLs, result.scriptURLs...)
+	}
+	return scriptURLs, nil
+}
+
+func fetchOpenCodeGoUsageServer(ctx context.Context, hash string, args []byte, cookie, referer string) (string, error) {
+	serverURL := openCodeGoSitePath("/_server") + "?id=" + url.QueryEscape(hash) + "&args=" + url.QueryEscape(string(args))
+	return fetchOpenCodeGoTextWithHeaders(ctx, serverURL, cookie, referer, map[string]string{
+		"X-Server-Id":       hash,
+		"X-Server-Instance": "server-fn:0",
+	})
+}
+
+func getOpenCodeGoLiteSubscriptionHashCache() (string, bool) {
+	openCodeGoSubscriptionHashCache.Lock()
+	defer openCodeGoSubscriptionHashCache.Unlock()
+	if openCodeGoSubscriptionHashCache.hash == "" || time.Now().After(openCodeGoSubscriptionHashCache.expiresAt) {
+		return "", false
+	}
+	return openCodeGoSubscriptionHashCache.hash, true
+}
+
+func setOpenCodeGoLiteSubscriptionHashCache(hash string) {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return
+	}
+	openCodeGoSubscriptionHashCache.Lock()
+	openCodeGoSubscriptionHashCache.hash = hash
+	openCodeGoSubscriptionHashCache.expiresAt = time.Now().Add(15 * time.Minute)
+	openCodeGoSubscriptionHashCache.Unlock()
+}
+
+func clearOpenCodeGoLiteSubscriptionHashCache(hash string) {
+	openCodeGoSubscriptionHashCache.Lock()
+	if hash == "" || openCodeGoSubscriptionHashCache.hash == hash {
+		openCodeGoSubscriptionHashCache.hash = ""
+		openCodeGoSubscriptionHashCache.expiresAt = time.Time{}
+	}
+	openCodeGoSubscriptionHashCache.Unlock()
+}
+
+func openCodeGoCookieLooksUnauthenticated(cookie string) bool {
+	cookie = strings.TrimSpace(cookie)
+	if cookie == "" {
+		return true
+	}
+	for _, part := range strings.Split(cookie, ";") {
+		name, _, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok {
+			continue
+		}
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" {
+			continue
+		}
+		switch name {
+		case "oc_locale":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func fetchOpenCodeGoModels(ctx context.Context, baseURL, apiKey string) ([]config.OpenAICompatibilityModel, error) {
@@ -612,27 +775,71 @@ func extractOpenCodeGoScriptURLs(pageHTML, pageURL string) []string {
 }
 
 func findOpenCodeGoLiteSubscriptionHash(ctx context.Context, scriptURLs []string, cookie, referer string) (string, error) {
-	seen := make(map[string]struct{}, len(scriptURLs))
-	for index := 0; index < len(scriptURLs) && index < 128; index++ {
-		scriptURL := scriptURLs[index]
-		scriptURL = strings.TrimSpace(scriptURL)
-		if scriptURL == "" {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	searchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type scriptResult struct {
+		hash         string
+		dependencies []string
+	}
+
+	const (
+		maxScripts = 128
+		batchSize  = 12
+	)
+
+	queue := append([]string(nil), scriptURLs...)
+	seen := make(map[string]struct{}, len(queue))
+	processed := 0
+	for len(queue) > 0 && processed < maxScripts {
+		batch := make([]string, 0, batchSize)
+		for len(queue) > 0 && len(batch) < batchSize && processed < maxScripts {
+			scriptURL := strings.TrimSpace(queue[0])
+			queue = queue[1:]
+			if scriptURL == "" {
+				continue
+			}
+			if _, ok := seen[scriptURL]; ok {
+				continue
+			}
+			seen[scriptURL] = struct{}{}
+			batch = append(batch, scriptURL)
+			processed++
+		}
+		if len(batch) == 0 {
 			continue
 		}
-		if _, ok := seen[scriptURL]; ok {
-			continue
+
+		results := make(chan scriptResult, len(batch))
+		for _, scriptURL := range batch {
+			scriptURL := scriptURL
+			go func() {
+				body, err := fetchOpenCodeGoText(searchCtx, scriptURL, cookie, referer)
+				if err != nil {
+					results <- scriptResult{}
+					return
+				}
+				if hash := extractOpenCodeGoLiteSubscriptionHash(body); hash != "" {
+					results <- scriptResult{hash: hash}
+					return
+				}
+				results <- scriptResult{dependencies: extractOpenCodeGoJSDependencyURLs(body, scriptURL)}
+			}()
 		}
-		seen[scriptURL] = struct{}{}
-		body, err := fetchOpenCodeGoText(ctx, scriptURL, cookie, referer)
-		if err != nil {
-			continue
-		}
-		if hash := extractOpenCodeGoLiteSubscriptionHash(body); hash != "" {
-			return hash, nil
-		}
-		for _, dependencyURL := range extractOpenCodeGoJSDependencyURLs(body, scriptURL) {
-			if _, ok := seen[dependencyURL]; !ok {
-				scriptURLs = append(scriptURLs, dependencyURL)
+
+		for range batch {
+			result := <-results
+			if result.hash != "" {
+				cancel()
+				return result.hash, nil
+			}
+			for _, dependencyURL := range result.dependencies {
+				if _, ok := seen[dependencyURL]; !ok {
+					queue = append(queue, dependencyURL)
+				}
 			}
 		}
 	}
@@ -751,7 +958,7 @@ func parseOpenCodeGoObjectNumber(object, key string) (float64, bool) {
 
 func (h *Handler) DeleteOpenCodeGoAccount(c *gin.Context) {
 	id := strings.TrimSpace(c.Param("id"))
-	removeProviderKey := strings.EqualFold(c.Query("remove-provider-key"), "true")
+	removeProviderKey := !strings.EqualFold(c.Query("remove-provider-key"), "false")
 
 	h.mu.Lock()
 	if h.cfg == nil {
@@ -863,7 +1070,6 @@ func openCodeGoAccountView(account config.OpenCodeGoAccount, cfg config.OpenCode
 		APIKeyPreview:      maskOpenCodeGoSecret(account.APIKey),
 		HasAPIKey:          strings.TrimSpace(account.APIKey) != "",
 		HasCookie:          strings.TrimSpace(account.Cookie) != "",
-		Usage:              account.Usage,
 		ProviderName:       providerName,
 		BaseURL:            baseURL,
 		APIKeySynced:       account.APIKeySynced,
@@ -923,6 +1129,67 @@ func maskOpenCodeGoSecret(secret string) string {
 		return secret[:1] + "***"
 	}
 	return secret[:4] + "***" + secret[len(secret)-4:]
+}
+
+func openCodeGoProviderSyncPlanForAccount(cfg *config.Config, account config.OpenCodeGoAccount) (openCodeGoProviderSyncPlan, error) {
+	if cfg == nil {
+		return openCodeGoProviderSyncPlan{}, nil
+	}
+	apiKey := strings.TrimSpace(account.APIKey)
+	if apiKey == "" {
+		return openCodeGoProviderSyncPlan{}, nil
+	}
+	providerName := openCodeGoProviderName(cfg.OpenCodeGo)
+	if accountProviderName := strings.TrimSpace(account.ProviderName); accountProviderName != "" {
+		providerName = accountProviderName
+	}
+	baseURL := strings.TrimSpace(account.BaseURL)
+	if baseURL == "" {
+		baseURL = openCodeGoBaseURL(cfg.OpenCodeGo)
+	}
+	if baseURL == "" {
+		return openCodeGoProviderSyncPlan{}, fmt.Errorf("base-url is required before syncing provider")
+	}
+	if errConflict := validateOpenCodeGoProviderBaseURL(cfg, providerName, baseURL); errConflict != nil {
+		return openCodeGoProviderSyncPlan{
+			AccountID:    account.ID,
+			ProviderName: providerName,
+			BaseURL:      baseURL,
+			APIKey:       apiKey,
+			Source:       openCodeGoProviderKeySource(account.ID),
+		}, errConflict
+	}
+	return openCodeGoProviderSyncPlan{
+		AccountID:    account.ID,
+		ProviderName: providerName,
+		BaseURL:      baseURL,
+		APIKey:       apiKey,
+		Source:       openCodeGoProviderKeySource(account.ID),
+	}, nil
+}
+
+func applyOpenCodeGoProviderSyncResult(cfg *config.Config, account *config.OpenCodeGoAccount, plan openCodeGoProviderSyncPlan, models []config.OpenAICompatibilityModel, syncErr error, now string) {
+	if account == nil {
+		return
+	}
+	account.ProviderName = plan.ProviderName
+	account.BaseURL = plan.BaseURL
+	if syncErr != nil {
+		account.ProviderSyncError = syncErr.Error()
+		account.UpdatedAt = now
+		return
+	}
+	managed, errSync := upsertOpenCodeGoProvider(cfg, plan.ProviderName, plan.BaseURL, plan.APIKey, plan.Source, models)
+	if errSync != nil {
+		account.ProviderSyncError = errSync.Error()
+		account.UpdatedAt = now
+		return
+	}
+	account.APIKeySynced = true
+	account.ProviderKeyManaged = managed
+	account.ProviderSyncedAt = now
+	account.ProviderSyncError = ""
+	account.UpdatedAt = now
 }
 
 func upsertOpenCodeGoProvider(cfg *config.Config, providerName, baseURL, apiKey, source string, models []config.OpenAICompatibilityModel) (bool, error) {
