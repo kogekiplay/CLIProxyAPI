@@ -139,11 +139,22 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 
 func TestOpenCodeGoManagementRoutesHitRealServer(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	modelsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-open-1" {
+			t.Fatalf("authorization = %q, want bearer api key", got)
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"opencode-go"}]}`))
+	}))
+	defer modelsServer.Close()
 
 	server := newTestServerWithConfig(t, &proxyconfig.Config{
 		OpenCodeGo: proxyconfig.OpenCodeGoConfig{
 			ProviderName: "opencode-go",
-			BaseURL:      "https://go.example/v1",
+			BaseURL:      modelsServer.URL,
 			Accounts: []proxyconfig.OpenCodeGoAccount{
 				{ID: "acc_1", APIKey: "sk-open-1", Cookie: "session=secret"},
 			},

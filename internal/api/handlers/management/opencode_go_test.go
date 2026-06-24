@@ -56,6 +56,24 @@ func openCodeGoTestRouter(h *Handler) *gin.Engine {
 	return router
 }
 
+func newOpenCodeGoModelsTestServer(t *testing.T, modelIDs []string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-open" && got != "Bearer sk-open-1" && got != "Bearer sk-open-2" && got != "Bearer sk-existing" {
+			t.Fatalf("authorization = %q, want bearer api key", got)
+		}
+		var items []map[string]string
+		for _, id := range modelIDs {
+			items = append(items, map[string]string{"id": id})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": items})
+	}))
+}
+
 func TestOpenCodeGoRefreshUsageFetchesFromOpenCode(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +89,7 @@ func TestOpenCodeGoRefreshUsageFetchesFromOpenCode(t *testing.T) {
 		_, _ = w.Write([]byte(`<script src="/_build/assets/app.js"></script>`))
 	})
 	mux.HandleFunc("/_build/assets/app.js", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`import("./go.js");const a=createServerReference("1111111111111111111111111111111111111111111111111111111111111111");query(a,"other.fn")`))
+		_, _ = w.Write([]byte(`"_build/assets/go.js";const a=createServerReference("1111111111111111111111111111111111111111111111111111111111111111");query(a,"other.fn")`))
 	})
 	mux.HandleFunc("/_build/assets/go.js", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`const b=createServerReference("2222222222222222222222222222222222222222222222222222222222222222");query(b,"lite.subscription.get")`))
@@ -111,6 +129,23 @@ func TestOpenCodeGoRefreshUsageFetchesFromOpenCode(t *testing.T) {
 	}
 	if account.Usage.Rolling.ResetAt == "" {
 		t.Fatalf("rolling reset-at empty")
+	}
+}
+
+func TestOpenCodeGoJSDependencyURLsResolveBuildAssetPaths(t *testing.T) {
+	urls := extractOpenCodeGoJSDependencyURLs(`"_build/assets/index-DtPYjwk4.js";"./query-B0ORTVO5.js";"/_build/assets/root.js"`, "https://opencode.ai/_build/assets/entry-client.js")
+	want := []string{
+		"https://opencode.ai/_build/assets/index-DtPYjwk4.js",
+		"https://opencode.ai/_build/assets/query-B0ORTVO5.js",
+		"https://opencode.ai/_build/assets/root.js",
+	}
+	if len(urls) != len(want) {
+		t.Fatalf("dependency len = %d, want %d; urls=%#v", len(urls), len(want), urls)
+	}
+	for i := range want {
+		if urls[i] != want[i] {
+			t.Fatalf("dependency[%d] = %q, want %q; urls=%#v", i, urls[i], want[i], urls)
+		}
 	}
 }
 
@@ -220,8 +255,11 @@ func TestOpenCodeGoGinRoutesHitAccountsAndSync(t *testing.T) {
 
 func TestOpenCodeGoSyncProviderUsesDefaultBaseURL(t *testing.T) {
 	t.Parallel()
+	modelsServer := newOpenCodeGoModelsTestServer(t, []string{"opencode-go", "opencode-small"})
+	defer modelsServer.Close()
 	h := &Handler{cfg: &config.Config{
 		OpenCodeGo: config.OpenCodeGoConfig{
+			BaseURL:  modelsServer.URL,
 			Accounts: []config.OpenCodeGoAccount{{ID: "acc_1", APIKey: "sk-open"}},
 		},
 	}, configFilePath: writeTestConfigFile(t)}
@@ -230,23 +268,31 @@ func TestOpenCodeGoSyncProviderUsesDefaultBaseURL(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if got := h.cfg.OpenCodeGo.Accounts[0].BaseURL; got != defaultOpenCodeGoBaseURL {
-		t.Fatalf("account base-url = %q, want %q", got, defaultOpenCodeGoBaseURL)
+	if got := h.cfg.OpenCodeGo.Accounts[0].BaseURL; got != modelsServer.URL {
+		t.Fatalf("account base-url = %q, want %q", got, modelsServer.URL)
 	}
 	if got := len(h.cfg.OpenAICompatibility); got != 1 {
 		t.Fatalf("openai compatibility len = %d, want 1", got)
 	}
-	if got := h.cfg.OpenAICompatibility[0].BaseURL; got != defaultOpenCodeGoBaseURL {
-		t.Fatalf("provider base-url = %q, want %q", got, defaultOpenCodeGoBaseURL)
+	if got := h.cfg.OpenAICompatibility[0].BaseURL; got != modelsServer.URL {
+		t.Fatalf("provider base-url = %q, want %q", got, modelsServer.URL)
+	}
+	if got := len(h.cfg.OpenAICompatibility[0].Models); got != 2 {
+		t.Fatalf("provider models len = %d, want 2; models=%#v", got, h.cfg.OpenAICompatibility[0].Models)
+	}
+	if model := h.cfg.OpenAICompatibility[0].Models[0]; model.Name != "opencode-go" || model.Alias != "opencode-go" {
+		t.Fatalf("first provider model = %#v", model)
 	}
 }
 
 func TestOpenCodeGoSyncProviderUpsertsOpenAICompatibilityEntry(t *testing.T) {
 	t.Parallel()
+	modelsServer := newOpenCodeGoModelsTestServer(t, []string{"opencode-go", "opencode-reasoning"})
+	defer modelsServer.Close()
 	h := &Handler{cfg: &config.Config{
 		OpenCodeGo: config.OpenCodeGoConfig{
 			ProviderName: "opencode-go",
-			BaseURL:      "https://go.example/v1",
+			BaseURL:      modelsServer.URL,
 			Accounts: []config.OpenCodeGoAccount{
 				{ID: "acc_1", Alias: "main", APIKey: "sk-open-1"},
 				{ID: "acc_2", Alias: "backup", APIKey: "sk-open-2"},
@@ -267,8 +313,11 @@ func TestOpenCodeGoSyncProviderUpsertsOpenAICompatibilityEntry(t *testing.T) {
 		t.Fatalf("openai compatibility len = %d, want 1", got)
 	}
 	provider := h.cfg.OpenAICompatibility[0]
-	if provider.Name != "opencode-go" || provider.BaseURL != "https://go.example/v1" {
+	if provider.Name != "opencode-go" || provider.BaseURL != modelsServer.URL {
 		t.Fatalf("provider mismatch: %#v", provider)
+	}
+	if got := len(provider.Models); got != 2 {
+		t.Fatalf("provider models len = %d, want 2; models=%#v", got, provider.Models)
 	}
 	if got := len(provider.APIKeyEntries); got != 1 {
 		t.Fatalf("api key entries len after repeat = %d, want 1", got)
@@ -289,6 +338,29 @@ func TestOpenCodeGoSyncProviderUpsertsOpenAICompatibilityEntry(t *testing.T) {
 	}
 	if got := len(h.cfg.OpenAICompatibility[0].APIKeyEntries); got != 2 {
 		t.Fatalf("api key entries len = %d, want 2", got)
+	}
+}
+
+func TestOpenCodeGoSyncProviderRejectsEmptyModelList(t *testing.T) {
+	t.Parallel()
+	modelsServer := newOpenCodeGoModelsTestServer(t, nil)
+	defer modelsServer.Close()
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{
+			BaseURL:  modelsServer.URL,
+			Accounts: []config.OpenCodeGoAccount{{ID: "acc_1", APIKey: "sk-open-1"}},
+		},
+	}, configFilePath: writeTestConfigFile(t)}
+
+	rec := performOpenCodeGoRouteJSON(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/sync-provider", nil, openCodeGoTestRouter(h))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "model list is empty") {
+		t.Fatalf("missing empty model list error: %s", rec.Body.String())
+	}
+	if got := len(h.cfg.OpenAICompatibility); got != 0 {
+		t.Fatalf("openai compatibility len = %d, want 0", got)
 	}
 }
 
@@ -339,16 +411,18 @@ func TestOpenCodeGoSyncProviderRejectsExistingProviderWithDifferentBaseURL(t *te
 
 func TestOpenCodeGoDeleteDoesNotRemovePreexistingProviderKey(t *testing.T) {
 	t.Parallel()
+	modelsServer := newOpenCodeGoModelsTestServer(t, []string{"opencode-go"})
+	defer modelsServer.Close()
 	h := &Handler{cfg: &config.Config{
 		OpenCodeGo: config.OpenCodeGoConfig{
 			ProviderName: "opencode-go",
-			BaseURL:      "https://go.example/v1",
+			BaseURL:      modelsServer.URL,
 			Accounts: []config.OpenCodeGoAccount{
 				{ID: "acc_1", APIKey: "sk-existing"},
 			},
 		},
 		OpenAICompatibility: []config.OpenAICompatibility{{
-			Name: "opencode-go", BaseURL: "https://go.example/v1",
+			Name: "opencode-go", BaseURL: modelsServer.URL,
 			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "sk-existing"}},
 		}},
 	}, configFilePath: writeTestConfigFile(t)}

@@ -214,9 +214,70 @@ func (h *Handler) SyncOpenCodeGoProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 		return
 	}
+	if errConflict := validateOpenCodeGoProviderBaseURL(h.cfg, providerName, baseURL); errConflict != nil {
+		msg := errConflict.Error()
+		account.ProviderName = providerName
+		account.BaseURL = baseURL
+		account.ProviderSyncError = msg
+		account.UpdatedAt = now
+		snapshot, ok := h.saveConfigAndSnapshotLocked(c)
+		if !ok {
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Unlock()
+		h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+		return
+	}
 
 	source := openCodeGoProviderKeySource(account.ID)
-	managed, errSync := upsertOpenCodeGoProviderKey(h.cfg, providerName, baseURL, apiKey, source)
+	h.mu.Unlock()
+
+	models, errModels := fetchOpenCodeGoModels(c.Request.Context(), baseURL, apiKey)
+	if errModels != nil {
+		msg := errModels.Error()
+		h.mu.Lock()
+		if h.cfg == nil {
+			h.mu.Unlock()
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+			return
+		}
+		idx = findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, id, "", "")
+		if idx < 0 {
+			h.mu.Unlock()
+			c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+			return
+		}
+		h.cfg.OpenCodeGo.Accounts[idx].ProviderName = providerName
+		h.cfg.OpenCodeGo.Accounts[idx].BaseURL = baseURL
+		h.cfg.OpenCodeGo.Accounts[idx].ProviderSyncError = msg
+		h.cfg.OpenCodeGo.Accounts[idx].UpdatedAt = now
+		snapshot, ok := h.saveConfigAndSnapshotLocked(c)
+		if !ok {
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Unlock()
+		h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+		return
+	}
+
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	idx = findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, id, "", "")
+	if idx < 0 {
+		h.mu.Unlock()
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+	account = &h.cfg.OpenCodeGo.Accounts[idx]
+	managed, errSync := upsertOpenCodeGoProvider(h.cfg, providerName, baseURL, apiKey, source, models)
 	if errSync != nil {
 		msg := errSync.Error()
 		account.ProviderName = providerName
@@ -361,6 +422,68 @@ func fetchOpenCodeGoUsage(ctx context.Context, cookie, workspaceID string) (stri
 		return "", config.OpenCodeGoUsageSnapshot{}, err
 	}
 	return workspaceID, usage, nil
+}
+
+func fetchOpenCodeGoModels(ctx context.Context, baseURL, apiKey string) ([]config.OpenAICompatibilityModel, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	apiKey = strings.TrimSpace(apiKey)
+	if baseURL == "" {
+		return nil, fmt.Errorf("base-url is required before syncing provider")
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf("account api-key is empty")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("User-Agent", openCodeGoBrowserUserAgent)
+	resp, err := openCodeGoHTTPClientOrDefault().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch opencode go models failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read opencode go models response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("fetch opencode go models returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		Models []string `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("parse opencode go models response: %w", err)
+	}
+	modelIDs := make([]string, 0, len(payload.Data)+len(payload.Models))
+	for _, item := range payload.Data {
+		modelIDs = append(modelIDs, item.ID)
+	}
+	modelIDs = append(modelIDs, payload.Models...)
+	models := make([]config.OpenAICompatibilityModel, 0, len(modelIDs))
+	seen := make(map[string]struct{}, len(modelIDs))
+	for _, modelID := range modelIDs {
+		modelID = strings.TrimSpace(modelID)
+		if modelID == "" {
+			continue
+		}
+		if _, ok := seen[modelID]; ok {
+			continue
+		}
+		seen[modelID] = struct{}{}
+		models = append(models, config.OpenAICompatibilityModel{Name: modelID, Alias: modelID})
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("opencode go model list is empty")
+	}
+	return models, nil
 }
 
 func discoverOpenCodeGoWorkspaceID(ctx context.Context, cookie string) (string, error) {
@@ -517,7 +640,7 @@ func findOpenCodeGoLiteSubscriptionHash(ctx context.Context, scriptURLs []string
 }
 
 func extractOpenCodeGoJSDependencyURLs(script, scriptURL string) []string {
-	matches := regexp.MustCompile(`["']((?:\.{1,2}/|/)[^"']+\.js[^"']*)["']`).FindAllStringSubmatch(script, -1)
+	matches := regexp.MustCompile(`["']((?:\.{1,2}/|/|_build/assets/)[^"']+\.js[^"']*)["']`).FindAllStringSubmatch(script, -1)
 	if len(matches) == 0 {
 		return nil
 	}
@@ -528,7 +651,11 @@ func extractOpenCodeGoJSDependencyURLs(script, scriptURL string) []string {
 		if len(match) != 2 {
 			continue
 		}
-		ref, err := url.Parse(strings.TrimSpace(match[1]))
+		rawRef := strings.TrimSpace(match[1])
+		if strings.HasPrefix(rawRef, "_build/assets/") {
+			rawRef = "/" + rawRef
+		}
+		ref, err := url.Parse(rawRef)
 		if err != nil {
 			continue
 		}
@@ -798,7 +925,7 @@ func maskOpenCodeGoSecret(secret string) string {
 	return secret[:4] + "***" + secret[len(secret)-4:]
 }
 
-func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey, source string) (bool, error) {
+func upsertOpenCodeGoProvider(cfg *config.Config, providerName, baseURL, apiKey, source string, models []config.OpenAICompatibilityModel) (bool, error) {
 	if cfg == nil {
 		return false, nil
 	}
@@ -809,16 +936,15 @@ func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiK
 	if providerName == "" || baseURL == "" || apiKey == "" {
 		return false, nil
 	}
-	hasSameNameDifferentBaseURL := false
 	for i := range cfg.OpenAICompatibility {
 		provider := &cfg.OpenAICompatibility[i]
 		if !strings.EqualFold(strings.TrimSpace(provider.Name), providerName) {
 			continue
 		}
 		if strings.TrimSpace(provider.BaseURL) != baseURL {
-			hasSameNameDifferentBaseURL = true
 			continue
 		}
+		provider.Models = cloneOpenCodeGoProviderModels(models)
 		for j := range provider.APIKeyEntries {
 			if strings.TrimSpace(provider.APIKeyEntries[j].APIKey) == apiKey {
 				return strings.TrimSpace(provider.APIKeyEntries[j].Source) == source, nil
@@ -827,15 +953,40 @@ func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiK
 		provider.APIKeyEntries = append(provider.APIKeyEntries, config.OpenAICompatibilityAPIKey{APIKey: apiKey, Source: source})
 		return true, nil
 	}
-	if hasSameNameDifferentBaseURL {
-		return false, fmt.Errorf("provider %q already exists with a different base-url; use a unique provider-name or align opencode-go base-url", providerName)
-	}
 	cfg.OpenAICompatibility = append(cfg.OpenAICompatibility, config.OpenAICompatibility{
 		Name:          providerName,
 		BaseURL:       baseURL,
+		Models:        cloneOpenCodeGoProviderModels(models),
 		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: apiKey, Source: source}},
 	})
 	return true, nil
+}
+
+func cloneOpenCodeGoProviderModels(models []config.OpenAICompatibilityModel) []config.OpenAICompatibilityModel {
+	if len(models) == 0 {
+		return nil
+	}
+	out := make([]config.OpenAICompatibilityModel, len(models))
+	copy(out, models)
+	return out
+}
+
+func validateOpenCodeGoProviderBaseURL(cfg *config.Config, providerName, baseURL string) error {
+	if cfg == nil {
+		return nil
+	}
+	providerName = strings.TrimSpace(providerName)
+	baseURL = strings.TrimSpace(baseURL)
+	for i := range cfg.OpenAICompatibility {
+		provider := &cfg.OpenAICompatibility[i]
+		if !strings.EqualFold(strings.TrimSpace(provider.Name), providerName) {
+			continue
+		}
+		if strings.TrimSpace(provider.BaseURL) != baseURL {
+			return fmt.Errorf("provider %q already exists with a different base-url; use a unique provider-name or align opencode-go base-url", providerName)
+		}
+	}
+	return nil
 }
 
 func removeOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey, source string) {
