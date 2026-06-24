@@ -146,6 +146,9 @@ type Config struct {
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
 
+	// OpenCodeGo stores accounts imported from the OpenCode Go browser helper.
+	OpenCodeGo OpenCodeGoConfig `yaml:"opencode-go,omitempty" json:"opencode-go,omitempty"`
+
 	// VertexCompatAPIKey defines Vertex AI-compatible API key configurations for third-party providers.
 	// Used for services that use Vertex AI-style paths but with simple API key authentication.
 	VertexCompatAPIKey []VertexCompatKey `yaml:"vertex-api-key" json:"vertex-api-key"`
@@ -614,6 +617,47 @@ type OpenAICompatibility struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+}
+
+// OpenCodeGoConfig stores account data synced by the OpenCode Go userscript.
+type OpenCodeGoConfig struct {
+	ProviderName string              `yaml:"provider-name,omitempty" json:"provider-name,omitempty"`
+	BaseURL      string              `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+	Accounts     []OpenCodeGoAccount `yaml:"accounts,omitempty" json:"accounts,omitempty"`
+}
+
+// OpenCodeGoAccount stores one OpenCode Go account imported by the browser helper.
+type OpenCodeGoAccount struct {
+	ID                string                  `yaml:"id" json:"id"`
+	Alias             string                  `yaml:"alias,omitempty" json:"alias,omitempty"`
+	Email             string                  `yaml:"email,omitempty" json:"email,omitempty"`
+	Username          string                  `yaml:"username,omitempty" json:"username,omitempty"`
+	WorkspaceID       string                  `yaml:"workspace-id,omitempty" json:"workspace-id,omitempty"`
+	APIKey            string                  `yaml:"api-key,omitempty" json:"api-key,omitempty"`
+	Cookie            string                  `yaml:"cookie,omitempty" json:"cookie,omitempty"`
+	Usage             OpenCodeGoUsageSnapshot `yaml:"usage,omitempty" json:"usage,omitempty"`
+	ProviderName      string                  `yaml:"provider-name,omitempty" json:"provider-name,omitempty"`
+	BaseURL           string                  `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+	APIKeySynced      bool                    `yaml:"api-key-synced,omitempty" json:"api-key-synced,omitempty"`
+	ProviderSyncedAt  string                  `yaml:"provider-synced-at,omitempty" json:"provider-synced-at,omitempty"`
+	ProviderSyncError string                  `yaml:"provider-sync-error,omitempty" json:"provider-sync-error,omitempty"`
+	CreatedAt         string                  `yaml:"created-at,omitempty" json:"created-at,omitempty"`
+	UpdatedAt         string                  `yaml:"updated-at,omitempty" json:"updated-at,omitempty"`
+	LastSyncedAt      string                  `yaml:"last-synced-at,omitempty" json:"last-synced-at,omitempty"`
+}
+
+// OpenCodeGoUsageSnapshot stores usage windows reported for an OpenCode Go account.
+type OpenCodeGoUsageSnapshot struct {
+	Rolling OpenCodeGoUsageWindow `yaml:"rolling,omitempty" json:"rolling,omitempty"`
+	Weekly  OpenCodeGoUsageWindow `yaml:"weekly,omitempty" json:"weekly,omitempty"`
+	Monthly OpenCodeGoUsageWindow `yaml:"monthly,omitempty" json:"monthly,omitempty"`
+}
+
+// OpenCodeGoUsageWindow stores usage and reset metadata for one time window.
+type OpenCodeGoUsageWindow struct {
+	Used    float64 `yaml:"used,omitempty" json:"used,omitempty"`
+	Limit   float64 `yaml:"limit,omitempty" json:"limit,omitempty"`
+	ResetAt string  `yaml:"reset-at,omitempty" json:"reset-at,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
