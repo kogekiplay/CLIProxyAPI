@@ -137,6 +137,58 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	}
 }
 
+func TestOpenCodeGoManagementRoutesHitRealServer(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	server := newTestServerWithConfig(t, &proxyconfig.Config{
+		OpenCodeGo: proxyconfig.OpenCodeGoConfig{
+			ProviderName: "opencode-go",
+			BaseURL:      "https://go.example/v1",
+			Accounts: []proxyconfig.OpenCodeGoAccount{
+				{ID: "acc_1", APIKey: "sk-open-1", Cookie: "session=secret"},
+			},
+		},
+	}, nil)
+	if err := os.WriteFile(server.configFilePath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	doRequest := func(method, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer test-management-key")
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		return rr
+	}
+
+	list := doRequest(http.MethodGet, "/v0/management/opencode-go/accounts", "")
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200; body=%s", list.Code, list.Body.String())
+	}
+
+	sync := doRequest(http.MethodPost, "/v0/management/opencode-go/sync", `{"id":"acc_route","api-key":"sk-route"}`)
+	if sync.Code != http.StatusOK {
+		t.Fatalf("sync status = %d, want 200; body=%s", sync.Code, sync.Body.String())
+	}
+
+	provider := doRequest(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/sync-provider", "")
+	if provider.Code != http.StatusOK {
+		t.Fatalf("sync-provider status = %d, want 200; body=%s", provider.Code, provider.Body.String())
+	}
+
+	cookie := doRequest(http.MethodGet, "/v0/management/opencode-go/accounts/acc_1/switch-cookie", "")
+	if cookie.Code != http.StatusOK {
+		t.Fatalf("switch-cookie status = %d, want 200; body=%s", cookie.Code, cookie.Body.String())
+	}
+	if !strings.Contains(cookie.Body.String(), "session=secret") {
+		t.Fatalf("switch-cookie body missing cookie: %s", cookie.Body.String())
+	}
+}
+
 func TestOAuthCallbackRouteSkipsManagementKeyMiddleware(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 

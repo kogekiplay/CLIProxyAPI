@@ -21,6 +21,7 @@ opencode-go:
       api-key: sk-test1234567890
       cookie: session=value
       api-key-synced: true
+      provider-key-managed: true
       provider-name: opencode-go
       provider-sync-error: ""
       usage:
@@ -49,6 +50,9 @@ opencode-go:
 	if account.WorkspaceID != "ws_123" || account.APIKey != "sk-test1234567890" || account.Cookie != "session=value" {
 		t.Fatalf("unexpected account: %#v", account)
 	}
+	if !account.ProviderKeyManaged {
+		t.Fatalf("provider-key-managed = false, want true")
+	}
 
 	out, err := yaml.Marshal(&cfg)
 	if err != nil {
@@ -60,6 +64,7 @@ opencode-go:
 		"provider-name: opencode-go",
 		"workspace-id: ws_123",
 		"api-key: sk-test1234567890",
+		"provider-key-managed: true",
 		"rolling:",
 	} {
 		if !strings.Contains(text, want) {

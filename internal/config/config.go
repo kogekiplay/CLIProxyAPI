@@ -628,22 +628,23 @@ type OpenCodeGoConfig struct {
 
 // OpenCodeGoAccount stores one OpenCode Go account imported by the browser helper.
 type OpenCodeGoAccount struct {
-	ID                string                  `yaml:"id" json:"id"`
-	Alias             string                  `yaml:"alias,omitempty" json:"alias,omitempty"`
-	Email             string                  `yaml:"email,omitempty" json:"email,omitempty"`
-	Username          string                  `yaml:"username,omitempty" json:"username,omitempty"`
-	WorkspaceID       string                  `yaml:"workspace-id,omitempty" json:"workspace-id,omitempty"`
-	APIKey            string                  `yaml:"api-key,omitempty" json:"api-key,omitempty"`
-	Cookie            string                  `yaml:"cookie,omitempty" json:"cookie,omitempty"`
-	Usage             OpenCodeGoUsageSnapshot `yaml:"usage,omitempty" json:"usage,omitempty"`
-	ProviderName      string                  `yaml:"provider-name,omitempty" json:"provider-name,omitempty"`
-	BaseURL           string                  `yaml:"base-url,omitempty" json:"base-url,omitempty"`
-	APIKeySynced      bool                    `yaml:"api-key-synced,omitempty" json:"api-key-synced,omitempty"`
-	ProviderSyncedAt  string                  `yaml:"provider-synced-at,omitempty" json:"provider-synced-at,omitempty"`
-	ProviderSyncError string                  `yaml:"provider-sync-error,omitempty" json:"provider-sync-error,omitempty"`
-	CreatedAt         string                  `yaml:"created-at,omitempty" json:"created-at,omitempty"`
-	UpdatedAt         string                  `yaml:"updated-at,omitempty" json:"updated-at,omitempty"`
-	LastSyncedAt      string                  `yaml:"last-synced-at,omitempty" json:"last-synced-at,omitempty"`
+	ID                 string                  `yaml:"id" json:"id"`
+	Alias              string                  `yaml:"alias,omitempty" json:"alias,omitempty"`
+	Email              string                  `yaml:"email,omitempty" json:"email,omitempty"`
+	Username           string                  `yaml:"username,omitempty" json:"username,omitempty"`
+	WorkspaceID        string                  `yaml:"workspace-id,omitempty" json:"workspace-id,omitempty"`
+	APIKey             string                  `yaml:"api-key,omitempty" json:"api-key,omitempty"`
+	Cookie             string                  `yaml:"cookie,omitempty" json:"cookie,omitempty"`
+	Usage              OpenCodeGoUsageSnapshot `yaml:"usage,omitempty" json:"usage,omitempty"`
+	ProviderName       string                  `yaml:"provider-name,omitempty" json:"provider-name,omitempty"`
+	BaseURL            string                  `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+	APIKeySynced       bool                    `yaml:"api-key-synced,omitempty" json:"api-key-synced,omitempty"`
+	ProviderKeyManaged bool                    `yaml:"provider-key-managed,omitempty" json:"provider-key-managed,omitempty"`
+	ProviderSyncedAt   string                  `yaml:"provider-synced-at,omitempty" json:"provider-synced-at,omitempty"`
+	ProviderSyncError  string                  `yaml:"provider-sync-error,omitempty" json:"provider-sync-error,omitempty"`
+	CreatedAt          string                  `yaml:"created-at,omitempty" json:"created-at,omitempty"`
+	UpdatedAt          string                  `yaml:"updated-at,omitempty" json:"updated-at,omitempty"`
+	LastSyncedAt       string                  `yaml:"last-synced-at,omitempty" json:"last-synced-at,omitempty"`
 }
 
 // OpenCodeGoUsageSnapshot stores usage windows reported for an OpenCode Go account.

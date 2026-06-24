@@ -25,23 +25,24 @@ type openCodeGoSyncRequest struct {
 }
 
 type openCodeGoAccountResponse struct {
-	ID                string                         `json:"id"`
-	Alias             string                         `json:"alias,omitempty"`
-	Email             string                         `json:"email,omitempty"`
-	Username          string                         `json:"username,omitempty"`
-	WorkspaceID       string                         `json:"workspace-id,omitempty"`
-	APIKeyPreview     string                         `json:"api-key-preview,omitempty"`
-	HasAPIKey         bool                           `json:"has-api-key"`
-	HasCookie         bool                           `json:"has-cookie"`
-	Usage             config.OpenCodeGoUsageSnapshot `json:"usage,omitempty"`
-	ProviderName      string                         `json:"provider-name,omitempty"`
-	BaseURL           string                         `json:"base-url,omitempty"`
-	APIKeySynced      bool                           `json:"api-key-synced"`
-	ProviderSyncedAt  string                         `json:"provider-synced-at,omitempty"`
-	ProviderSyncError string                         `json:"provider-sync-error,omitempty"`
-	CreatedAt         string                         `json:"created-at,omitempty"`
-	UpdatedAt         string                         `json:"updated-at,omitempty"`
-	LastSyncedAt      string                         `json:"last-synced-at,omitempty"`
+	ID                 string                         `json:"id"`
+	Alias              string                         `json:"alias,omitempty"`
+	Email              string                         `json:"email,omitempty"`
+	Username           string                         `json:"username,omitempty"`
+	WorkspaceID        string                         `json:"workspace-id,omitempty"`
+	APIKeyPreview      string                         `json:"api-key-preview,omitempty"`
+	HasAPIKey          bool                           `json:"has-api-key"`
+	HasCookie          bool                           `json:"has-cookie"`
+	Usage              config.OpenCodeGoUsageSnapshot `json:"usage,omitempty"`
+	ProviderName       string                         `json:"provider-name,omitempty"`
+	BaseURL            string                         `json:"base-url,omitempty"`
+	APIKeySynced       bool                           `json:"api-key-synced"`
+	ProviderKeyManaged bool                           `json:"provider-key-managed"`
+	ProviderSyncedAt   string                         `json:"provider-synced-at,omitempty"`
+	ProviderSyncError  string                         `json:"provider-sync-error,omitempty"`
+	CreatedAt          string                         `json:"created-at,omitempty"`
+	UpdatedAt          string                         `json:"updated-at,omitempty"`
+	LastSyncedAt       string                         `json:"last-synced-at,omitempty"`
 }
 
 func (h *Handler) ListOpenCodeGoAccounts(c *gin.Context) {
@@ -104,6 +105,7 @@ func (h *Handler) SyncOpenCodeGoAccount(c *gin.Context) {
 	if req.APIKey != "" {
 		if account.APIKey != req.APIKey {
 			account.APIKeySynced = false
+			account.ProviderKeyManaged = false
 			account.ProviderSyncedAt = ""
 			account.ProviderSyncError = ""
 		}
@@ -161,10 +163,17 @@ func (h *Handler) SyncOpenCodeGoProvider(c *gin.Context) {
 	account := &h.cfg.OpenCodeGo.Accounts[idx]
 	apiKey := strings.TrimSpace(account.APIKey)
 	if apiKey == "" {
-		account.ProviderSyncError = "account api-key is empty"
-		_, _ = h.saveConfigAndSnapshotLocked(c)
+		msg := "account api-key is empty"
+		account.ProviderSyncError = msg
+		account.UpdatedAt = now
+		snapshot, ok := h.saveConfigAndSnapshotLocked(c)
+		if !ok {
+			h.mu.Unlock()
+			return
+		}
 		h.mu.Unlock()
-		c.JSON(http.StatusBadRequest, gin.H{"error": "account api-key is empty"})
+		h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 		return
 	}
 
@@ -177,14 +186,23 @@ func (h *Handler) SyncOpenCodeGoProvider(c *gin.Context) {
 		baseURL = strings.TrimSpace(h.cfg.OpenCodeGo.BaseURL)
 	}
 	if baseURL == "" {
-		account.ProviderSyncError = "base-url is required before syncing provider"
-		_, _ = h.saveConfigAndSnapshotLocked(c)
+		msg := "base-url is required before syncing provider"
+		account.ProviderSyncError = msg
+		account.UpdatedAt = now
+		snapshot, ok := h.saveConfigAndSnapshotLocked(c)
+		if !ok {
+			h.mu.Unlock()
+			return
+		}
 		h.mu.Unlock()
-		c.JSON(http.StatusBadRequest, gin.H{"error": "base-url is required before syncing provider"})
+		h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 		return
 	}
 
-	upsertOpenCodeGoProviderKey(h.cfg, providerName, baseURL, apiKey)
+	if upsertOpenCodeGoProviderKey(h.cfg, providerName, baseURL, apiKey) {
+		account.ProviderKeyManaged = true
+	}
 	account.ProviderName = providerName
 	account.BaseURL = baseURL
 	account.APIKeySynced = true
@@ -227,7 +245,13 @@ func (h *Handler) DeleteOpenCodeGoAccount(c *gin.Context) {
 		if providerName == "" {
 			providerName = openCodeGoProviderName(h.cfg.OpenCodeGo)
 		}
-		removeOpenCodeGoProviderKey(h.cfg, providerName, account.APIKey)
+		baseURL := strings.TrimSpace(account.BaseURL)
+		if baseURL == "" {
+			baseURL = strings.TrimSpace(h.cfg.OpenCodeGo.BaseURL)
+		}
+		if account.ProviderKeyManaged {
+			removeOpenCodeGoProviderKey(h.cfg, providerName, baseURL, account.APIKey)
+		}
 	}
 
 	snapshot, ok := h.saveConfigAndSnapshotLocked(c)
@@ -295,23 +319,24 @@ func openCodeGoAccountView(account config.OpenCodeGoAccount, cfg config.OpenCode
 		baseURL = strings.TrimSpace(cfg.BaseURL)
 	}
 	return openCodeGoAccountResponse{
-		ID:                account.ID,
-		Alias:             account.Alias,
-		Email:             account.Email,
-		Username:          account.Username,
-		WorkspaceID:       account.WorkspaceID,
-		APIKeyPreview:     maskOpenCodeGoSecret(account.APIKey),
-		HasAPIKey:         strings.TrimSpace(account.APIKey) != "",
-		HasCookie:         strings.TrimSpace(account.Cookie) != "",
-		Usage:             account.Usage,
-		ProviderName:      providerName,
-		BaseURL:           baseURL,
-		APIKeySynced:      account.APIKeySynced,
-		ProviderSyncedAt:  account.ProviderSyncedAt,
-		ProviderSyncError: account.ProviderSyncError,
-		CreatedAt:         account.CreatedAt,
-		UpdatedAt:         account.UpdatedAt,
-		LastSyncedAt:      account.LastSyncedAt,
+		ID:                 account.ID,
+		Alias:              account.Alias,
+		Email:              account.Email,
+		Username:           account.Username,
+		WorkspaceID:        account.WorkspaceID,
+		APIKeyPreview:      maskOpenCodeGoSecret(account.APIKey),
+		HasAPIKey:          strings.TrimSpace(account.APIKey) != "",
+		HasCookie:          strings.TrimSpace(account.Cookie) != "",
+		Usage:              account.Usage,
+		ProviderName:       providerName,
+		BaseURL:            baseURL,
+		APIKeySynced:       account.APIKeySynced,
+		ProviderKeyManaged: account.ProviderKeyManaged,
+		ProviderSyncedAt:   account.ProviderSyncedAt,
+		ProviderSyncError:  account.ProviderSyncError,
+		CreatedAt:          account.CreatedAt,
+		UpdatedAt:          account.UpdatedAt,
+		LastSyncedAt:       account.LastSyncedAt,
 	}
 }
 
@@ -356,7 +381,41 @@ func maskOpenCodeGoSecret(secret string) string {
 	return secret[:4] + "***" + secret[len(secret)-4:]
 }
 
-func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey string) {
+func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey string) bool {
+	if cfg == nil {
+		return false
+	}
+	providerName = strings.TrimSpace(providerName)
+	baseURL = strings.TrimSpace(baseURL)
+	apiKey = strings.TrimSpace(apiKey)
+	if providerName == "" || baseURL == "" || apiKey == "" {
+		return false
+	}
+	for i := range cfg.OpenAICompatibility {
+		provider := &cfg.OpenAICompatibility[i]
+		if !strings.EqualFold(strings.TrimSpace(provider.Name), providerName) {
+			continue
+		}
+		if strings.TrimSpace(provider.BaseURL) != baseURL {
+			continue
+		}
+		for j := range provider.APIKeyEntries {
+			if strings.TrimSpace(provider.APIKeyEntries[j].APIKey) == apiKey {
+				return false
+			}
+		}
+		provider.APIKeyEntries = append(provider.APIKeyEntries, config.OpenAICompatibilityAPIKey{APIKey: apiKey})
+		return true
+	}
+	cfg.OpenAICompatibility = append(cfg.OpenAICompatibility, config.OpenAICompatibility{
+		Name:          providerName,
+		BaseURL:       baseURL,
+		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: apiKey}},
+	})
+	return true
+}
+
+func removeOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey string) {
 	if cfg == nil {
 		return
 	}
@@ -371,40 +430,12 @@ func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiK
 		if !strings.EqualFold(strings.TrimSpace(provider.Name), providerName) {
 			continue
 		}
-		provider.Name = providerName
-		provider.BaseURL = baseURL
-		for j := range provider.APIKeyEntries {
-			if strings.TrimSpace(provider.APIKeyEntries[j].APIKey) == apiKey {
-				return
-			}
-		}
-		provider.APIKeyEntries = append(provider.APIKeyEntries, config.OpenAICompatibilityAPIKey{APIKey: apiKey})
-		return
-	}
-	cfg.OpenAICompatibility = append(cfg.OpenAICompatibility, config.OpenAICompatibility{
-		Name:          providerName,
-		BaseURL:       baseURL,
-		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: apiKey}},
-	})
-}
-
-func removeOpenCodeGoProviderKey(cfg *config.Config, providerName, apiKey string) {
-	if cfg == nil {
-		return
-	}
-	providerName = strings.TrimSpace(providerName)
-	apiKey = strings.TrimSpace(apiKey)
-	if providerName == "" || apiKey == "" {
-		return
-	}
-	for i := range cfg.OpenAICompatibility {
-		provider := &cfg.OpenAICompatibility[i]
-		if !strings.EqualFold(strings.TrimSpace(provider.Name), providerName) {
+		if strings.TrimSpace(provider.BaseURL) != baseURL {
 			continue
 		}
 		filtered := provider.APIKeyEntries[:0]
 		for _, entry := range provider.APIKeyEntries {
-			if strings.TrimSpace(entry.APIKey) != apiKey {
+			if strings.TrimSpace(entry.APIKey) != apiKey || strings.TrimSpace(entry.ProxyURL) != "" {
 				filtered = append(filtered, entry)
 			}
 		}

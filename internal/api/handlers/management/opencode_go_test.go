@@ -227,7 +227,7 @@ func TestOpenCodeGoSyncProviderUpsertsOpenAICompatibilityEntry(t *testing.T) {
 	}
 }
 
-func TestOpenCodeGoDeleteOptionallyRemovesProviderKey(t *testing.T) {
+func TestOpenCodeGoSyncProviderDoesNotRetargetExistingProviderWithDifferentBaseURL(t *testing.T) {
 	t.Parallel()
 	h := &Handler{cfg: &config.Config{
 		OpenCodeGo: config.OpenCodeGoConfig{
@@ -235,6 +235,87 @@ func TestOpenCodeGoDeleteOptionallyRemovesProviderKey(t *testing.T) {
 			BaseURL:      "https://go.example/v1",
 			Accounts: []config.OpenCodeGoAccount{
 				{ID: "acc_1", APIKey: "sk-open-1"},
+			},
+		},
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name:    "opencode-go",
+			BaseURL: "https://manual.example/v1",
+			Models:  []config.OpenAICompatibilityModel{{Name: "manual-upstream", Alias: "manual-client"}},
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{
+				{APIKey: "sk-manual", ProxyURL: "http://proxy.example"},
+			},
+		}},
+	}, configFilePath: writeTestConfigFile(t)}
+
+	rec := performOpenCodeGoRouteJSON(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/sync-provider", nil, openCodeGoTestRouter(h))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := len(h.cfg.OpenAICompatibility); got != 2 {
+		t.Fatalf("openai compatibility len = %d, want 2", got)
+	}
+	if got := h.cfg.OpenAICompatibility[0].BaseURL; got != "https://manual.example/v1" {
+		t.Fatalf("manual provider base-url = %q, want unchanged", got)
+	}
+	if got := h.cfg.OpenAICompatibility[0].APIKeyEntries[0].APIKey; got != "sk-manual" {
+		t.Fatalf("manual provider key = %q, want sk-manual", got)
+	}
+	if got := h.cfg.OpenAICompatibility[1].BaseURL; got != "https://go.example/v1" {
+		t.Fatalf("opencode provider base-url = %q, want https://go.example/v1", got)
+	}
+	if got := h.cfg.OpenAICompatibility[1].APIKeyEntries[0].APIKey; got != "sk-open-1" {
+		t.Fatalf("opencode provider key = %q, want sk-open-1", got)
+	}
+	if !h.cfg.OpenCodeGo.Accounts[0].ProviderKeyManaged {
+		t.Fatalf("provider-key-managed = false, want true for newly appended provider key")
+	}
+}
+
+func TestOpenCodeGoDeleteDoesNotRemovePreexistingProviderKey(t *testing.T) {
+	t.Parallel()
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{
+			ProviderName: "opencode-go",
+			BaseURL:      "https://go.example/v1",
+			Accounts: []config.OpenCodeGoAccount{
+				{ID: "acc_1", APIKey: "sk-existing"},
+			},
+		},
+		OpenAICompatibility: []config.OpenAICompatibility{{
+			Name: "opencode-go", BaseURL: "https://go.example/v1",
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "sk-existing"}},
+		}},
+	}, configFilePath: writeTestConfigFile(t)}
+	router := openCodeGoTestRouter(h)
+
+	rec := performOpenCodeGoRouteJSON(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/sync-provider", nil, router)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("sync status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if h.cfg.OpenCodeGo.Accounts[0].ProviderKeyManaged {
+		t.Fatalf("provider-key-managed = true, want false for preexisting provider key")
+	}
+
+	rec = performOpenCodeGoRouteJSON(http.MethodDelete, "/v0/management/opencode-go/accounts/acc_1?remove-provider-key=true", nil, router)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := len(h.cfg.OpenAICompatibility[0].APIKeyEntries); got != 1 {
+		t.Fatalf("provider key entries len = %d, want manual key preserved", got)
+	}
+	if got := h.cfg.OpenAICompatibility[0].APIKeyEntries[0].APIKey; got != "sk-existing" {
+		t.Fatalf("remaining provider key = %q, want sk-existing", got)
+	}
+}
+
+func TestOpenCodeGoDeleteOptionallyRemovesProviderKey(t *testing.T) {
+	t.Parallel()
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{
+			ProviderName: "opencode-go",
+			BaseURL:      "https://go.example/v1",
+			Accounts: []config.OpenCodeGoAccount{
+				{ID: "acc_1", APIKey: "sk-open-1", BaseURL: "https://go.example/v1", ProviderKeyManaged: true},
 				{ID: "acc_2", APIKey: "sk-open-2"},
 			},
 		},
