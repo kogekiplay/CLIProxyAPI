@@ -48,11 +48,70 @@ func openCodeGoTestRouter(h *Handler) *gin.Engine {
 	group := router.Group("/v0/management/opencode-go")
 	group.GET("/accounts", h.ListOpenCodeGoAccounts)
 	group.POST("/sync", h.SyncOpenCodeGoAccount)
+	group.POST("/accounts/:id/refresh-usage", h.RefreshOpenCodeGoUsage)
 	group.POST("/accounts/:id/sync-provider", h.SyncOpenCodeGoProvider)
 	group.DELETE("/accounts/:id", h.DeleteOpenCodeGoAccount)
 	group.GET("/accounts/:id/switch-cookie", h.GetOpenCodeGoSwitchCookie)
 	group.GET("/userscript-config", h.GetOpenCodeGoUserscriptConfig)
 	return router
+}
+
+func TestOpenCodeGoRefreshUsageFetchesFromOpenCode(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Cookie"); !strings.Contains(got, "session=secret") {
+			t.Fatalf("auth cookie = %q, want session cookie", got)
+		}
+		http.Redirect(w, r, "/workspace/wrk_test123", http.StatusFound)
+	})
+	mux.HandleFunc("/workspace/wrk_test123", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<script src="/_build/assets/app.js"></script>`))
+	})
+	mux.HandleFunc("/workspace/wrk_test123/go", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<script src="/_build/assets/app.js"></script>`))
+	})
+	mux.HandleFunc("/_build/assets/app.js", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`import("./go.js");const a=createServerReference("1111111111111111111111111111111111111111111111111111111111111111");query(a,"other.fn")`))
+	})
+	mux.HandleFunc("/_build/assets/go.js", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`const b=createServerReference("2222222222222222222222222222222222222222222222222222222222222222");query(b,"lite.subscription.get")`))
+	})
+	mux.HandleFunc("/_server", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("id"); got != "2222222222222222222222222222222222222222222222222222222222222222" {
+			t.Fatalf("server id = %q", got)
+		}
+		_, _ = w.Write([]byte(`rollingUsage:$R[1],weeklyUsage:$R[2],monthlyUsage:{usagePercent:20,resetInSec:30,status:"ok"};$R[1]={usagePercent:100,resetInSec:60,status:"ok"};$R[2]={usagePercent:40,resetInSec:120,status:"ok"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	oldSiteURL := openCodeGoSiteURL
+	openCodeGoSiteURL = server.URL
+	defer func() { openCodeGoSiteURL = oldSiteURL }()
+
+	h := &Handler{cfg: &config.Config{
+		OpenCodeGo: config.OpenCodeGoConfig{
+			Accounts: []config.OpenCodeGoAccount{{ID: "acc_1", Cookie: "session=secret"}},
+		},
+	}, configFilePath: writeTestConfigFile(t)}
+
+	rec := performOpenCodeGoRouteJSON(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/refresh-usage", nil, openCodeGoTestRouter(h))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	account := h.cfg.OpenCodeGo.Accounts[0]
+	if account.WorkspaceID != "wrk_test123" {
+		t.Fatalf("workspace id = %q, want wrk_test123", account.WorkspaceID)
+	}
+	if account.Usage.Rolling.Used != 100 || account.Usage.Rolling.Limit != 100 {
+		t.Fatalf("rolling usage = %#v", account.Usage.Rolling)
+	}
+	if account.Usage.Weekly.Used != 40 || account.Usage.Monthly.Used != 20 {
+		t.Fatalf("usage snapshot = %#v", account.Usage)
+	}
+	if account.Usage.Rolling.ResetAt == "" {
+		t.Fatalf("rolling reset-at empty")
+	}
 }
 
 func TestOpenCodeGoSyncCreatesAccountAndRedactsList(t *testing.T) {

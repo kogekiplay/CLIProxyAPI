@@ -715,6 +715,7 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/opencode-go/accounts", s.mgmt.ListOpenCodeGoAccounts)
 		mgmt.POST("/opencode-go/sync", s.mgmt.SyncOpenCodeGoAccount)
+		mgmt.POST("/opencode-go/accounts/:id/refresh-usage", s.mgmt.RefreshOpenCodeGoUsage)
 		mgmt.POST("/opencode-go/accounts/:id/sync-provider", s.mgmt.SyncOpenCodeGoProvider)
 		mgmt.DELETE("/opencode-go/accounts/:id", s.mgmt.DeleteOpenCodeGoAccount)
 		mgmt.GET("/opencode-go/accounts/:id/switch-cookie", s.mgmt.GetOpenCodeGoSwitchCookie)

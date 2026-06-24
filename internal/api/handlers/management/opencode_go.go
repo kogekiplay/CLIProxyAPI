@@ -1,10 +1,16 @@
 package management
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +20,13 @@ import (
 
 const defaultOpenCodeGoProviderName = "opencode-go"
 const defaultOpenCodeGoBaseURL = "https://opencode.ai/zen/go/v1"
+const defaultOpenCodeGoSiteURL = "https://opencode.ai"
 const openCodeGoProviderKeySourcePrefix = "opencode-go:"
+
+var openCodeGoSiteURL = defaultOpenCodeGoSiteURL
+var openCodeGoHTTPClient = http.DefaultClient
+
+const openCodeGoBrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 
 type openCodeGoSyncRequest struct {
 	ID          string                          `json:"id"`
@@ -238,6 +250,376 @@ func (h *Handler) SyncOpenCodeGoProvider(c *gin.Context) {
 	h.mu.Unlock()
 	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
 	c.JSON(http.StatusOK, gin.H{"account": view})
+}
+
+func (h *Handler) RefreshOpenCodeGoUsage(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	idx := findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, id, "", "")
+	if idx < 0 {
+		h.mu.Unlock()
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+	account := h.cfg.OpenCodeGo.Accounts[idx]
+	h.mu.Unlock()
+
+	cookie := strings.TrimSpace(account.Cookie)
+	if cookie == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account cookie is empty"})
+		return
+	}
+
+	workspaceID, usage, err := fetchOpenCodeGoUsage(c.Request.Context(), cookie, account.WorkspaceID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	idx = findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, id, "", "")
+	if idx < 0 {
+		h.mu.Unlock()
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+	h.cfg.OpenCodeGo.Accounts[idx].WorkspaceID = workspaceID
+	h.cfg.OpenCodeGo.Accounts[idx].Usage = usage
+	h.cfg.OpenCodeGo.Accounts[idx].UpdatedAt = now
+	view := openCodeGoAccountView(h.cfg.OpenCodeGo.Accounts[idx], h.cfg.OpenCodeGo)
+	snapshot, ok := h.saveConfigAndSnapshotLocked(c)
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
+	c.JSON(http.StatusOK, gin.H{"account": view})
+}
+
+func fetchOpenCodeGoUsage(ctx context.Context, cookie, workspaceID string) (string, config.OpenCodeGoUsageSnapshot, error) {
+	cookie = strings.TrimSpace(cookie)
+	if cookie == "" {
+		return "", config.OpenCodeGoUsageSnapshot{}, fmt.Errorf("account cookie is empty")
+	}
+
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		discovered, err := discoverOpenCodeGoWorkspaceID(ctx, cookie)
+		if err != nil {
+			return "", config.OpenCodeGoUsageSnapshot{}, err
+		}
+		workspaceID = discovered
+	}
+	if workspaceID == "" {
+		return "", config.OpenCodeGoUsageSnapshot{}, fmt.Errorf("opencode workspace id not found")
+	}
+
+	workspaceURL := openCodeGoSitePath("/workspace/" + url.PathEscape(workspaceID))
+	goURL := openCodeGoSitePath("/workspace/" + url.PathEscape(workspaceID) + "/go")
+	scriptURLs := make([]string, 0, 16)
+	for _, pageURL := range []string{workspaceURL, goURL} {
+		body, err := fetchOpenCodeGoText(ctx, pageURL, cookie, workspaceURL)
+		if err != nil {
+			return "", config.OpenCodeGoUsageSnapshot{}, err
+		}
+		scriptURLs = append(scriptURLs, extractOpenCodeGoScriptURLs(body, pageURL)...)
+	}
+
+	hash, err := findOpenCodeGoLiteSubscriptionHash(ctx, scriptURLs, cookie, goURL)
+	if err != nil {
+		return "", config.OpenCodeGoUsageSnapshot{}, err
+	}
+
+	args, err := json.Marshal([]string{workspaceID})
+	if err != nil {
+		return "", config.OpenCodeGoUsageSnapshot{}, err
+	}
+	serverURL := openCodeGoSitePath("/_server") + "?id=" + url.QueryEscape(hash) + "&args=" + url.QueryEscape(string(args))
+	body, err := fetchOpenCodeGoTextWithHeaders(ctx, serverURL, cookie, goURL, map[string]string{
+		"X-Server-Id":       hash,
+		"X-Server-Instance": "server-fn:0",
+	})
+	if err != nil {
+		return "", config.OpenCodeGoUsageSnapshot{}, err
+	}
+
+	usage, err := parseOpenCodeGoUsageSnapshot(body, time.Now().UTC())
+	if err != nil {
+		return "", config.OpenCodeGoUsageSnapshot{}, err
+	}
+	return workspaceID, usage, nil
+}
+
+func discoverOpenCodeGoWorkspaceID(ctx context.Context, cookie string) (string, error) {
+	authURL := openCodeGoSitePath("/auth")
+	req, err := newOpenCodeGoRequest(ctx, authURL, cookie, "")
+	if err != nil {
+		return "", err
+	}
+	resp, err := openCodeGoHTTPClientOrDefault().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("opencode auth request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return "", fmt.Errorf("opencode auth returned HTTP %d", resp.StatusCode)
+	}
+	if resp.Request != nil && resp.Request.URL != nil {
+		if workspaceID := extractOpenCodeGoWorkspaceID(resp.Request.URL.Path); workspaceID != "" {
+			return workspaceID, nil
+		}
+	}
+	if location := resp.Header.Get("Location"); location != "" {
+		if workspaceID := extractOpenCodeGoWorkspaceID(location); workspaceID != "" {
+			return workspaceID, nil
+		}
+	}
+	return "", fmt.Errorf("opencode auth redirect did not include workspace id")
+}
+
+func fetchOpenCodeGoText(ctx context.Context, targetURL, cookie, referer string) (string, error) {
+	return fetchOpenCodeGoTextWithHeaders(ctx, targetURL, cookie, referer, nil)
+}
+
+func fetchOpenCodeGoTextWithHeaders(ctx context.Context, targetURL, cookie, referer string, extraHeaders map[string]string) (string, error) {
+	req, err := newOpenCodeGoRequest(ctx, targetURL, cookie, referer)
+	if err != nil {
+		return "", err
+	}
+	for key, value := range extraHeaders {
+		if strings.TrimSpace(value) != "" {
+			req.Header.Set(key, value)
+		}
+	}
+	resp, err := openCodeGoHTTPClientOrDefault().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("opencode request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read opencode response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("opencode returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return string(body), nil
+}
+
+func newOpenCodeGoRequest(ctx context.Context, targetURL, cookie, referer string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", openCodeGoBrowserUserAgent)
+	req.Header.Set("Accept", "*/*")
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	return req, nil
+}
+
+func openCodeGoHTTPClientOrDefault() *http.Client {
+	if openCodeGoHTTPClient != nil {
+		return openCodeGoHTTPClient
+	}
+	return http.DefaultClient
+}
+
+func openCodeGoSitePath(path string) string {
+	base := strings.TrimRight(strings.TrimSpace(openCodeGoSiteURL), "/")
+	if base == "" {
+		base = defaultOpenCodeGoSiteURL
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return base + path
+}
+
+func extractOpenCodeGoWorkspaceID(value string) string {
+	match := regexp.MustCompile(`/workspace/(wrk_[A-Za-z0-9]+)`).FindStringSubmatch(value)
+	if len(match) == 2 {
+		return match[1]
+	}
+	return ""
+}
+
+func extractOpenCodeGoScriptURLs(pageHTML, pageURL string) []string {
+	matches := regexp.MustCompile(`(?i)(?:src|href)=["']([^"']+\.js[^"']*)["']`).FindAllStringSubmatch(pageHTML, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	base, _ := url.Parse(pageURL)
+	for _, match := range matches {
+		if len(match) != 2 {
+			continue
+		}
+		ref, err := url.Parse(strings.TrimSpace(match[1]))
+		if err != nil {
+			continue
+		}
+		resolved := base.ResolveReference(ref).String()
+		if _, ok := seen[resolved]; ok {
+			continue
+		}
+		seen[resolved] = struct{}{}
+		out = append(out, resolved)
+	}
+	return out
+}
+
+func findOpenCodeGoLiteSubscriptionHash(ctx context.Context, scriptURLs []string, cookie, referer string) (string, error) {
+	seen := make(map[string]struct{}, len(scriptURLs))
+	for index := 0; index < len(scriptURLs) && index < 128; index++ {
+		scriptURL := scriptURLs[index]
+		scriptURL = strings.TrimSpace(scriptURL)
+		if scriptURL == "" {
+			continue
+		}
+		if _, ok := seen[scriptURL]; ok {
+			continue
+		}
+		seen[scriptURL] = struct{}{}
+		body, err := fetchOpenCodeGoText(ctx, scriptURL, cookie, referer)
+		if err != nil {
+			continue
+		}
+		if hash := extractOpenCodeGoLiteSubscriptionHash(body); hash != "" {
+			return hash, nil
+		}
+		for _, dependencyURL := range extractOpenCodeGoJSDependencyURLs(body, scriptURL) {
+			if _, ok := seen[dependencyURL]; !ok {
+				scriptURLs = append(scriptURLs, dependencyURL)
+			}
+		}
+	}
+	return "", fmt.Errorf("opencode lite.subscription.get server function not found")
+}
+
+func extractOpenCodeGoJSDependencyURLs(script, scriptURL string) []string {
+	matches := regexp.MustCompile(`["']((?:\.{1,2}/|/)[^"']+\.js[^"']*)["']`).FindAllStringSubmatch(script, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	base, _ := url.Parse(scriptURL)
+	out := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		if len(match) != 2 {
+			continue
+		}
+		ref, err := url.Parse(strings.TrimSpace(match[1]))
+		if err != nil {
+			continue
+		}
+		resolved := base.ResolveReference(ref).String()
+		if _, ok := seen[resolved]; ok {
+			continue
+		}
+		seen[resolved] = struct{}{}
+		out = append(out, resolved)
+	}
+	return out
+}
+
+func extractOpenCodeGoLiteSubscriptionHash(script string) string {
+	refPattern := regexp.MustCompile(`(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*createServerReference\("([0-9a-f]{64})"\)`)
+	matches := refPattern.FindAllStringSubmatch(script, -1)
+	for _, match := range matches {
+		if len(match) != 3 {
+			continue
+		}
+		queryPattern := regexp.MustCompile(`query\(\s*` + regexp.QuoteMeta(match[1]) + `\s*,\s*"lite\.subscription\.get"\s*\)`)
+		if queryPattern.MatchString(script) {
+			return match[2]
+		}
+	}
+	return ""
+}
+
+func parseOpenCodeGoUsageSnapshot(body string, now time.Time) (config.OpenCodeGoUsageSnapshot, error) {
+	rolling, okRolling := parseOpenCodeGoUsageWindow(body, "rollingUsage", now)
+	weekly, okWeekly := parseOpenCodeGoUsageWindow(body, "weeklyUsage", now)
+	monthly, okMonthly := parseOpenCodeGoUsageWindow(body, "monthlyUsage", now)
+	if !okRolling && !okWeekly && !okMonthly {
+		return config.OpenCodeGoUsageSnapshot{}, fmt.Errorf("opencode usage data not found")
+	}
+	return config.OpenCodeGoUsageSnapshot{
+		Rolling: rolling,
+		Weekly:  weekly,
+		Monthly: monthly,
+	}, nil
+}
+
+func parseOpenCodeGoUsageWindow(body, name string, now time.Time) (config.OpenCodeGoUsageWindow, bool) {
+	object := ""
+	inlinePattern := regexp.MustCompile(regexp.QuoteMeta(name) + `\s*:\s*(?:\$R\[(\d+)\]\s*=\s*)?(\{[^}]*\}|\$R\[(\d+)\])`)
+	match := inlinePattern.FindStringSubmatch(body)
+	if len(match) == 0 {
+		return config.OpenCodeGoUsageWindow{}, false
+	}
+	if strings.HasPrefix(match[2], "{") {
+		object = match[2]
+	} else {
+		ref := match[1]
+		if ref == "" {
+			ref = match[3]
+		}
+		refPattern := regexp.MustCompile(`\$R\[` + regexp.QuoteMeta(ref) + `\]\s*=\s*(\{[^}]*\})`)
+		refMatch := refPattern.FindStringSubmatch(body)
+		if len(refMatch) == 2 {
+			object = refMatch[1]
+		}
+	}
+	if object == "" {
+		return config.OpenCodeGoUsageWindow{}, false
+	}
+
+	usagePercent, ok := parseOpenCodeGoObjectNumber(object, "usagePercent")
+	if !ok {
+		return config.OpenCodeGoUsageWindow{}, false
+	}
+	window := config.OpenCodeGoUsageWindow{
+		Used:  usagePercent,
+		Limit: 100,
+	}
+	if resetInSec, ok := parseOpenCodeGoObjectNumber(object, "resetInSec"); ok && resetInSec >= 0 {
+		window.ResetAt = now.Add(time.Duration(resetInSec) * time.Second).UTC().Format(time.RFC3339)
+	}
+	return window, true
+}
+
+func parseOpenCodeGoObjectNumber(object, key string) (float64, bool) {
+	pattern := regexp.MustCompile(regexp.QuoteMeta(key) + `\s*:\s*([0-9]+(?:\.[0-9]+)?)`)
+	match := pattern.FindStringSubmatch(object)
+	if len(match) != 2 {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	return value, true
 }
 
 func (h *Handler) DeleteOpenCodeGoAccount(c *gin.Context) {
