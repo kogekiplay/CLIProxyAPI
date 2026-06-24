@@ -13,6 +13,7 @@ import (
 )
 
 const defaultOpenCodeGoProviderName = "opencode-go"
+const defaultOpenCodeGoBaseURL = "https://opencode.ai/zen/go/v1"
 const openCodeGoProviderKeySourcePrefix = "opencode-go:"
 
 type openCodeGoSyncRequest struct {
@@ -62,7 +63,7 @@ func (h *Handler) ListOpenCodeGoAccounts(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"provider-name": openCodeGoProviderName(h.cfg.OpenCodeGo),
-		"base-url":      strings.TrimSpace(h.cfg.OpenCodeGo.BaseURL),
+		"base-url":      openCodeGoBaseURL(h.cfg.OpenCodeGo),
 		"accounts":      accounts,
 	})
 }
@@ -125,7 +126,7 @@ func (h *Handler) SyncOpenCodeGoAccount(c *gin.Context) {
 		account.ProviderName = openCodeGoProviderName(h.cfg.OpenCodeGo)
 	}
 	if account.BaseURL == "" {
-		account.BaseURL = strings.TrimSpace(h.cfg.OpenCodeGo.BaseURL)
+		account.BaseURL = openCodeGoBaseURL(h.cfg.OpenCodeGo)
 	}
 
 	if idx >= 0 {
@@ -185,7 +186,7 @@ func (h *Handler) SyncOpenCodeGoProvider(c *gin.Context) {
 	}
 	baseURL := strings.TrimSpace(account.BaseURL)
 	if baseURL == "" {
-		baseURL = strings.TrimSpace(h.cfg.OpenCodeGo.BaseURL)
+		baseURL = openCodeGoBaseURL(h.cfg.OpenCodeGo)
 	}
 	if baseURL == "" {
 		msg := "base-url is required before syncing provider"
@@ -265,7 +266,7 @@ func (h *Handler) DeleteOpenCodeGoAccount(c *gin.Context) {
 		}
 		baseURL := strings.TrimSpace(account.BaseURL)
 		if baseURL == "" {
-			baseURL = strings.TrimSpace(h.cfg.OpenCodeGo.BaseURL)
+			baseURL = openCodeGoBaseURL(h.cfg.OpenCodeGo)
 		}
 		if account.ProviderKeyManaged {
 			removeOpenCodeGoProviderKey(h.cfg, providerName, baseURL, account.APIKey, openCodeGoProviderKeySource(account.ID))
@@ -327,6 +328,14 @@ func openCodeGoProviderName(cfg config.OpenCodeGoConfig) string {
 	return strings.ToLower(name)
 }
 
+func openCodeGoBaseURL(cfg config.OpenCodeGoConfig) string {
+	baseURL := strings.TrimSpace(cfg.BaseURL)
+	if baseURL == "" {
+		return defaultOpenCodeGoBaseURL
+	}
+	return strings.TrimRight(baseURL, "/")
+}
+
 func openCodeGoAccountView(account config.OpenCodeGoAccount, cfg config.OpenCodeGoConfig) openCodeGoAccountResponse {
 	providerName := strings.TrimSpace(account.ProviderName)
 	if providerName == "" {
@@ -334,7 +343,7 @@ func openCodeGoAccountView(account config.OpenCodeGoAccount, cfg config.OpenCode
 	}
 	baseURL := strings.TrimSpace(account.BaseURL)
 	if baseURL == "" {
-		baseURL = strings.TrimSpace(cfg.BaseURL)
+		baseURL = openCodeGoBaseURL(cfg)
 	}
 	return openCodeGoAccountResponse{
 		ID:                 account.ID,

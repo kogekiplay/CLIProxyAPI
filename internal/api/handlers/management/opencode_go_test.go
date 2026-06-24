@@ -159,7 +159,7 @@ func TestOpenCodeGoGinRoutesHitAccountsAndSync(t *testing.T) {
 	}
 }
 
-func TestOpenCodeGoSyncProviderRequiresBaseURL(t *testing.T) {
+func TestOpenCodeGoSyncProviderUsesDefaultBaseURL(t *testing.T) {
 	t.Parallel()
 	h := &Handler{cfg: &config.Config{
 		OpenCodeGo: config.OpenCodeGoConfig{
@@ -168,14 +168,17 @@ func TestOpenCodeGoSyncProviderRequiresBaseURL(t *testing.T) {
 	}, configFilePath: writeTestConfigFile(t)}
 
 	rec := performOpenCodeGoRouteJSON(http.MethodPost, "/v0/management/opencode-go/accounts/acc_1/sync-provider", nil, openCodeGoTestRouter(h))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "base-url") {
-		t.Fatalf("missing base-url error: %s", rec.Body.String())
+	if got := h.cfg.OpenCodeGo.Accounts[0].BaseURL; got != defaultOpenCodeGoBaseURL {
+		t.Fatalf("account base-url = %q, want %q", got, defaultOpenCodeGoBaseURL)
 	}
-	if got := h.cfg.OpenCodeGo.Accounts[0].ProviderSyncError; !strings.Contains(got, "base-url") {
-		t.Fatalf("provider sync error = %q, want base-url error", got)
+	if got := len(h.cfg.OpenAICompatibility); got != 1 {
+		t.Fatalf("openai compatibility len = %d, want 1", got)
+	}
+	if got := h.cfg.OpenAICompatibility[0].BaseURL; got != defaultOpenCodeGoBaseURL {
+		t.Fatalf("provider base-url = %q, want %q", got, defaultOpenCodeGoBaseURL)
 	}
 }
 
