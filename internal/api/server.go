@@ -713,6 +713,13 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
 		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
 
+		mgmt.GET("/opencode-go/accounts", s.mgmt.ListOpenCodeGoAccounts)
+		mgmt.POST("/opencode-go/sync", s.mgmt.SyncOpenCodeGoAccount)
+		mgmt.POST("/opencode-go/accounts/:id/sync-provider", s.mgmt.SyncOpenCodeGoProvider)
+		mgmt.DELETE("/opencode-go/accounts/:id", s.mgmt.DeleteOpenCodeGoAccount)
+		mgmt.GET("/opencode-go/accounts/:id/switch-cookie", s.mgmt.GetOpenCodeGoSwitchCookie)
+		mgmt.GET("/opencode-go/userscript-config", s.mgmt.GetOpenCodeGoUserscriptConfig)
+
 		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
 		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)
 		mgmt.PATCH("/vertex-api-key", s.mgmt.PatchVertexCompatKey)

@@ -81,9 +81,9 @@ func (h *Handler) SyncOpenCodeGoAccount(c *gin.Context) {
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	if h.cfg == nil {
+		h.mu.Unlock()
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
@@ -132,10 +132,149 @@ func (h *Handler) SyncOpenCodeGoAccount(c *gin.Context) {
 
 	snapshot, ok := h.saveConfigAndSnapshotLocked(c)
 	if !ok {
+		h.mu.Unlock()
 		return
 	}
+	view := openCodeGoAccountView(account, h.cfg.OpenCodeGo)
+	h.mu.Unlock()
 	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
-	c.JSON(http.StatusOK, gin.H{"account": openCodeGoAccountView(account, h.cfg.OpenCodeGo)})
+	c.JSON(http.StatusOK, gin.H{"account": view})
+}
+
+func (h *Handler) SyncOpenCodeGoProvider(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	idx := findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, id, "", "")
+	if idx < 0 {
+		h.mu.Unlock()
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+
+	account := &h.cfg.OpenCodeGo.Accounts[idx]
+	apiKey := strings.TrimSpace(account.APIKey)
+	if apiKey == "" {
+		account.ProviderSyncError = "account api-key is empty"
+		_, _ = h.saveConfigAndSnapshotLocked(c)
+		h.mu.Unlock()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account api-key is empty"})
+		return
+	}
+
+	providerName := openCodeGoProviderName(h.cfg.OpenCodeGo)
+	if accountProviderName := strings.TrimSpace(account.ProviderName); accountProviderName != "" {
+		providerName = accountProviderName
+	}
+	baseURL := strings.TrimSpace(account.BaseURL)
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(h.cfg.OpenCodeGo.BaseURL)
+	}
+	if baseURL == "" {
+		account.ProviderSyncError = "base-url is required before syncing provider"
+		_, _ = h.saveConfigAndSnapshotLocked(c)
+		h.mu.Unlock()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "base-url is required before syncing provider"})
+		return
+	}
+
+	upsertOpenCodeGoProviderKey(h.cfg, providerName, baseURL, apiKey)
+	account.ProviderName = providerName
+	account.BaseURL = baseURL
+	account.APIKeySynced = true
+	account.ProviderSyncedAt = now
+	account.ProviderSyncError = ""
+	account.UpdatedAt = now
+
+	view := openCodeGoAccountView(*account, h.cfg.OpenCodeGo)
+	snapshot, ok := h.saveConfigAndSnapshotLocked(c)
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
+	c.JSON(http.StatusOK, gin.H{"account": view})
+}
+
+func (h *Handler) DeleteOpenCodeGoAccount(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	removeProviderKey := strings.EqualFold(c.Query("remove-provider-key"), "true")
+
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	idx := findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, id, "", "")
+	if idx < 0 {
+		h.mu.Unlock()
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+
+	account := h.cfg.OpenCodeGo.Accounts[idx]
+	h.cfg.OpenCodeGo.Accounts = append(h.cfg.OpenCodeGo.Accounts[:idx], h.cfg.OpenCodeGo.Accounts[idx+1:]...)
+	if removeProviderKey {
+		providerName := strings.TrimSpace(account.ProviderName)
+		if providerName == "" {
+			providerName = openCodeGoProviderName(h.cfg.OpenCodeGo)
+		}
+		removeOpenCodeGoProviderKey(h.cfg, providerName, account.APIKey)
+	}
+
+	snapshot, ok := h.saveConfigAndSnapshotLocked(c)
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
+	c.JSON(http.StatusOK, gin.H{"deleted": true})
+}
+
+func (h *Handler) GetOpenCodeGoSwitchCookie(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+	idx := findOpenCodeGoAccountIndex(h.cfg.OpenCodeGo.Accounts, id, "", "")
+	if idx < 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+	cookie := strings.TrimSpace(h.cfg.OpenCodeGo.Accounts[idx].Cookie)
+	if cookie == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "account has no stored cookie"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"cookie": cookie})
+}
+
+func (h *Handler) GetOpenCodeGoUserscriptConfig(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"name":            "opencode go账号助手",
+		"match":           "https://opencode.ai/*",
+		"management-base": "/v0/management",
+		"endpoints": gin.H{
+			"accounts":      "/opencode-go/accounts",
+			"sync":          "/opencode-go/sync",
+			"sync-provider": "/opencode-go/accounts/{id}/sync-provider",
+			"delete":        "/opencode-go/accounts/{id}",
+			"switch-cookie": "/opencode-go/accounts/{id}/switch-cookie",
+		},
+	})
 }
 
 func openCodeGoProviderName(cfg config.OpenCodeGoConfig) string {
@@ -215,4 +354,61 @@ func maskOpenCodeGoSecret(secret string) string {
 		return secret[:1] + "***"
 	}
 	return secret[:4] + "***" + secret[len(secret)-4:]
+}
+
+func upsertOpenCodeGoProviderKey(cfg *config.Config, providerName, baseURL, apiKey string) {
+	if cfg == nil {
+		return
+	}
+	providerName = strings.TrimSpace(providerName)
+	baseURL = strings.TrimSpace(baseURL)
+	apiKey = strings.TrimSpace(apiKey)
+	if providerName == "" || baseURL == "" || apiKey == "" {
+		return
+	}
+	for i := range cfg.OpenAICompatibility {
+		provider := &cfg.OpenAICompatibility[i]
+		if !strings.EqualFold(strings.TrimSpace(provider.Name), providerName) {
+			continue
+		}
+		provider.Name = providerName
+		provider.BaseURL = baseURL
+		for j := range provider.APIKeyEntries {
+			if strings.TrimSpace(provider.APIKeyEntries[j].APIKey) == apiKey {
+				return
+			}
+		}
+		provider.APIKeyEntries = append(provider.APIKeyEntries, config.OpenAICompatibilityAPIKey{APIKey: apiKey})
+		return
+	}
+	cfg.OpenAICompatibility = append(cfg.OpenAICompatibility, config.OpenAICompatibility{
+		Name:          providerName,
+		BaseURL:       baseURL,
+		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: apiKey}},
+	})
+}
+
+func removeOpenCodeGoProviderKey(cfg *config.Config, providerName, apiKey string) {
+	if cfg == nil {
+		return
+	}
+	providerName = strings.TrimSpace(providerName)
+	apiKey = strings.TrimSpace(apiKey)
+	if providerName == "" || apiKey == "" {
+		return
+	}
+	for i := range cfg.OpenAICompatibility {
+		provider := &cfg.OpenAICompatibility[i]
+		if !strings.EqualFold(strings.TrimSpace(provider.Name), providerName) {
+			continue
+		}
+		filtered := provider.APIKeyEntries[:0]
+		for _, entry := range provider.APIKeyEntries {
+			if strings.TrimSpace(entry.APIKey) != apiKey {
+				filtered = append(filtered, entry)
+			}
+		}
+		provider.APIKeyEntries = filtered
+		return
+	}
 }
