@@ -21,6 +21,7 @@ import (
 
 const (
 	DefaultPanelGitHubRepository = "https://github.com/kogekiplay/Cli-Proxy-API-Management-Center"
+	legacyPanelGitHubRepository  = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 	DefaultAuthDir               = "~/.cli-proxy-api"
 )
@@ -311,6 +312,14 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+}
+
+func normalizePanelGitHubRepository(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || strings.EqualFold(trimmed, legacyPanelGitHubRepository) {
+		return DefaultPanelGitHubRepository
+	}
+	return trimmed
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -775,10 +784,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
 	}
 
-	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
-	if cfg.RemoteManagement.PanelGitHubRepository == "" {
-		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
-	}
+	cfg.RemoteManagement.PanelGitHubRepository = normalizePanelGitHubRepository(cfg.RemoteManagement.PanelGitHubRepository)
 
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {
