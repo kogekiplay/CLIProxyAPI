@@ -172,19 +172,25 @@ func StaticDir(configFilePath string) string {
 
 // FilePath resolves the absolute path to the management control panel asset.
 func FilePath(configFilePath string) string {
+	return FilePathFor(configFilePath, ManagementFileName)
+}
+
+// FilePathFor resolves the absolute path to a named control-panel asset (e.g. next.html)
+// stored in the configured management static directory.
+func FilePathFor(configFilePath string, name string) string {
 	if override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")); override != "" {
 		cleaned := filepath.Clean(override)
 		if strings.EqualFold(filepath.Base(cleaned), managementAssetName) {
-			return cleaned
+			cleaned = filepath.Dir(cleaned)
 		}
-		return filepath.Join(cleaned, ManagementFileName)
+		return filepath.Join(cleaned, name)
 	}
 
 	dir := StaticDir(configFilePath)
 	if dir == "" {
 		return ""
 	}
-	return filepath.Join(dir, ManagementFileName)
+	return filepath.Join(dir, name)
 }
 
 // EnsureLatestManagementHTML checks the latest management.html asset and updates the local copy when needed.

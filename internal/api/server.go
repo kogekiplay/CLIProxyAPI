@@ -398,7 +398,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" || path == "/next.html" {
 				c.Next()
 				return
 			}
@@ -427,6 +427,7 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/next.html", s.serveNextControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
@@ -862,12 +863,20 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 }
 
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
+	s.serveStaticPanel(c, managementasset.ManagementFileName)
+}
+
+func (s *Server) serveNextControlPanel(c *gin.Context) {
+	s.serveStaticPanel(c, "next.html")
+}
+
+func (s *Server) serveStaticPanel(c *gin.Context, name string) {
 	cfg := s.cfg
 	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
-	filePath := managementasset.FilePath(s.configFilePath)
+	filePath := managementasset.FilePathFor(s.configFilePath, name)
 	if strings.TrimSpace(filePath) == "" {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
@@ -875,6 +884,10 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 
 	if _, err := os.Stat(filePath); err != nil {
 		if os.IsNotExist(err) {
+			if name != managementasset.ManagementFileName {
+				c.AbortWithStatus(http.StatusNotFound)
+				return
+			}
 			// Synchronously ensure management.html is available with a detached context.
 			// Control panel bootstrap should not be canceled by client disconnects.
 			if !managementasset.EnsureLatestManagementHTML(context.Background(), managementasset.StaticDir(s.configFilePath), cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository) {
