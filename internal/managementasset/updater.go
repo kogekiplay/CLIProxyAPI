@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
+	defaultManagementReleaseURL  = "https://api.github.com/repos/kogekiplay/Cli-Proxy-API-Management-Center/releases/latest"
 	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
 	managementAssetName          = "management.html"
 	httpUserAgent                = "CLIProxyAPI-management-updater"
@@ -131,6 +131,7 @@ func newHTTPClient(proxyURL string) *http.Client {
 
 type releaseAsset struct {
 	Name               string `json:"name"`
+	URL                string `json:"url"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Digest             string `json:"digest"`
 }
@@ -259,7 +260,7 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
-		data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
+		data, downloadedHash, err := downloadReleaseAsset(ctx, client, asset)
 		if err != nil {
 			if localFileMissing {
 				log.WithError(err).Warn("failed to download management asset, trying fallback page")
@@ -388,6 +389,24 @@ func downloadAsset(ctx context.Context, client *http.Client, downloadURL string)
 
 	sum := sha256.Sum256(data)
 	return data, hex.EncodeToString(sum[:]), nil
+}
+
+func downloadReleaseAsset(ctx context.Context, client *http.Client, asset *releaseAsset) ([]byte, string, error) {
+	if asset == nil {
+		return nil, "", fmt.Errorf("missing release asset")
+	}
+	if strings.TrimSpace(asset.URL) != "" {
+		data, err := httpfetch.GetBytes(ctx, client, asset.URL, map[string]string{
+			"Accept":     "application/octet-stream",
+			"User-Agent": httpUserAgent,
+		}, maxAssetDownloadSize)
+		if err == nil {
+			sum := sha256.Sum256(data)
+			return data, hex.EncodeToString(sum[:]), nil
+		}
+		log.WithError(err).Warn("failed to download management asset through GitHub API, trying browser download URL")
+	}
+	return downloadAsset(ctx, client, asset.BrowserDownloadURL)
 }
 
 func fileSHA256(path string) (string, error) {

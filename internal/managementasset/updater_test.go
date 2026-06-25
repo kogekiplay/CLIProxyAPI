@@ -1,6 +1,10 @@
 package managementasset
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -58,5 +62,35 @@ func TestAutoUpdateSkipReason(t *testing.T) {
 				t.Fatalf("autoUpdateSkipReason() = (%q, %t), want (%q, %t)", gotReason, gotSkip, tt.wantReason, tt.wantSkip)
 			}
 		})
+	}
+}
+
+func TestDownloadReleaseAssetPrefersAPIURL(t *testing.T) {
+	const body = "<html>management</html>"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api-asset":
+			if !strings.Contains(r.Header.Get("Accept"), "application/octet-stream") {
+				t.Fatalf("Accept = %q, want application/octet-stream", r.Header.Get("Accept"))
+			}
+			_, _ = w.Write([]byte(body))
+		case "/browser-asset":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	data, _, err := downloadReleaseAsset(context.Background(), server.Client(), &releaseAsset{
+		URL:                server.URL + "/api-asset",
+		BrowserDownloadURL: server.URL + "/browser-asset",
+	})
+	if err != nil {
+		t.Fatalf("downloadReleaseAsset() error = %v", err)
+	}
+	if string(data) != body {
+		t.Fatalf("downloadReleaseAsset() body = %q, want %q", string(data), body)
 	}
 }

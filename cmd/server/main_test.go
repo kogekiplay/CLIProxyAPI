@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -85,5 +86,16 @@ func TestShouldStartExampleAPIKeyWarningServer(t *testing.T) {
 				t.Fatalf("shouldStartExampleAPIKeyWarningServer() = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestExampleConfigStartsNormalServer(t *testing.T) {
+	cfg, err := config.LoadConfigOptional(filepath.Join("..", "..", "config.example.yaml"), false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional(config.example.yaml) error = %v", err)
+	}
+
+	if shouldStartExampleAPIKeyWarningServer(cfg, false, false, false, false, false) {
+		t.Fatal("config.example.yaml should not trigger the example API key warning server")
 	}
 }
