@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -85,4 +86,35 @@ func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 			t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
 		}
 	})
+}
+
+func TestLatestReleaseAPIURLUsesForkRepository(t *testing.T) {
+	got := latestReleaseAPIURL()
+	want := "https://api.github.com/repos/kogekiplay/CLIProxyAPI/releases/latest"
+	if got != want {
+		t.Fatalf("latest release API URL = %q, want %q", got, want)
+	}
+}
+
+func TestLatestVersionFallsBackToForkTagsWhenReleaseIsMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/kogekiplay/CLIProxyAPI/releases/latest":
+			http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
+		case "/repos/kogekiplay/CLIProxyAPI/tags":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"name":"v7.2.40-fork"}]`))
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	version, err := fetchLatestVersion(context.Background(), server.Client(), server.URL)
+	if err != nil {
+		t.Fatalf("fetchLatestVersion() error = %v", err)
+	}
+	if version != "v7.2.40-fork" {
+		t.Fatalf("version = %q, want v7.2.40-fork", version)
+	}
 }

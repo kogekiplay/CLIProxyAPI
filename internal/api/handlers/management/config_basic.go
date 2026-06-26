@@ -1,7 +1,9 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,9 +21,23 @@ import (
 )
 
 const (
-	latestReleaseURL       = "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest"
-	latestReleaseUserAgent = "CLIProxyAPI"
+	latestReleaseAPIBaseURL = "https://api.github.com"
+	latestReleaseOwner      = "kogekiplay"
+	latestReleaseRepo       = "CLIProxyAPI"
+	latestReleaseUserAgent  = "CLIProxyAPI"
 )
+
+func latestReleaseAPIURL() string {
+	return latestReleaseAPIURLForBase(latestReleaseAPIBaseURL)
+}
+
+func latestReleaseAPIURLForBase(apiBase string) string {
+	return fmt.Sprintf("%s/repos/%s/%s/releases/latest", strings.TrimRight(apiBase, "/"), latestReleaseOwner, latestReleaseRepo)
+}
+
+func latestTagsAPIURLForBase(apiBase string) string {
+	return fmt.Sprintf("%s/repos/%s/%s/tags?per_page=1", strings.TrimRight(apiBase, "/"), latestReleaseOwner, latestReleaseRepo)
+}
 
 func (h *Handler) GetConfig(c *gin.Context) {
 	if h == nil || h.cfg == nil {
@@ -36,6 +52,101 @@ type releaseInfo struct {
 	Name    string `json:"name"`
 }
 
+type tagInfo struct {
+	Name string `json:"name"`
+}
+
+type latestVersionError struct {
+	code    string
+	message string
+}
+
+func (e latestVersionError) Error() string {
+	return e.message
+}
+
+func fetchGitHubJSON(ctx context.Context, client *http.Client, requestURL string, target any) (int, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return 0, "", latestVersionError{code: "request_create_failed", message: err.Error()}
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", latestReleaseUserAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", latestVersionError{code: "request_failed", message: err.Error()}
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.WithError(errClose).Debug("failed to close latest version response body")
+		}
+	}()
+
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if errRead != nil {
+		return resp.StatusCode, "", latestVersionError{code: "request_failed", message: errRead.Error()}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, strings.TrimSpace(string(body)), nil
+	}
+	if errDecode := json.Unmarshal(body, target); errDecode != nil {
+		return resp.StatusCode, "", latestVersionError{code: "decode_failed", message: errDecode.Error()}
+	}
+	return resp.StatusCode, "", nil
+}
+
+func releaseVersion(info releaseInfo) string {
+	version := strings.TrimSpace(info.TagName)
+	if version == "" {
+		version = strings.TrimSpace(info.Name)
+	}
+	return version
+}
+
+func fetchLatestVersion(ctx context.Context, client *http.Client, apiBase string) (string, error) {
+	var release releaseInfo
+	status, body, err := fetchGitHubJSON(ctx, client, latestReleaseAPIURLForBase(apiBase), &release)
+	if err != nil {
+		return "", err
+	}
+	if status == http.StatusOK {
+		if version := releaseVersion(release); version != "" {
+			return version, nil
+		}
+		return "", latestVersionError{code: "invalid_response", message: "missing release version"}
+	}
+	if status != http.StatusNotFound {
+		return "", latestVersionError{
+			code:    "unexpected_status",
+			message: fmt.Sprintf("release status %d: %s", status, body),
+		}
+	}
+
+	var tags []tagInfo
+	status, body, err = fetchGitHubJSON(ctx, client, latestTagsAPIURLForBase(apiBase), &tags)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", latestVersionError{
+			code:    "unexpected_status",
+			message: fmt.Sprintf("tags status %d: %s", status, body),
+		}
+	}
+	if len(tags) == 0 || strings.TrimSpace(tags[0].Name) == "" {
+		return "", latestVersionError{code: "invalid_response", message: "missing tag version"}
+	}
+	return strings.TrimSpace(tags[0].Name), nil
+}
+
 // GetLatestVersion returns the latest release version from GitHub without downloading assets.
 func (h *Handler) GetLatestVersion(c *gin.Context) {
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -48,43 +159,14 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 		util.SetProxy(sdkCfg, client)
 	}
 
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, latestReleaseURL, nil)
+	version, err := fetchLatestVersion(c.Request.Context(), client, latestReleaseAPIBaseURL)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "request_create_failed", "message": err.Error()})
-		return
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", latestReleaseUserAgent)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "request_failed", "message": err.Error()})
-		return
-	}
-	defer func() {
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.WithError(errClose).Debug("failed to close latest version response body")
+		var versionErr latestVersionError
+		if errors.As(err, &versionErr) {
+			c.JSON(http.StatusBadGateway, gin.H{"error": versionErr.code, "message": versionErr.message})
+			return
 		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		c.JSON(http.StatusBadGateway, gin.H{"error": "unexpected_status", "message": fmt.Sprintf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))})
-		return
-	}
-
-	var info releaseInfo
-	if errDecode := json.NewDecoder(resp.Body).Decode(&info); errDecode != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "decode_failed", "message": errDecode.Error()})
-		return
-	}
-
-	version := strings.TrimSpace(info.TagName)
-	if version == "" {
-		version = strings.TrimSpace(info.Name)
-	}
-	if version == "" {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid_response", "message": "missing release version"})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "request_failed", "message": err.Error()})
 		return
 	}
 
