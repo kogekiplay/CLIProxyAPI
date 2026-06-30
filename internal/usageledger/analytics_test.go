@@ -118,6 +118,89 @@ func TestSQLiteStoreAnalyticsAggregatesFilteredUsage(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreAnalyticsReturnsKnownCostWhenSomeModelsAreUnpriced(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	now := time.Date(2026, 6, 26, 10, 0, 0, 0, time.UTC)
+	if err := store.UpsertModelPrice(context.Background(), ModelPrice{
+		Model:       "gpt-5.5",
+		InputPer1M:  10,
+		OutputPer1M: 20,
+	}); err != nil {
+		t.Fatalf("upsert price: %v", err)
+	}
+
+	events := []Event{
+		{
+			RequestID:         "req-priced",
+			Timestamp:         now.Add(-30 * time.Minute),
+			Provider:          "codex",
+			Model:             "gpt-5.5",
+			AuthType:          "apikey",
+			CredentialKeyHash: "key-a",
+			Tokens:            TokenUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		},
+		{
+			RequestID:         "req-unpriced",
+			Timestamp:         now.Add(-20 * time.Minute),
+			Provider:          "xai",
+			Model:             "grok-unpriced-preview",
+			AuthType:          "apikey",
+			CredentialKeyHash: "key-a",
+			Tokens:            TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
+		},
+	}
+	for _, event := range events {
+		if _, err := store.InsertEvent(context.Background(), event); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+	}
+
+	result, err := store.Analytics(context.Background(), AnalyticsRequest{
+		FromMS: now.Add(-time.Hour).UnixMilli(),
+		ToMS:   now.Add(time.Minute).UnixMilli(),
+		Include: AnalyticsInclude{
+			Summary:     true,
+			Timeline:    true,
+			ModelStats:  true,
+			APIKeyStats: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("analytics: %v", err)
+	}
+
+	const wantCost = 0.0002
+	if result.Summary == nil || result.Summary.TotalCost == nil || math.Abs(*result.Summary.TotalCost-wantCost) > 0.000000001 {
+		t.Fatalf("summary cost = %v, want %v", result.Summary, wantCost)
+	}
+	if len(result.Timeline) != 1 || result.Timeline[0].Cost == nil || math.Abs(*result.Timeline[0].Cost-wantCost) > 0.000000001 {
+		t.Fatalf("timeline = %#v, want known cost %v", result.Timeline, wantCost)
+	}
+	if len(result.APIKeyStats) != 1 || result.APIKeyStats[0].Cost == nil || math.Abs(*result.APIKeyStats[0].Cost-wantCost) > 0.000000001 {
+		t.Fatalf("api key stats = %#v, want known cost %v", result.APIKeyStats, wantCost)
+	}
+	if len(result.ModelStats) != 2 {
+		t.Fatalf("model stats = %#v", result.ModelStats)
+	}
+	var priced, unpriced *AnalyticsModelStat
+	for i := range result.ModelStats {
+		switch result.ModelStats[i].Model {
+		case "gpt-5.5":
+			priced = &result.ModelStats[i]
+		case "grok-unpriced-preview":
+			unpriced = &result.ModelStats[i]
+		}
+	}
+	if priced == nil || priced.Cost == nil || math.Abs(*priced.Cost-wantCost) > 0.000000001 {
+		t.Fatalf("priced model stat = %#v, want known cost %v", priced, wantCost)
+	}
+	if unpriced == nil || unpriced.Cost != nil {
+		t.Fatalf("unpriced model stat = %#v, want nil cost", unpriced)
+	}
+}
+
 func TestSQLiteStoreAnalyticsEventsExposeRequestMonitoringFields(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()

@@ -241,7 +241,7 @@ func buildAnalyticsSummary(events []analyticsEvent) *AnalyticsSummary {
 		CacheCreationTokens: agg.tokens.CacheCreationTokens,
 		TotalTokens:         agg.tokens.TotalTokens,
 	}
-	if agg.allCost {
+	if agg.hasCost {
 		summary.TotalCost = floatPtr(agg.cost)
 	}
 	return summary
@@ -276,7 +276,7 @@ func buildAnalyticsTimeline(events []analyticsEvent) []AnalyticsTimelinePoint {
 			CacheCreationTokens: agg.tokens.CacheCreationTokens,
 			TotalTokens:         agg.tokens.TotalTokens,
 		}
-		if agg.allCost {
+		if agg.hasCost {
 			point.Cost = floatPtr(agg.cost)
 		}
 		out = append(out, point)
@@ -309,7 +309,7 @@ func buildAnalyticsModelStats(events []analyticsEvent) []AnalyticsModelStat {
 			CacheCreationTokens: agg.tokens.CacheCreationTokens,
 			TotalTokens:         agg.tokens.TotalTokens,
 		}
-		if agg.allCost {
+		if agg.hasCost {
 			row.Cost = floatPtr(agg.cost)
 		}
 		out = append(out, row)
@@ -378,7 +378,7 @@ func buildAnalyticsAPIKeyStats(events []analyticsEvent) []AnalyticsAPIKeyStat {
 			CacheCreationTokens: agg.tokens.CacheCreationTokens,
 			TotalTokens:         agg.tokens.TotalTokens,
 		}
-		if agg.allCost {
+		if agg.hasCost {
 			row.Cost = floatPtr(agg.cost)
 		}
 		out = append(out, row)
@@ -498,7 +498,7 @@ func buildAnalyticsCredentialStats(events []analyticsEvent) []AnalyticsCredentia
 			CacheCreationTokens: agg.tokens.CacheCreationTokens,
 			TotalTokens:         agg.tokens.TotalTokens,
 		}
-		if agg.allCost {
+		if agg.hasCost {
 			row.Cost = floatPtr(agg.cost)
 		}
 		out = append(out, row)
