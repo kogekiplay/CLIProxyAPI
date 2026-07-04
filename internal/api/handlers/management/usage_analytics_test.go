@@ -244,6 +244,9 @@ func TestUsageAnalyticsEndpointReclassifiesLegacyAPIKeyCredentialStats(t *testin
 		"include": map[string]any{
 			"api_key_stats":    true,
 			"credential_stats": true,
+			"events_page": map[string]any{
+				"limit": 5,
+			},
 		},
 	}
 	rec := performUsageManagementJSON(http.MethodPost, "/v0/management/usage-analytics", body, router)
@@ -267,5 +270,13 @@ func TestUsageAnalyticsEndpointReclassifiesLegacyAPIKeyCredentialStats(t *testin
 	}
 	if stat.APIKeyPreview != "sk-c***wxyz" {
 		t.Fatalf("api key preview = %q", stat.APIKeyPreview)
+	}
+	if response.Events == nil || len(response.Events.Items) != 2 {
+		t.Fatalf("events = %#v", response.Events)
+	}
+	for _, event := range response.Events.Items {
+		if event.CredentialDisplayName != "codex-sk-c***wxyz" {
+			t.Fatalf("event credential display name = %q", event.CredentialDisplayName)
+		}
 	}
 }

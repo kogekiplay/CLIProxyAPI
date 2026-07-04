@@ -363,10 +363,48 @@ func usageAnalyticsCredentialDisplayName(auth *coreauth.Auth) string {
 		return email
 	}
 	if label := strings.TrimSpace(auth.Label); label != "" {
+		if auth.AuthKind() == coreauth.AuthKindAPIKey && isGenericUsageAnalyticsAPIKeyLabel(auth.Provider, label) {
+			if apiKeyLabel := usageAnalyticsProviderAPIKeyLabel(auth); apiKeyLabel != "" {
+				return apiKeyLabel
+			}
+		}
 		return label
+	}
+	if auth.AuthKind() == coreauth.AuthKindAPIKey {
+		if apiKeyLabel := usageAnalyticsProviderAPIKeyLabel(auth); apiKeyLabel != "" {
+			return apiKeyLabel
+		}
 	}
 	if name := strings.TrimSpace(auth.FileName); name != "" {
 		return filepath.Base(name)
 	}
 	return strings.TrimSpace(auth.ID)
+}
+
+func isGenericUsageAnalyticsAPIKeyLabel(provider, label string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	label = strings.ToLower(strings.TrimSpace(label))
+	if provider == "" || label == "" {
+		return false
+	}
+	return label == provider+"-apikey" || label == provider+"-api-key"
+}
+
+func usageAnalyticsProviderAPIKeyLabel(auth *coreauth.Auth) string {
+	if auth == nil || auth.AuthKind() != coreauth.AuthKindAPIKey {
+		return ""
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider == "" {
+		provider = "api-key"
+	}
+	_, apiKey := auth.AccountInfo()
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" && auth.Attributes != nil {
+		apiKey = strings.TrimSpace(auth.Attributes[coreauth.AttributeAPIKey])
+	}
+	if apiKey == "" {
+		return ""
+	}
+	return provider + "-" + maskOpenCodeGoSecret(apiKey)
 }

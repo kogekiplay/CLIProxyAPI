@@ -255,6 +255,7 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 		Config: &config.Config{
 			CodexKey: []config.CodexKey{
 				{
+					Name:           "main-codex",
 					APIKey:         "codex-key-123",
 					Prefix:         "dev",
 					BaseURL:        "https://api.openai.com",
@@ -279,8 +280,8 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	if auths[0].Provider != "codex" {
 		t.Errorf("expected provider codex, got %s", auths[0].Provider)
 	}
-	if auths[0].Label != "codex-apikey" {
-		t.Errorf("expected label codex-apikey, got %s", auths[0].Label)
+	if auths[0].Label != "codex-main-codex" {
+		t.Errorf("expected label codex-main-codex, got %s", auths[0].Label)
 	}
 	if auths[0].ProxyURL != "http://proxy.local" {
 		t.Errorf("expected proxy_url http://proxy.local, got %s", auths[0].ProxyURL)

@@ -195,7 +195,7 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		a := &coreauth.Auth{
 			ID:         id,
 			Provider:   "codex",
-			Label:      "codex-apikey",
+			Label:      synthesizedAPIKeyLabel("codex", ck.Name, key),
 			Prefix:     prefix,
 			Status:     coreauth.StatusActive,
 			ProxyURL:   proxyURL,
@@ -211,6 +211,29 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		out = append(out, a)
 	}
 	return out
+}
+
+func synthesizedAPIKeyLabel(provider, name, apiKey string) string {
+	provider = strings.TrimSpace(provider)
+	name = strings.TrimSpace(name)
+	if provider == "" {
+		provider = "api-key"
+	}
+	if name != "" {
+		return provider + "-" + name
+	}
+	return provider + "-" + maskSynthesizedAPIKey(apiKey)
+}
+
+func maskSynthesizedAPIKey(apiKey string) string {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return "apikey"
+	}
+	if len(apiKey) <= 8 {
+		return apiKey[:1] + "***"
+	}
+	return apiKey[:4] + "***" + apiKey[len(apiKey)-4:]
 }
 
 // synthesizeOpenAICompat creates Auth entries for OpenAI-compatible providers.
