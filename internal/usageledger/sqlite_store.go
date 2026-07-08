@@ -555,7 +555,7 @@ func applySummaryRows(summary *Summary, rows []aggregateRow, prices []ModelPrice
 	}
 	missingSet := make(map[string]struct{})
 	var totalCost float64
-	allPriced := len(rows) > 0
+	anyPriced := false
 	for _, row := range rows {
 		tokens := TokenUsage{
 			InputTokens:         row.input,
@@ -575,8 +575,8 @@ func applySummaryRows(summary *Summary, rows []aggregateRow, prices []ModelPrice
 		if cost, ok, missing := CostForUsage(row.model, tokens, prices); ok {
 			modelSummary.EstimatedCostUSD = floatPtr(cost)
 			totalCost += cost
+			anyPriced = true
 		} else {
-			allPriced = false
 			modelSummary.MissingPriceModels = append(modelSummary.MissingPriceModels, missing...)
 			for _, model := range missing {
 				missingSet[model] = struct{}{}
@@ -587,7 +587,7 @@ func applySummaryRows(summary *Summary, rows []aggregateRow, prices []ModelPrice
 		summary.Tokens = summary.Tokens.Add(tokens)
 		summary.Rows = append(summary.Rows, modelSummary)
 	}
-	if allPriced {
+	if anyPriced {
 		summary.EstimatedCostUSD = floatPtr(totalCost)
 	}
 	summary.MissingPriceModels = sortedStringSet(missingSet)

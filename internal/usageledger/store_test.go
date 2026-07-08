@@ -104,6 +104,64 @@ func TestSQLiteStoreSummaryScopesByAuthIndexAndAPIKeyHash(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreSummaryIncludesKnownCostWhenSomeModelsMissPrices(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	ctx := context.Background()
+	if err := store.UpsertModelPrice(ctx, ModelPrice{
+		Model:       "priced-model-for-partial-cost",
+		InputPer1M:  2,
+		OutputPer1M: 6,
+		Source:      "test",
+	}); err != nil {
+		t.Fatalf("upsert price: %v", err)
+	}
+
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	events := []Event{
+		{
+			RequestID: "priced",
+			Timestamp: now,
+			Provider:  "codex",
+			Model:     "priced-model-for-partial-cost",
+			AuthIndex: "auth-1",
+			Tokens:    TokenUsage{InputTokens: 1_000_000, OutputTokens: 500_000, TotalTokens: 1_500_000},
+		},
+		{
+			RequestID: "unpriced",
+			Timestamp: now,
+			Provider:  "codex",
+			Model:     "unpriced-model-for-partial-cost",
+			AuthIndex: "auth-1",
+			Tokens:    TokenUsage{InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
+		},
+	}
+	for _, event := range events {
+		if _, err := store.InsertEvent(ctx, event); err != nil {
+			t.Fatalf("insert %s: %v", event.RequestID, err)
+		}
+	}
+
+	summary, err := store.Summary(ctx, SummaryFilter{
+		Provider:  "codex",
+		AuthIndex: "auth-1",
+		Window:    Window{Start: now.Add(-time.Minute), End: now.Add(time.Minute)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.EstimatedCostUSD == nil {
+		t.Fatal("estimated cost is nil, want known priced rows to be included")
+	}
+	if *summary.EstimatedCostUSD != 5 {
+		t.Fatalf("estimated cost = %v, want 5", *summary.EstimatedCostUSD)
+	}
+	if len(summary.MissingPriceModels) != 1 || summary.MissingPriceModels[0] != "unpriced-model-for-partial-cost" {
+		t.Fatalf("missing prices = %#v", summary.MissingPriceModels)
+	}
+}
+
 func TestSQLiteStoreModelPriceCRUD(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()
