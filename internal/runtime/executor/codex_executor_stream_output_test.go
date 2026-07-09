@@ -3,9 +3,11 @@ package executor
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -254,5 +256,99 @@ func TestCodexExecutorExecuteStream_EmptyStreamCompletionOutputUsesOutputItemDon
 	gotContent := gjson.GetBytes(completed, "response.output.0.content.0.text").String()
 	if gotContent != "ok" {
 		t.Fatalf("response.output[0].content[0].text = %q, want %q; completed=%s", gotContent, "ok", string(completed))
+	}
+}
+
+func TestCodexExecutorExecuteStream_ContinuationUsesSameAuthAndDropsTentativeOutput(t *testing.T) {
+	var calls int32
+	var secondBody []byte
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := atomic.AddInt32(&calls, 1)
+		body, _ := io.ReadAll(r.Body)
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch call {
+		case 1:
+			_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","output":[]}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"enc_1"}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_partial","role":"assistant","content":[]}}
+
+data: {"type":"response.output_text.delta","output_index":1,"item_id":"msg_partial","content_index":0,"delta":"partial should disappear"}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_partial","role":"assistant","content":[{"type":"output_text","text":"partial should disappear"}]}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":8,"output_tokens":520,"total_tokens":528,"output_tokens_details":{"reasoning_tokens":516}}}}
+
+`))
+		default:
+			secondBody = append([]byte(nil), body...)
+			_, _ = w.Write([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_2","summary":[]}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_2","summary":[],"encrypted_content":"enc_2"}}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"msg_final","role":"assistant","content":[{"type":"output_text","text":"final ok"}]}}
+
+data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"output_tokens_details":{"reasoning_tokens":10}}}}
+
+`))
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "same-token",
+	}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","stream":true,"previous_response_id":"resp_prev","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var body bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		body.Write(chunk.Payload)
+		body.WriteByte('\n')
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2; body:\n%s", got, body.String())
+	}
+	if strings.Contains(body.String(), "partial should disappear") {
+		t.Fatalf("tentative truncated output leaked downstream:\n%s", body.String())
+	}
+	if !strings.Contains(body.String(), "final ok") {
+		t.Fatalf("final output missing from downstream:\n%s", body.String())
+	}
+	if len(authorizations) != 2 || authorizations[0] != "Bearer same-token" || authorizations[1] != "Bearer same-token" {
+		t.Fatalf("unexpected Authorization headers: %#v", authorizations)
+	}
+	if gjson.GetBytes(secondBody, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id leaked into continuation payload: %s", secondBody)
+	}
+	if got := len(gjson.GetBytes(secondBody, "input").Array()); got != 3 {
+		t.Fatalf("continuation input len = %d, want 3: %s", got, secondBody)
+	}
+	if got := gjson.GetBytes(secondBody, "input.1.type").String(); got != "reasoning" {
+		t.Fatalf("input.1.type = %q, want reasoning: %s", got, secondBody)
+	}
+	if got := gjson.GetBytes(secondBody, "input.2.phase").String(); got != "commentary" {
+		t.Fatalf("input.2.phase = %q, want commentary: %s", got, secondBody)
+	}
+	if !codexContinuationIncludeHasEncrypted(secondBody) {
+		t.Fatalf("continuation payload missing encrypted include: %s", secondBody)
 	}
 }
