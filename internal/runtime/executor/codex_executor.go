@@ -1075,6 +1075,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if errReplay != nil {
 		return nil, errReplay
 	}
+	continuationEnabled := sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) && codexContinuationEnabledForBody(e.cfg, body)
+	if continuationEnabled {
+		body = codexContinuationPrepareBody(e.cfg, body)
+	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1132,18 +1136,25 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		closeHTTPRespBody := true
 		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
-				log.Errorf("codex executor: close response body error: %v", errClose)
+			if closeHTTPRespBody && httpResp.Body != nil {
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("codex executor: close response body error: %v", errClose)
+				}
 			}
 		}()
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 52_428_800) // 50MB
+		sendErr := func(err error) {
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: err}:
+			case <-ctx.Done():
+			}
+		}
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
-		for scanner.Scan() {
-			line := applyCodexIdentityConfuseResponsePayload(scanner.Bytes(), identityState)
+		processLine := func(rawLine []byte) bool {
+			line := applyCodexIdentityConfuseResponsePayload(rawLine, identityState)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			translatedLine := bytes.Clone(line)
 
@@ -1153,25 +1164,21 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
 						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
 						reporter.PublishFailure(ctx, errClearReplay)
-						select {
-						case out <- cliproxyexecutor.StreamChunk{Err: errClearReplay}:
-						case <-ctx.Done():
-						}
-						return
+						sendErr(errClearReplay)
+						return false
 					}
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 					reporter.PublishFailure(ctx, streamErr)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
-					case <-ctx.Done():
-					}
-					return
+					sendErr(streamErr)
+					return false
 				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
-					if detail, ok := helps.ParseCodexUsage(data); ok {
+					if detail, ok := codexContinuationBilledUsageDetail(data); ok {
+						reporter.Publish(ctx, detail)
+					} else if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
@@ -1187,17 +1194,69 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
 				case <-ctx.Done():
+					return false
+				}
+			}
+			return true
+		}
+
+		if continuationEnabled {
+			closeHTTPRespBody = false
+			openContinuationRound := func(roundCtx context.Context, payload []byte) (*http.Response, error) {
+				httpReq, errReq := http.NewRequestWithContext(roundCtx, http.MethodPost, url, bytes.NewReader(payload))
+				if errReq != nil {
+					return nil, errReq
+				}
+				if cacheID := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String()); cacheID != "" {
+					httpReq.Header.Set("Session_id", cacheID)
+				}
+				applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+				applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+				helps.RecordAPIRequest(roundCtx, e.cfg, helps.UpstreamRequestLog{
+					URL:       url,
+					Method:    http.MethodPost,
+					Headers:   httpReq.Header.Clone(),
+					Body:      payload,
+					Provider:  e.Identifier(),
+					AuthID:    authID,
+					AuthLabel: authLabel,
+					AuthType:  authType,
+					AuthValue: authValue,
+				})
+				nextResp, errDo := httpClient.Do(httpReq)
+				if errDo != nil {
+					helps.RecordAPIResponseError(roundCtx, e.cfg, errDo)
+					return nil, errDo
+				}
+				helps.RecordAPIResponseMetadata(roundCtx, e.cfg, nextResp.StatusCode, nextResp.Header.Clone())
+				return nextResp, nil
+			}
+			stopped := false
+			_, errFold := foldCodexContinuationStream(ctx, codexContinuationOptionsFromConfig(e.cfg), upstreamBody, httpResp, openContinuationRound, func(chunk []byte) {
+				if stopped {
 					return
 				}
+				stopped = !processLine(chunk)
+			})
+			if errFold != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, errFold)
+				reporter.PublishFailure(ctx, errFold)
+				sendErr(errFold)
+			}
+			return
+		}
+
+		scanner := bufio.NewScanner(httpResp.Body)
+		scanner.Buffer(nil, 52_428_800) // 50MB
+		for scanner.Scan() {
+			if !processLine(scanner.Bytes()) {
+				return
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
-			}
+			sendErr(errScan)
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
