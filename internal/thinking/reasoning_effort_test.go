@@ -25,6 +25,13 @@ func TestExtractReasoningEffortOpenAICompatiblePayloads(t *testing.T) {
 			want:     "medium",
 		},
 		{
+			name:     "responses accepts top level OpenAI effort",
+			provider: "openai-response",
+			model:    "gpt-5.4",
+			body:     []byte(`{"reasoning_effort":"high"}`),
+			want:     "high",
+		},
+		{
 			name:     "model suffix overrides body",
 			provider: "openai",
 			model:    "alias(max)",

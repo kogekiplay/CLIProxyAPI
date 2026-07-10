@@ -47,7 +47,8 @@ func (s *SQLiteStore) Analytics(ctx context.Context, req AnalyticsRequest) (Anal
 	if err != nil {
 		return AnalyticsResponse{}, err
 	}
-	events, err := s.analyticsEvents(ctx, req, prices)
+	modelAliases := compileModelAliasIndex(req.ModelAliases)
+	events, err := s.analyticsEventsWithModelAliasIndex(ctx, req, prices, modelAliases)
 	if err != nil {
 		return AnalyticsResponse{}, err
 	}
@@ -75,7 +76,11 @@ func (s *SQLiteStore) Analytics(ctx context.Context, req AnalyticsRequest) (Anal
 }
 
 func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest, prices []ModelPrice) ([]analyticsEvent, error) {
-	where, args := buildAnalyticsWhere(req)
+	return s.analyticsEventsWithModelAliasIndex(ctx, req, prices, compileModelAliasIndex(req.ModelAliases))
+}
+
+func (s *SQLiteStore) analyticsEventsWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices []ModelPrice, modelAliases modelAliasIndex) ([]analyticsEvent, error) {
+	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
 	requestedModels := cleanedAnalyticsValues(req.Filters.Models)
 	rows, err := s.db.QueryContext(ctx, `SELECT
 		id,
@@ -157,7 +162,7 @@ func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest,
 		item.failed = failed != 0
 		item.event.Failed = item.failed
 		item.upstreamModel = strings.TrimSpace(item.event.Model)
-		item.event.Model = resolveAnalyticsModel(item.event, req.ModelAliases)
+		item.event.Model = modelAliases.resolve(item.event)
 		if !matchesAnalyticsModelFilter(requestedModels, item.event.Model, item.upstreamModel) {
 			continue
 		}
@@ -188,6 +193,10 @@ func matchesAnalyticsModelFilter(requestedModels []string, effectiveModel, upstr
 }
 
 func buildAnalyticsWhere(req AnalyticsRequest) (string, []any) {
+	return buildAnalyticsWhereWithModelAliasIndex(req, compileModelAliasIndex(req.ModelAliases))
+}
+
+func buildAnalyticsWhereWithModelAliasIndex(req AnalyticsRequest, modelAliases modelAliasIndex) (string, []any) {
 	clauses := []string{"ts_ns >= ?", "ts_ns < ?"}
 	args := []any{time.UnixMilli(req.FromMS).UTC().UnixNano(), time.UnixMilli(req.ToMS).UTC().UnixNano()}
 	addIn := func(column string, values []string) {
@@ -203,7 +212,7 @@ func buildAnalyticsWhere(req AnalyticsRequest) (string, []any) {
 		clauses = append(clauses, column+" IN ("+strings.Join(placeholders, ",")+")")
 	}
 	addIn("provider", req.Filters.Providers)
-	addAnalyticsModelFilter(req.Filters.Models, req.ModelAliases, &clauses, &args)
+	addAnalyticsModelFilter(req.Filters.Models, modelAliases, &clauses, &args)
 	addIn("auth_file_name", req.Filters.AuthFiles)
 	addIn("auth_index", req.Filters.AuthIndices)
 	addAPIKeyHashFilter(req.Filters.APIKeyHashes, &clauses, &args)
@@ -216,23 +225,12 @@ func buildAnalyticsWhere(req AnalyticsRequest) (string, []any) {
 	return "WHERE " + strings.Join(clauses, " AND "), args
 }
 
-func addAnalyticsModelFilter(values []string, rules []ModelAliasRule, clauses *[]string, args *[]any) {
+func addAnalyticsModelFilter(values []string, modelAliases modelAliasIndex, clauses *[]string, args *[]any) {
 	requested := cleanedAnalyticsValues(values)
 	if len(requested) == 0 || clauses == nil || args == nil {
 		return
 	}
-	modelCandidates := append([]string{}, requested...)
-	for _, rule := range rules {
-		if !isModelAliasRule(rule) {
-			continue
-		}
-		for _, model := range requested {
-			if strings.EqualFold(strings.TrimSpace(rule.Alias), model) {
-				modelCandidates = appendUniqueModelAlias(modelCandidates, strings.TrimSpace(rule.UpstreamModel))
-				break
-			}
-		}
-	}
+	modelCandidates := modelAliases.expandRequestedModels(requested)
 	aliasPlaceholders := make([]string, len(requested))
 	for i, value := range requested {
 		aliasPlaceholders[i] = "?"

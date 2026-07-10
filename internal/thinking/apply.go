@@ -441,17 +441,18 @@ func ExtractReasoningEffort(body []byte, provider, model string) string {
 	}
 
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	config := extractThinkingConfig(body, provider)
-	if !hasThinkingConfig(config) {
-		switch provider {
-		case "openai-response":
-			config = extractCodexConfig(body)
-		case "openai":
-			config = extractCodexConfig(body)
+	var config ThinkingConfig
+	switch provider {
+	case "openai", "openai-response":
+		config = extractCodexConfig(body)
+		if !hasThinkingConfig(config) {
+			config = extractOpenAIConfig(body)
 		}
-		if !hasThinkingConfig(config) && (provider == "openai" || provider == "openai-response") {
+		if !hasThinkingConfig(config) {
 			config = extractClaudeConfig(body)
 		}
+	default:
+		config = extractThinkingConfig(body, provider)
 	}
 	return reasoningEffortFromConfig(config)
 }

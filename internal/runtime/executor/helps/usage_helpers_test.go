@@ -396,6 +396,32 @@ func TestUsageReporterSetTranslatedReasoningEffortPreservesEntryEffortWhenPayloa
 	}
 }
 
+func TestUsageReporterSetTranslatedReasoningEffortOverwritesEntryEffortWithExplicitValues(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{name: "none", payload: []byte(`{"reasoning_effort":"none"}`), want: "none"},
+		{name: "auto", payload: []byte(`{"reasoning_effort":"auto"}`), want: "auto"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reporter := NewUsageReporter(
+				usage.WithReasoningEffort(context.Background(), "high"),
+				"openai-compatible-test",
+				"model",
+				nil,
+			)
+
+			reporter.SetTranslatedReasoningEffort(test.payload, "openai")
+
+			if reporter.reasoning != test.want {
+				t.Fatalf("reasoning = %q, want %q", reporter.reasoning, test.want)
+			}
+		})
+	}
+}
+
 func TestUsageReporterSetTranslatedReasoningEffortDefaultsServiceTierWhenRemoved(t *testing.T) {
 	ctx := usage.WithServiceTier(context.Background(), "priority")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)

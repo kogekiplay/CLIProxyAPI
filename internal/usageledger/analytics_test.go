@@ -222,6 +222,29 @@ func TestSQLiteStoreAnalyticsResolveAliasRules(t *testing.T) {
 	}
 }
 
+func TestCompiledModelAliasIndexPreservesResolutionAndFilterExpansion(t *testing.T) {
+	index := compileModelAliasIndex([]ModelAliasRule{
+		{Provider: "Provider", AuthIndex: "auth-a", UpstreamModel: "shared-upstream", Alias: "alias-a"},
+		{Provider: "Provider", AuthIndex: "auth-a", UpstreamModel: "shared-upstream", Alias: "alias-b"},
+		{Provider: "Provider", AuthIndex: "auth-b", UpstreamModel: "shared-upstream", Alias: "alias-a"},
+	})
+
+	if got := index.resolve(Event{Provider: "PROVIDER", AuthIndex: "AUTH-A", Model: "SHARED-UPSTREAM"}); got != "SHARED-UPSTREAM" {
+		t.Fatalf("exact conflict resolution = %q, want upstream model", got)
+	}
+	if got := index.resolve(Event{Provider: "provider", AuthIndex: "unmapped", Model: "shared-upstream"}); got != "shared-upstream" {
+		t.Fatalf("provider conflict resolution = %q, want upstream model", got)
+	}
+	if got := index.resolve(Event{Provider: "provider", AuthIndex: "auth-b", Model: "shared-upstream"}); got != "alias-a" {
+		t.Fatalf("exact resolution = %q, want configured alias spelling", got)
+	}
+
+	candidates := index.expandRequestedModels([]string{"ALIAS-A"})
+	if len(candidates) != 2 || candidates[0] != "ALIAS-A" || candidates[1] != "shared-upstream" {
+		t.Fatalf("filter candidates = %#v, want requested alias plus upstream", candidates)
+	}
+}
+
 func TestSQLiteStoreAnalyticsHistoricalAliasPricingAndFilters(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()
