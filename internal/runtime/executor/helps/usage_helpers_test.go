@@ -381,6 +381,21 @@ func TestUsageReporterSetTranslatedReasoningEffortUpdatesServiceTier(t *testing.
 	}
 }
 
+func TestUsageReporterSetTranslatedReasoningEffortPreservesEntryEffortWhenPayloadHasNone(t *testing.T) {
+	reporter := NewUsageReporter(
+		usage.WithReasoningEffort(context.Background(), "high"),
+		"openai-compatible-test",
+		"model",
+		nil,
+	)
+
+	reporter.SetTranslatedReasoningEffort([]byte(`{"model":"upstream"}`), "openai")
+
+	if reporter.reasoning != "high" {
+		t.Fatalf("reasoning = %q, want %q", reporter.reasoning, "high")
+	}
+}
+
 func TestUsageReporterSetTranslatedReasoningEffortDefaultsServiceTierWhenRemoved(t *testing.T) {
 	ctx := usage.WithServiceTier(context.Background(), "priority")
 	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)

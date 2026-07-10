@@ -449,6 +449,9 @@ func ExtractReasoningEffort(body []byte, provider, model string) string {
 		case "openai":
 			config = extractCodexConfig(body)
 		}
+		if !hasThinkingConfig(config) && (provider == "openai" || provider == "openai-response") {
+			config = extractClaudeConfig(body)
+		}
 	}
 	return reasoningEffortFromConfig(config)
 }
@@ -464,6 +467,9 @@ func ExtractTranslatedReasoningEffort(body []byte, provider string) string {
 			config = extractCodexConfig(body)
 			if !hasThinkingConfig(config) {
 				config = extractOpenAIConfig(body)
+			}
+			if !hasThinkingConfig(config) {
+				config = extractClaudeConfig(body)
 			}
 		}
 	}

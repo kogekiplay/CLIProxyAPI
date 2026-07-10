@@ -110,7 +110,9 @@ func (r *UsageReporter) SetTranslatedReasoningEffort(payload []byte, format stri
 	if r == nil {
 		return
 	}
-	r.reasoning = thinking.ExtractTranslatedReasoningEffort(payload, format)
+	if reasoning := thinking.ExtractTranslatedReasoningEffort(payload, format); reasoning != "" {
+		r.reasoning = reasoning
+	}
 	r.serviceTier = extractServiceTierFromPayload(payload)
 }
 

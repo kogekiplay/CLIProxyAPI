@@ -29,6 +29,16 @@ func TestSetReasoningEffortMetadataUsesSuffixOverBody(t *testing.T) {
 	}
 }
 
+func TestSetReasoningEffortMetadataUsesMaxSuffixOverLowerBody(t *testing.T) {
+	meta := make(map[string]any)
+
+	setReasoningEffortMetadata(meta, "openai", "alias(max)", []byte(`{"reasoning_effort":"low"}`))
+
+	if got := meta[coreexecutor.ReasoningEffortMetadataKey]; got != "max" {
+		t.Fatalf("ReasoningEffortMetadataKey = %v, want %q", got, "max")
+	}
+}
+
 func TestSetReasoningEffortMetadataSupportsOpenAIResponses(t *testing.T) {
 	meta := make(map[string]any)
 

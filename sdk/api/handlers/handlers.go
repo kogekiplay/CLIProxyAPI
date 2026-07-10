@@ -737,7 +737,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
-	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
+	setReasoningEffortMetadata(reqMeta, entryProtocol, originalRequestedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -804,7 +804,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
-	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
+	setReasoningEffortMetadata(reqMeta, handlerType, originalRequestedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -891,7 +891,7 @@ func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtoco
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
-	setReasoningEffortMetadata(reqMeta, entryProtocol, modelName, rawJSON)
+	setReasoningEffortMetadata(reqMeta, entryProtocol, originalRequestedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -1138,7 +1138,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
-	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
+	setReasoningEffortMetadata(reqMeta, entryProtocol, originalRequestedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	payload := rawJSON
 	if len(payload) == 0 {
