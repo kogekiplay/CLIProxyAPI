@@ -198,19 +198,6 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
-  # Automatically continue Codex /v1/responses streams that end on the observed
-  # 518*n-2 reasoning-token truncation boundary. Enabled by default; set
-  # enabled: false to restore strict passthrough behavior.
-  # continuation:
-  #   enabled: true
-  #   max-continue: 3
-  #   min-n: 1
-  #   max-n: 6
-  #   truncation-step: 518
-  #   marker-text: "Continue thinking..."
-  #   forward-marker: false
-  #   force-include-encrypted: true
-  #   max-total-output-tokens: 0
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true

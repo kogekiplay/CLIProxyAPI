@@ -283,22 +283,7 @@ type CodexHeaderDefaults struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse bool                    `yaml:"identity-confuse" json:"identity-confuse"`
-	Continuation    CodexContinuationConfig `yaml:"continuation,omitempty" json:"continuation,omitempty"`
-}
-
-// CodexContinuationConfig controls automatic continuation folding for Codex
-// Responses streams that end on the observed 518*n-2 reasoning-token boundary.
-type CodexContinuationConfig struct {
-	Enabled               *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	MaxContinue           int    `yaml:"max-continue,omitempty" json:"max-continue,omitempty"`
-	MinN                  int    `yaml:"min-n,omitempty" json:"min-n,omitempty"`
-	MaxN                  int    `yaml:"max-n,omitempty" json:"max-n,omitempty"`
-	TruncationStep        int    `yaml:"truncation-step,omitempty" json:"truncation-step,omitempty"`
-	MarkerText            string `yaml:"marker-text,omitempty" json:"marker-text,omitempty"`
-	ForwardMarker         bool   `yaml:"forward-marker,omitempty" json:"forward-marker,omitempty"`
-	MaxTotalOutputTokens  int64  `yaml:"max-total-output-tokens,omitempty" json:"max-total-output-tokens,omitempty"`
-	ForceIncludeEncrypted *bool  `yaml:"force-include-encrypted,omitempty" json:"force-include-encrypted,omitempty"`
+	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
 }
 
 // TLSConfig holds HTTPS server settings.
