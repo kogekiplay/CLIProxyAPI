@@ -328,6 +328,167 @@ func TestSQLiteStoreAnalyticsHistoricalAliasPricingAndFilters(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreAnalyticsAliasFilterMatchesEffectiveModelPerAuth(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	const (
+		provider = "provider-a"
+		upstream = "shared-upstream"
+		aliasA   = "alias-a"
+		aliasB   = "alias-b"
+	)
+	now := time.Date(2026, 7, 10, 1, 0, 0, 0, time.UTC)
+	for _, event := range []Event{
+		{
+			RequestID: "req-auth-a",
+			Timestamp: now.Add(-2 * time.Minute),
+			Provider:  provider,
+			Model:     upstream,
+			AuthIndex: "auth-a",
+			Tokens:    TokenUsage{InputTokens: 2, TotalTokens: 2},
+		},
+		{
+			RequestID: "req-auth-b",
+			Timestamp: now.Add(-time.Minute),
+			Provider:  provider,
+			Model:     upstream,
+			AuthIndex: "auth-b",
+			Tokens:    TokenUsage{InputTokens: 3, TotalTokens: 3},
+		},
+	} {
+		if _, err := store.InsertEvent(context.Background(), event); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+	}
+	if err := store.UpsertModelPrice(context.Background(), ModelPrice{Model: aliasA, InputPer1M: 1_000_000}); err != nil {
+		t.Fatalf("upsert alias price: %v", err)
+	}
+
+	request := AnalyticsRequest{
+		FromMS: now.Add(-time.Hour).UnixMilli(),
+		ToMS:   now.Add(time.Minute).UnixMilli(),
+		ModelAliases: []ModelAliasRule{
+			{Provider: provider, AuthIndex: "auth-a", UpstreamModel: upstream, Alias: aliasA},
+			{Provider: provider, AuthIndex: "auth-b", UpstreamModel: upstream, Alias: aliasB},
+		},
+		Include: AnalyticsInclude{
+			Summary:         true,
+			Timeline:        true,
+			ModelStats:      true,
+			CredentialStats: true,
+			EventsPage:      &AnalyticsEventsPage{Limit: 10},
+		},
+	}
+
+	t.Run("alias only includes its matching auth and aggregates", func(t *testing.T) {
+		filtered := request
+		filtered.Filters.Models = []string{aliasA}
+		result, err := store.Analytics(context.Background(), filtered)
+		if err != nil {
+			t.Fatalf("analytics: %v", err)
+		}
+		if result.Summary == nil || result.Summary.TotalCalls != 1 || result.Summary.TotalTokens != 2 || result.Summary.TotalCost == nil || math.Abs(*result.Summary.TotalCost-2) > 0.000000001 {
+			t.Fatalf("summary = %#v", result.Summary)
+		}
+		if len(result.Timeline) != 1 || result.Timeline[0].Calls != 1 || result.Timeline[0].Cost == nil || math.Abs(*result.Timeline[0].Cost-2) > 0.000000001 {
+			t.Fatalf("timeline = %#v", result.Timeline)
+		}
+		if len(result.ModelStats) != 1 || result.ModelStats[0].Model != aliasA || result.ModelStats[0].Calls != 1 || result.ModelStats[0].Cost == nil || math.Abs(*result.ModelStats[0].Cost-2) > 0.000000001 {
+			t.Fatalf("model stats = %#v", result.ModelStats)
+		}
+		if len(result.CredentialStats) != 1 || result.CredentialStats[0].AuthIndex != "auth-a" || result.CredentialStats[0].Calls != 1 {
+			t.Fatalf("credential stats = %#v", result.CredentialStats)
+		}
+		if result.Events == nil || len(result.Events.Items) != 1 || result.Events.Items[0].RequestID != "req-auth-a" || result.Events.Items[0].EstimatedCostUSD == nil || math.Abs(*result.Events.Items[0].EstimatedCostUSD-2) > 0.000000001 {
+			t.Fatalf("events = %#v", result.Events)
+		}
+	})
+
+	t.Run("upstream includes both auths", func(t *testing.T) {
+		filtered := request
+		filtered.Filters.Models = []string{upstream}
+		result, err := store.Analytics(context.Background(), filtered)
+		if err != nil {
+			t.Fatalf("analytics: %v", err)
+		}
+		if result.Summary == nil || result.Summary.TotalCalls != 2 || result.Summary.TotalTokens != 5 {
+			t.Fatalf("summary = %#v", result.Summary)
+		}
+		if result.Events == nil || len(result.Events.Items) != 2 {
+			t.Fatalf("events = %#v", result.Events)
+		}
+	})
+}
+
+func TestSQLiteStoreAnalyticsAliasFilterDoesNotOverrideStoredAliasOrCrossProvider(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	const (
+		providerA = "provider-a"
+		providerB = "provider-b"
+		upstream  = "shared-upstream"
+		aliasA    = "alias-a"
+		aliasB    = "alias-b"
+	)
+	now := time.Date(2026, 7, 10, 1, 0, 0, 0, time.UTC)
+	for _, event := range []Event{
+		{
+			RequestID:  "req-stored-alias-b",
+			Timestamp:  now.Add(-2 * time.Minute),
+			Provider:   providerA,
+			Model:      upstream,
+			ModelAlias: aliasB,
+			AuthIndex:  "auth-a",
+			Tokens:     TokenUsage{TotalTokens: 2},
+		},
+		{
+			RequestID: "req-other-provider",
+			Timestamp: now.Add(-time.Minute),
+			Provider:  providerB,
+			Model:     upstream,
+			AuthIndex: "auth-a",
+			Tokens:    TokenUsage{TotalTokens: 3},
+		},
+	} {
+		if _, err := store.InsertEvent(context.Background(), event); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+	}
+
+	result, err := store.Analytics(context.Background(), AnalyticsRequest{
+		FromMS: now.Add(-time.Hour).UnixMilli(),
+		ToMS:   now.Add(time.Minute).UnixMilli(),
+		Filters: AnalyticsFilters{
+			Models: []string{aliasA},
+		},
+		ModelAliases: []ModelAliasRule{{
+			Provider:      providerA,
+			AuthIndex:     "auth-a",
+			UpstreamModel: upstream,
+			Alias:         aliasA,
+		}},
+		Include: AnalyticsInclude{
+			Summary:    true,
+			ModelStats: true,
+			EventsPage: &AnalyticsEventsPage{Limit: 10},
+		},
+	})
+	if err != nil {
+		t.Fatalf("analytics: %v", err)
+	}
+	if result.Summary == nil || result.Summary.TotalCalls != 0 || result.Summary.TotalTokens != 0 {
+		t.Fatalf("summary = %#v", result.Summary)
+	}
+	if len(result.ModelStats) != 0 {
+		t.Fatalf("model stats = %#v", result.ModelStats)
+	}
+	if result.Events == nil || len(result.Events.Items) != 0 {
+		t.Fatalf("events = %#v", result.Events)
+	}
+}
+
 func TestSQLiteStoreAnalyticsAliasFilterStaysScopedInSQL(t *testing.T) {
 	where, args := buildAnalyticsWhere(AnalyticsRequest{
 		FromMS: 100,

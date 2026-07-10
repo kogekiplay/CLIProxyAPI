@@ -76,6 +76,7 @@ func (s *SQLiteStore) Analytics(ctx context.Context, req AnalyticsRequest) (Anal
 
 func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest, prices []ModelPrice) ([]analyticsEvent, error) {
 	where, args := buildAnalyticsWhere(req)
+	requestedModels := cleanedAnalyticsValues(req.Filters.Models)
 	rows, err := s.db.QueryContext(ctx, `SELECT
 		id,
 		request_id,
@@ -157,6 +158,9 @@ func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest,
 		item.event.Failed = item.failed
 		item.upstreamModel = strings.TrimSpace(item.event.Model)
 		item.event.Model = resolveAnalyticsModel(item.event, req.ModelAliases)
+		if !matchesAnalyticsModelFilter(requestedModels, item.event.Model, item.upstreamModel) {
+			continue
+		}
 		if cost, ok, missing := CostForUsage(item.event.Model, item.tokens, prices); ok {
 			item.cost = cost
 			item.hasCost = true
@@ -169,6 +173,18 @@ func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest,
 		return nil, err
 	}
 	return out, nil
+}
+
+func matchesAnalyticsModelFilter(requestedModels []string, effectiveModel, upstreamModel string) bool {
+	if len(requestedModels) == 0 {
+		return true
+	}
+	for _, requestedModel := range requestedModels {
+		if strings.EqualFold(requestedModel, effectiveModel) || strings.EqualFold(requestedModel, upstreamModel) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildAnalyticsWhere(req AnalyticsRequest) (string, []any) {
