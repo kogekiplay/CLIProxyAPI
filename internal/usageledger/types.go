@@ -59,6 +59,7 @@ type Event struct {
 	Timestamp         time.Time
 	Provider          string
 	Model             string
+	ModelAlias        string
 	Endpoint          string
 	AuthIndex         string
 	AuthFileName      string

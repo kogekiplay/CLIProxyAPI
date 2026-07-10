@@ -58,6 +58,7 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 			ts_ns INTEGER NOT NULL,
 			provider TEXT NOT NULL,
 			model TEXT NOT NULL,
+			model_alias TEXT NOT NULL DEFAULT '',
 			endpoint TEXT NOT NULL DEFAULT '',
 			auth_index TEXT NOT NULL DEFAULT '',
 			auth_file_name TEXT NOT NULL DEFAULT '',
@@ -157,6 +158,7 @@ func (s *SQLiteStore) ensureUsageEventColumns(ctx context.Context) error {
 		def  string
 	}{
 		{name: "credential_key_hash", def: "TEXT NOT NULL DEFAULT ''"},
+		{name: "model_alias", def: "TEXT NOT NULL DEFAULT ''"},
 		{name: "auth_type", def: "TEXT NOT NULL DEFAULT ''"},
 		{name: "reasoning_effort", def: "TEXT NOT NULL DEFAULT ''"},
 		{name: "status_code", def: "INTEGER NOT NULL DEFAULT 0"},
@@ -252,6 +254,7 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		ts_ns,
 		provider,
 		model,
+		model_alias,
 		endpoint,
 		auth_index,
 		auth_file_name,
@@ -275,13 +278,14 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		cache_creation_tokens,
 		total_tokens,
 		failed
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	if event.RequestID != "" {
 		query = `INSERT OR IGNORE INTO usage_events (
 			request_id,
 			ts_ns,
 			provider,
 			model,
+			model_alias,
 			endpoint,
 			auth_index,
 			auth_file_name,
@@ -305,13 +309,14 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 			cache_creation_tokens,
 			total_tokens,
 			failed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	}
 	result, err := tx.ExecContext(ctx, query,
 		event.RequestID,
 		event.Timestamp.UnixNano(),
 		event.Provider,
 		event.Model,
+		event.ModelAlias,
 		event.Endpoint,
 		event.AuthIndex,
 		event.AuthFileName,
@@ -799,6 +804,7 @@ func normalizeEvent(event Event) Event {
 	event.RequestID = strings.TrimSpace(event.RequestID)
 	event.Provider = defaultString(event.Provider, "unknown")
 	event.Model = defaultString(event.Model, "unknown")
+	event.ModelAlias = strings.TrimSpace(event.ModelAlias)
 	event.Endpoint = strings.TrimSpace(event.Endpoint)
 	event.AuthIndex = strings.TrimSpace(event.AuthIndex)
 	event.AuthFileName = strings.TrimSpace(event.AuthFileName)

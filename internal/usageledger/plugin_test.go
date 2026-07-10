@@ -133,6 +133,26 @@ func TestPluginStoresMonitoringFieldsFromUsageRecord(t *testing.T) {
 	}
 }
 
+func TestPluginStoresModelAlias(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	plugin := NewPlugin(store, nil)
+	plugin.HandleUsage(context.Background(), coreusage.Record{
+		Provider: "openai-compatible-cf worker",
+		Model:    "@cf/zai-org/glm-5.2",
+		Alias:    "glm-5.2",
+	})
+
+	var model, modelAlias string
+	if err := store.db.QueryRow(`SELECT model, model_alias FROM usage_events LIMIT 1`).Scan(&model, &modelAlias); err != nil {
+		t.Fatal(err)
+	}
+	if model != "@cf/zai-org/glm-5.2" || modelAlias != "glm-5.2" {
+		t.Fatalf("model names = %q / %q", model, modelAlias)
+	}
+}
+
 func TestPluginStoresReasoningEffortFromContextFallback(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()

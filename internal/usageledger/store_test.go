@@ -2,6 +2,7 @@ package usageledger
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -23,6 +24,76 @@ func findModelPrice(prices []ModelPrice, model string) (ModelPrice, bool) {
 		}
 	}
 	return ModelPrice{}, false
+}
+
+func TestOpenSQLiteAddsModelAliasColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy sqlite database: %v", err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE usage_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		request_id TEXT NOT NULL DEFAULT '',
+		ts_ns INTEGER NOT NULL,
+		provider TEXT NOT NULL,
+		model TEXT NOT NULL,
+		endpoint TEXT NOT NULL DEFAULT '',
+		auth_index TEXT NOT NULL DEFAULT '',
+		auth_file_name TEXT NOT NULL DEFAULT '',
+		api_key_hash TEXT NOT NULL DEFAULT '',
+		credential_key_hash TEXT NOT NULL DEFAULT '',
+		account_ref TEXT NOT NULL DEFAULT '',
+		auth_type TEXT NOT NULL DEFAULT '',
+		service_tier TEXT NOT NULL DEFAULT '',
+		reasoning_effort TEXT NOT NULL DEFAULT '',
+		status_code INTEGER NOT NULL DEFAULT 0,
+		latency_ms INTEGER NOT NULL DEFAULT 0,
+		ttft_ms INTEGER NOT NULL DEFAULT 0,
+		fail_status_code INTEGER NOT NULL DEFAULT 0,
+		fail_summary TEXT NOT NULL DEFAULT '',
+		fail_body TEXT NOT NULL DEFAULT '',
+		input_tokens INTEGER NOT NULL DEFAULT 0,
+		output_tokens INTEGER NOT NULL DEFAULT 0,
+		reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+		cached_tokens INTEGER NOT NULL DEFAULT 0,
+		cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+		total_tokens INTEGER NOT NULL DEFAULT 0,
+		failed INTEGER NOT NULL DEFAULT 0
+	)`)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatalf("create legacy usage_events: %v", err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO usage_events (ts_ns, provider, model) VALUES (?, ?, ?)`, 1, "legacy", "legacy-model"); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("insert legacy event: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy sqlite database: %v", err)
+	}
+
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("reopen migrated sqlite database: %v", err)
+	}
+	defer store.Close()
+
+	columns, err := store.tableColumns(context.Background(), "usage_events")
+	if err != nil {
+		t.Fatalf("read usage_events columns: %v", err)
+	}
+	if !columns["model_alias"] {
+		t.Fatal("usage_events is missing model_alias")
+	}
+	var model, modelAlias string
+	if err := store.db.QueryRow(`SELECT model, model_alias FROM usage_events LIMIT 1`).Scan(&model, &modelAlias); err != nil {
+		t.Fatal(err)
+	}
+	if model != "legacy-model" || modelAlias != "" {
+		t.Fatalf("migrated model names = %q / %q", model, modelAlias)
+	}
 }
 
 func TestSQLiteStoreInsertEventUpdatesRollupsOnce(t *testing.T) {

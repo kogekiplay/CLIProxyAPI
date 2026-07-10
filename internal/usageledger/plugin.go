@@ -76,6 +76,7 @@ func (p *plugin) eventFromRecord(ctx context.Context, record coreusage.Record) E
 		Timestamp:         timestamp,
 		Provider:          strings.TrimSpace(record.Provider),
 		Model:             strings.TrimSpace(record.Model),
+		ModelAlias:        strings.TrimSpace(record.Alias),
 		Endpoint:          strings.TrimSpace(internallogging.GetEndpoint(ctx)),
 		AuthIndex:         authIndex,
 		APIKeyHash:        HashAPIKey(record.APIKey),
