@@ -85,3 +85,90 @@ func TestExtractTranslatedReasoningEffortOpenAICompatibleFallback(t *testing.T) 
 		t.Fatalf("ExtractTranslatedReasoningEffort() = %q, want %q", got, "max")
 	}
 }
+
+func TestExtractReasoningEffortOpenAICompatiblePriorityAndFallback(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		body     []byte
+		want     string
+	}{
+		{
+			name:     "chat blank native effort falls back to claude thinking",
+			provider: "openai",
+			body:     []byte(`{"reasoning_effort":" \t ","thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`),
+			want:     "high",
+		},
+		{
+			name:     "responses blank native effort falls back to claude thinking",
+			provider: "openai-response",
+			body:     []byte(`{"reasoning":{"effort":" \t "},"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`),
+			want:     "high",
+		},
+		{
+			name:     "responses native effort overrides claude thinking",
+			provider: "openai-response",
+			body:     []byte(`{"reasoning":{"effort":"low"},"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),
+			want:     "low",
+		},
+		{
+			name:     "chat native none blocks claude fallback",
+			provider: "openai",
+			body:     []byte(`{"reasoning_effort":"none","thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),
+			want:     "none",
+		},
+		{
+			name:     "chat native auto blocks claude fallback",
+			provider: "openai",
+			body:     []byte(`{"reasoning_effort":"auto","thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),
+			want:     "auto",
+		},
+		{
+			name:     "responses native none blocks claude fallback",
+			provider: "openai-response",
+			body:     []byte(`{"reasoning":{"effort":"none"},"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),
+			want:     "none",
+		},
+		{
+			name:     "responses native auto blocks claude fallback",
+			provider: "openai-response",
+			body:     []byte(`{"reasoning":{"effort":"auto"},"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),
+			want:     "auto",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ExtractReasoningEffort(tt.body, tt.provider, "gpt-5.4"); got != tt.want {
+				t.Fatalf("ExtractReasoningEffort() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractTranslatedReasoningEffortOpenAICompatibleBlankNativeFallsBack(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		body     []byte
+	}{
+		{
+			name:     "chat completions",
+			provider: "openai",
+			body:     []byte(`{"reasoning_effort":" ","thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),
+		},
+		{
+			name:     "responses",
+			provider: "openai-response",
+			body:     []byte(`{"reasoning":{"effort":" \t "},"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ExtractTranslatedReasoningEffort(tt.body, tt.provider); got != "max" {
+				t.Fatalf("ExtractTranslatedReasoningEffort() = %q, want %q", got, "max")
+			}
+		})
+	}
+}
