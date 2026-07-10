@@ -67,6 +67,7 @@ type Event struct {
 	AccountRef        string
 	AuthType          string
 	ServiceTier       string
+	ReasoningEffort   string
 	StatusCode        int
 	LatencyMS         int64
 	TTFTMS            int64
@@ -230,6 +231,7 @@ type AnalyticsEventRow struct {
 	AccountRef            string     `json:"account_ref"`
 	AuthType              string     `json:"auth_type"`
 	ServiceTier           string     `json:"service_tier"`
+	ReasoningEffort       string     `json:"reasoning_effort,omitempty"`
 	StatusCode            int        `json:"status_code,omitempty"`
 	LatencyMS             *int64     `json:"latency_ms,omitempty"`
 	TTFTMS                *int64     `json:"ttft_ms,omitempty"`

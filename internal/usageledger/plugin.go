@@ -58,6 +58,10 @@ func (p *plugin) eventFromRecord(ctx context.Context, record coreusage.Record) E
 	if serviceTier == "" {
 		serviceTier = coreusage.ServiceTierFromContext(ctx)
 	}
+	reasoningEffort := strings.TrimSpace(record.ReasoningEffort)
+	if reasoningEffort == "" {
+		reasoningEffort = coreusage.ReasoningEffortFromContext(ctx)
+	}
 	statusCode := record.Fail.StatusCode
 	if statusCode <= 0 {
 		statusCode = internallogging.GetResponseStatus(ctx)
@@ -79,6 +83,7 @@ func (p *plugin) eventFromRecord(ctx context.Context, record coreusage.Record) E
 		AccountRef:        accountRefFromSource(record.Source),
 		AuthType:          strings.TrimSpace(record.AuthType),
 		ServiceTier:       serviceTier,
+		ReasoningEffort:   reasoningEffort,
 		StatusCode:        statusCode,
 		LatencyMS:         durationMillis(record.Latency),
 		TTFTMS:            durationMillis(record.TTFT),

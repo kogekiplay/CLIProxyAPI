@@ -101,13 +101,14 @@ func TestPluginStoresMonitoringFieldsFromUsageRecord(t *testing.T) {
 	internallogging.SetResponseStatus(ctx, 200)
 
 	plugin.HandleUsage(ctx, coreusage.Record{
-		Provider:    "codex",
-		Model:       "gpt-5.5",
-		AuthIndex:   "auth-1",
-		RequestedAt: now,
-		Latency:     1500 * time.Millisecond,
-		TTFT:        375 * time.Millisecond,
-		Detail:      coreusage.Detail{TotalTokens: 23},
+		Provider:        "codex",
+		Model:           "gpt-5.5",
+		AuthIndex:       "auth-1",
+		ReasoningEffort: "ultra",
+		RequestedAt:     now,
+		Latency:         1500 * time.Millisecond,
+		TTFT:            375 * time.Millisecond,
+		Detail:          coreusage.Detail{TotalTokens: 23},
 	})
 
 	result, err := store.Analytics(context.Background(), AnalyticsRequest{
@@ -126,6 +127,41 @@ func TestPluginStoresMonitoringFieldsFromUsageRecord(t *testing.T) {
 	row := result.Events.Items[0]
 	if row.StatusCode != 200 || row.LatencyMS == nil || *row.LatencyMS != 1500 || row.TTFTMS == nil || *row.TTFTMS != 375 {
 		t.Fatalf("monitoring fields = %#v", row)
+	}
+	if row.ReasoningEffort != "ultra" {
+		t.Fatalf("reasoning effort = %q, want ultra", row.ReasoningEffort)
+	}
+}
+
+func TestPluginStoresReasoningEffortFromContextFallback(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	now := time.Date(2026, 7, 10, 1, 0, 0, 0, time.UTC)
+	plugin := NewPlugin(store, func() time.Time { return now })
+	ctx := coreusage.WithReasoningEffort(context.Background(), "high")
+
+	plugin.HandleUsage(ctx, coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5.6-sol",
+		RequestedAt: now,
+	})
+
+	result, err := store.Analytics(context.Background(), AnalyticsRequest{
+		FromMS: now.Add(-time.Minute).UnixMilli(),
+		ToMS:   now.Add(time.Minute).UnixMilli(),
+		Include: AnalyticsInclude{
+			EventsPage: &AnalyticsEventsPage{Limit: 10},
+		},
+	})
+	if err != nil {
+		t.Fatalf("analytics: %v", err)
+	}
+	if result.Events == nil || len(result.Events.Items) != 1 {
+		t.Fatalf("events = %#v", result.Events)
+	}
+	if got := result.Events.Items[0].ReasoningEffort; got != "high" {
+		t.Fatalf("reasoning effort = %q, want high", got)
 	}
 }
 

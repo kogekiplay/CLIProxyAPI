@@ -207,19 +207,20 @@ func TestSQLiteStoreAnalyticsEventsExposeRequestMonitoringFields(t *testing.T) {
 
 	now := time.Date(2026, 6, 26, 10, 0, 0, 0, time.UTC)
 	if _, err := store.InsertEvent(context.Background(), Event{
-		RequestID:      "req-monitoring",
-		Timestamp:      now,
-		Provider:       "codex",
-		Model:          "gpt-5.5",
-		Endpoint:       "POST /v1/responses",
-		AuthIndex:      "auth-1",
-		StatusCode:     429,
-		LatencyMS:      1530,
-		TTFTMS:         420,
-		Failed:         true,
-		FailStatusCode: 429,
-		FailBody:       `{"error":{"message":"rate limit for sk-secret-value","code":"rate_limit_exceeded"},"Authorization":"Bearer bearer-secret-12345"}`,
-		Tokens:         TokenUsage{TotalTokens: 0},
+		RequestID:       "req-monitoring",
+		Timestamp:       now,
+		Provider:        "codex",
+		Model:           "gpt-5.5",
+		ReasoningEffort: "max",
+		Endpoint:        "POST /v1/responses",
+		AuthIndex:       "auth-1",
+		StatusCode:      429,
+		LatencyMS:       1530,
+		TTFTMS:          420,
+		Failed:          true,
+		FailStatusCode:  429,
+		FailBody:        `{"error":{"message":"rate limit for sk-secret-value","code":"rate_limit_exceeded"},"Authorization":"Bearer bearer-secret-12345"}`,
+		Tokens:          TokenUsage{TotalTokens: 0},
 	}); err != nil {
 		t.Fatalf("insert event: %v", err)
 	}
@@ -240,6 +241,9 @@ func TestSQLiteStoreAnalyticsEventsExposeRequestMonitoringFields(t *testing.T) {
 	row := result.Events.Items[0]
 	if row.StatusCode != 429 || row.FailStatusCode != 429 || row.LatencyMS == nil || *row.LatencyMS != 1530 || row.TTFTMS == nil || *row.TTFTMS != 420 {
 		t.Fatalf("monitoring fields = %#v", row)
+	}
+	if row.ReasoningEffort != "max" {
+		t.Fatalf("reasoning effort = %q, want max", row.ReasoningEffort)
 	}
 	if row.FailSummary == "" || row.FailBody == "" {
 		t.Fatalf("fail summary/body missing: %#v", row)

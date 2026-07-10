@@ -66,6 +66,7 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 			account_ref TEXT NOT NULL DEFAULT '',
 			auth_type TEXT NOT NULL DEFAULT '',
 			service_tier TEXT NOT NULL DEFAULT '',
+			reasoning_effort TEXT NOT NULL DEFAULT '',
 			status_code INTEGER NOT NULL DEFAULT 0,
 			latency_ms INTEGER NOT NULL DEFAULT 0,
 			ttft_ms INTEGER NOT NULL DEFAULT 0,
@@ -157,6 +158,7 @@ func (s *SQLiteStore) ensureUsageEventColumns(ctx context.Context) error {
 	}{
 		{name: "credential_key_hash", def: "TEXT NOT NULL DEFAULT ''"},
 		{name: "auth_type", def: "TEXT NOT NULL DEFAULT ''"},
+		{name: "reasoning_effort", def: "TEXT NOT NULL DEFAULT ''"},
 		{name: "status_code", def: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "latency_ms", def: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "ttft_ms", def: "INTEGER NOT NULL DEFAULT 0"},
@@ -258,6 +260,7 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		account_ref,
 		auth_type,
 		service_tier,
+		reasoning_effort,
 		status_code,
 		latency_ms,
 		ttft_ms,
@@ -272,7 +275,7 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		cache_creation_tokens,
 		total_tokens,
 		failed
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	if event.RequestID != "" {
 		query = `INSERT OR IGNORE INTO usage_events (
 			request_id,
@@ -287,6 +290,7 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 			account_ref,
 			auth_type,
 			service_tier,
+			reasoning_effort,
 			status_code,
 			latency_ms,
 			ttft_ms,
@@ -301,7 +305,7 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 			cache_creation_tokens,
 			total_tokens,
 			failed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	}
 	result, err := tx.ExecContext(ctx, query,
 		event.RequestID,
@@ -316,6 +320,7 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		event.AccountRef,
 		event.AuthType,
 		event.ServiceTier,
+		event.ReasoningEffort,
 		event.StatusCode,
 		event.LatencyMS,
 		event.TTFTMS,

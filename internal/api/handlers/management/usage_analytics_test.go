@@ -20,13 +20,14 @@ func TestUsageAnalyticsEndpointReturnsUsageLedgerAnalytics(t *testing.T) {
 
 	now := time.Date(2026, 6, 26, 10, 0, 0, 0, time.UTC)
 	if _, err := store.InsertEvent(context.Background(), usageledger.Event{
-		RequestID:  "req-analytics",
-		Timestamp:  now,
-		Provider:   "opencode-go",
-		Model:      "kimi-k2.6",
-		APIKeyHash: "key-a",
-		AccountRef: "opencode-go:acct-a",
-		Tokens:     usageledger.TokenUsage{InputTokens: 20, OutputTokens: 10, TotalTokens: 30},
+		RequestID:       "req-analytics",
+		Timestamp:       now,
+		Provider:        "opencode-go",
+		Model:           "kimi-k2.6",
+		APIKeyHash:      "key-a",
+		AccountRef:      "opencode-go:acct-a",
+		ReasoningEffort: "high",
+		Tokens:          usageledger.TokenUsage{InputTokens: 20, OutputTokens: 10, TotalTokens: 30},
 	}); err != nil {
 		t.Fatalf("insert event: %v", err)
 	}
@@ -60,6 +61,9 @@ func TestUsageAnalyticsEndpointReturnsUsageLedgerAnalytics(t *testing.T) {
 	}
 	if response.Events == nil || len(response.Events.Items) != 1 || response.Events.Items[0].RequestID != "req-analytics" {
 		t.Fatalf("events = %#v", response.Events)
+	}
+	if response.Events.Items[0].ReasoningEffort != "high" {
+		t.Fatalf("reasoning effort = %q, want high", response.Events.Items[0].ReasoningEffort)
 	}
 }
 
