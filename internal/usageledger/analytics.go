@@ -11,6 +11,38 @@ import (
 const defaultAnalyticsEventsLimit = 100
 const maxAnalyticsEventsLimit = 50000
 
+const analyticsEventsSelect = `SELECT
+		id,
+		request_id,
+		ts_ns,
+		provider,
+		model,
+		model_alias,
+		endpoint,
+		auth_index,
+		auth_file_name,
+		api_key_hash,
+		credential_key_hash,
+		account_ref,
+		auth_type,
+		service_tier,
+		reasoning_effort,
+		status_code,
+		latency_ms,
+		ttft_ms,
+		fail_status_code,
+		fail_summary,
+		fail_body,
+		input_tokens,
+		output_tokens,
+		reasoning_tokens,
+		cached_tokens,
+		cache_read_tokens,
+		cache_creation_tokens,
+		total_tokens,
+		failed
+		FROM usage_events `
+
 type analyticsEvent struct {
 	id            int64
 	event         Event
@@ -48,12 +80,20 @@ func (s *SQLiteStore) Analytics(ctx context.Context, req AnalyticsRequest) (Anal
 		return AnalyticsResponse{}, err
 	}
 	modelAliases := compileModelAliasIndex(req.ModelAliases)
+	resp := AnalyticsResponse{GeneratedAtMS: time.Now().UnixMilli()}
+	if canUseAnalyticsEventsFastPath(req) {
+		resp.Events, err = s.analyticsEventsPageWithModelAliasIndex(ctx, req, prices, modelAliases)
+		if err != nil {
+			return AnalyticsResponse{}, err
+		}
+		return resp, nil
+	}
+
 	events, err := s.analyticsEventsWithModelAliasIndex(ctx, req, prices, modelAliases)
 	if err != nil {
 		return AnalyticsResponse{}, err
 	}
 
-	resp := AnalyticsResponse{GeneratedAtMS: time.Now().UnixMilli()}
 	if req.Include.Summary {
 		resp.Summary = buildAnalyticsSummary(events)
 	}
@@ -75,45 +115,53 @@ func (s *SQLiteStore) Analytics(ctx context.Context, req AnalyticsRequest) (Anal
 	return resp, nil
 }
 
+func canUseAnalyticsEventsFastPath(req AnalyticsRequest) bool {
+	return req.Include.EventsPage != nil &&
+		!req.Include.Summary &&
+		!req.Include.Timeline &&
+		!req.Include.ModelStats &&
+		!req.Include.APIKeyStats &&
+		!req.Include.CredentialStats &&
+		len(cleanedAnalyticsValues(req.Filters.Models)) == 0
+}
+
 func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest, prices []ModelPrice) ([]analyticsEvent, error) {
 	return s.analyticsEventsWithModelAliasIndex(ctx, req, prices, compileModelAliasIndex(req.ModelAliases))
 }
 
 func (s *SQLiteStore) analyticsEventsWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices []ModelPrice, modelAliases modelAliasIndex) ([]analyticsEvent, error) {
 	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
-	requestedModels := cleanedAnalyticsValues(req.Filters.Models)
-	rows, err := s.db.QueryContext(ctx, `SELECT
-		id,
-		request_id,
-		ts_ns,
-		provider,
-		model,
-		model_alias,
-		endpoint,
-		auth_index,
-		auth_file_name,
-		api_key_hash,
-		credential_key_hash,
-		account_ref,
-		auth_type,
-		service_tier,
-		reasoning_effort,
-		status_code,
-		latency_ms,
-		ttft_ms,
-		fail_status_code,
-		fail_summary,
-		fail_body,
-		input_tokens,
-		output_tokens,
-		reasoning_tokens,
-		cached_tokens,
-		cache_read_tokens,
-		cache_creation_tokens,
-		total_tokens,
-		failed
-		FROM usage_events `+where+`
-		ORDER BY ts_ns ASC, id ASC`, args...)
+	return s.queryAnalyticsEvents(ctx, analyticsEventsSelect+where+` ORDER BY ts_ns ASC, id ASC`, args, prices, modelAliases, cleanedAnalyticsValues(req.Filters.Models))
+}
+
+func (s *SQLiteStore) analyticsEventsPageWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices []ModelPrice, modelAliases modelAliasIndex) (*AnalyticsEventsResponse, error) {
+	page := *req.Include.EventsPage
+	limit := normalizeAnalyticsEventsLimit(page.Limit)
+	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
+
+	var totalCount int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events `+where, args...).Scan(&totalCount); err != nil {
+		return nil, err
+	}
+
+	pageWhere, pageArgs := addAnalyticsEventsPageCursor(where, append([]any(nil), args...), page)
+	pageArgs = append(pageArgs, limit+1)
+	events, err := s.queryAnalyticsEvents(
+		ctx,
+		analyticsEventsSelect+pageWhere+` ORDER BY ts_ns DESC, id DESC LIMIT ?`,
+		pageArgs,
+		prices,
+		modelAliases,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return buildAnalyticsEventsPageFromDescending(events, limit, totalCount), nil
+}
+
+func (s *SQLiteStore) queryAnalyticsEvents(ctx context.Context, query string, args []any, prices []ModelPrice, modelAliases modelAliasIndex, requestedModels []string) ([]analyticsEvent, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -121,56 +169,12 @@ func (s *SQLiteStore) analyticsEventsWithModelAliasIndex(ctx context.Context, re
 
 	out := make([]analyticsEvent, 0)
 	for rows.Next() {
-		var item analyticsEvent
-		var failed int
-		if err := rows.Scan(
-			&item.id,
-			&item.event.RequestID,
-			&item.unixNano,
-			&item.event.Provider,
-			&item.event.Model,
-			&item.event.ModelAlias,
-			&item.event.Endpoint,
-			&item.event.AuthIndex,
-			&item.event.AuthFileName,
-			&item.event.APIKeyHash,
-			&item.event.CredentialKeyHash,
-			&item.event.AccountRef,
-			&item.event.AuthType,
-			&item.event.ServiceTier,
-			&item.event.ReasoningEffort,
-			&item.event.StatusCode,
-			&item.event.LatencyMS,
-			&item.event.TTFTMS,
-			&item.event.FailStatusCode,
-			&item.event.FailSummary,
-			&item.event.FailBody,
-			&item.tokens.InputTokens,
-			&item.tokens.OutputTokens,
-			&item.tokens.ReasoningTokens,
-			&item.tokens.CachedTokens,
-			&item.tokens.CacheReadTokens,
-			&item.tokens.CacheCreationTokens,
-			&item.tokens.TotalTokens,
-			&failed,
-		); err != nil {
+		item, err := scanAnalyticsEvent(rows, prices, modelAliases)
+		if err != nil {
 			return nil, err
 		}
-		item.event.Timestamp = time.Unix(0, item.unixNano).UTC()
-		item.event.Tokens = item.tokens.Normalize()
-		item.tokens = item.event.Tokens
-		item.failed = failed != 0
-		item.event.Failed = item.failed
-		item.upstreamModel = strings.TrimSpace(item.event.Model)
-		item.event.Model = modelAliases.resolve(item.event)
 		if !matchesAnalyticsModelFilter(requestedModels, item.event.Model, item.upstreamModel) {
 			continue
-		}
-		if cost, ok, missing := CostForUsage(item.event.Model, item.tokens, prices); ok {
-			item.cost = cost
-			item.hasCost = true
-		} else if len(missing) > 0 {
-			item.missing = missing[0]
 		}
 		out = append(out, item)
 	}
@@ -178,6 +182,75 @@ func (s *SQLiteStore) analyticsEventsWithModelAliasIndex(ctx context.Context, re
 		return nil, err
 	}
 	return out, nil
+}
+
+type analyticsRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanAnalyticsEvent(scanner analyticsRowScanner, prices []ModelPrice, modelAliases modelAliasIndex) (analyticsEvent, error) {
+	var item analyticsEvent
+	var failed int
+	if err := scanner.Scan(
+		&item.id,
+		&item.event.RequestID,
+		&item.unixNano,
+		&item.event.Provider,
+		&item.event.Model,
+		&item.event.ModelAlias,
+		&item.event.Endpoint,
+		&item.event.AuthIndex,
+		&item.event.AuthFileName,
+		&item.event.APIKeyHash,
+		&item.event.CredentialKeyHash,
+		&item.event.AccountRef,
+		&item.event.AuthType,
+		&item.event.ServiceTier,
+		&item.event.ReasoningEffort,
+		&item.event.StatusCode,
+		&item.event.LatencyMS,
+		&item.event.TTFTMS,
+		&item.event.FailStatusCode,
+		&item.event.FailSummary,
+		&item.event.FailBody,
+		&item.tokens.InputTokens,
+		&item.tokens.OutputTokens,
+		&item.tokens.ReasoningTokens,
+		&item.tokens.CachedTokens,
+		&item.tokens.CacheReadTokens,
+		&item.tokens.CacheCreationTokens,
+		&item.tokens.TotalTokens,
+		&failed,
+	); err != nil {
+		return analyticsEvent{}, err
+	}
+	item.event.Timestamp = time.Unix(0, item.unixNano).UTC()
+	item.event.Tokens = item.tokens.Normalize()
+	item.tokens = item.event.Tokens
+	item.failed = failed != 0
+	item.event.Failed = item.failed
+	item.upstreamModel = strings.TrimSpace(item.event.Model)
+	item.event.Model = modelAliases.resolve(item.event)
+	if cost, ok, missing := CostForUsage(item.event.Model, item.tokens, prices); ok {
+		item.cost = cost
+		item.hasCost = true
+	} else if len(missing) > 0 {
+		item.missing = missing[0]
+	}
+	return item, nil
+}
+
+func addAnalyticsEventsPageCursor(where string, args []any, page AnalyticsEventsPage) (string, []any) {
+	if page.BeforeMS == nil {
+		return where, args
+	}
+	start := time.UnixMilli(*page.BeforeMS).UTC()
+	startNS := start.UnixNano()
+	nextNS := start.Add(time.Millisecond).UnixNano()
+	if page.BeforeID != nil && *page.BeforeID > 0 {
+		return where + ` AND (ts_ns < ? OR (ts_ns >= ? AND ts_ns < ? AND id < ?))`, append(args, startNS, startNS, nextNS, *page.BeforeID)
+	}
+	return where + ` AND ts_ns < ?`, append(args, nextNS)
 }
 
 func matchesAnalyticsModelFilter(requestedModels []string, effectiveModel, upstreamModel string) bool {
@@ -558,13 +631,7 @@ func buildAnalyticsCredentialStats(events []analyticsEvent) []AnalyticsCredentia
 }
 
 func buildAnalyticsEventsPage(events []analyticsEvent, page AnalyticsEventsPage) *AnalyticsEventsResponse {
-	limit := page.Limit
-	if limit <= 0 {
-		limit = defaultAnalyticsEventsLimit
-	}
-	if limit > maxAnalyticsEventsLimit {
-		limit = maxAnalyticsEventsLimit
-	}
+	limit := normalizeAnalyticsEventsLimit(page.Limit)
 	items := make([]AnalyticsEventRow, 0, minInt(limit, len(events)))
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
@@ -581,38 +648,7 @@ func buildAnalyticsEventsPage(events []analyticsEvent, page AnalyticsEventsPage)
 		if len(items) >= limit+1 {
 			break
 		}
-		row := AnalyticsEventRow{
-			ID:                    event.id,
-			RequestID:             event.event.RequestID,
-			TimestampMS:           timestampMS,
-			Provider:              event.event.Provider,
-			Model:                 event.event.Model,
-			Endpoint:              event.event.Endpoint,
-			AuthIndex:             event.event.AuthIndex,
-			AuthFileName:          event.event.AuthFileName,
-			APIKeyHash:            event.event.APIKeyHash,
-			CredentialKeyHash:     event.event.CredentialKeyHash,
-			AccountRef:            event.event.AccountRef,
-			AuthType:              event.event.AuthType,
-			ServiceTier:           event.event.ServiceTier,
-			ReasoningEffort:       event.event.ReasoningEffort,
-			StatusCode:            event.event.StatusCode,
-			LatencyMS:             int64PtrIfPositive(event.event.LatencyMS),
-			TTFTMS:                int64PtrIfPositive(event.event.TTFTMS),
-			FailStatusCode:        event.event.FailStatusCode,
-			FailSummary:           event.event.FailSummary,
-			FailBody:              event.event.FailBody,
-			Tokens:                event.tokens,
-			Failed:                event.failed,
-			MissingPriceModelName: event.missing,
-		}
-		if event.upstreamModel != "" && event.upstreamModel != event.event.Model {
-			row.UpstreamModel = event.upstreamModel
-		}
-		if event.hasCost {
-			row.EstimatedCostUSD = floatPtr(event.cost)
-		}
-		items = append(items, row)
+		items = append(items, analyticsEventRow(event))
 	}
 	hasMore := len(items) > limit
 	if hasMore {
@@ -629,6 +665,73 @@ func buildAnalyticsEventsPage(events []analyticsEvent, page AnalyticsEventsPage)
 		resp.NextBeforeID = last.ID
 	}
 	return resp
+}
+
+func buildAnalyticsEventsPageFromDescending(events []analyticsEvent, limit int, totalCount int64) *AnalyticsEventsResponse {
+	hasMore := len(events) > limit
+	if hasMore {
+		events = events[:limit]
+	}
+	items := make([]AnalyticsEventRow, 0, len(events))
+	for _, event := range events {
+		items = append(items, analyticsEventRow(event))
+	}
+	resp := &AnalyticsEventsResponse{
+		Items:      items,
+		HasMore:    hasMore,
+		TotalCount: totalCount,
+	}
+	if len(items) > 0 {
+		last := items[len(items)-1]
+		resp.NextBeforeMS = last.TimestampMS
+		resp.NextBeforeID = last.ID
+	}
+	return resp
+}
+
+func analyticsEventRow(event analyticsEvent) AnalyticsEventRow {
+	row := AnalyticsEventRow{
+		ID:                    event.id,
+		RequestID:             event.event.RequestID,
+		TimestampMS:           event.event.Timestamp.UnixMilli(),
+		Provider:              event.event.Provider,
+		Model:                 event.event.Model,
+		Endpoint:              event.event.Endpoint,
+		AuthIndex:             event.event.AuthIndex,
+		AuthFileName:          event.event.AuthFileName,
+		APIKeyHash:            event.event.APIKeyHash,
+		CredentialKeyHash:     event.event.CredentialKeyHash,
+		AccountRef:            event.event.AccountRef,
+		AuthType:              event.event.AuthType,
+		ServiceTier:           event.event.ServiceTier,
+		ReasoningEffort:       event.event.ReasoningEffort,
+		StatusCode:            event.event.StatusCode,
+		LatencyMS:             int64PtrIfPositive(event.event.LatencyMS),
+		TTFTMS:                int64PtrIfPositive(event.event.TTFTMS),
+		FailStatusCode:        event.event.FailStatusCode,
+		FailSummary:           event.event.FailSummary,
+		FailBody:              event.event.FailBody,
+		Tokens:                event.tokens,
+		Failed:                event.failed,
+		MissingPriceModelName: event.missing,
+	}
+	if event.upstreamModel != "" && event.upstreamModel != event.event.Model {
+		row.UpstreamModel = event.upstreamModel
+	}
+	if event.hasCost {
+		row.EstimatedCostUSD = floatPtr(event.cost)
+	}
+	return row
+}
+
+func normalizeAnalyticsEventsLimit(limit int) int {
+	if limit <= 0 {
+		return defaultAnalyticsEventsLimit
+	}
+	if limit > maxAnalyticsEventsLimit {
+		return maxAnalyticsEventsLimit
+	}
+	return limit
 }
 
 func aggregateAnalyticsEvents(events []analyticsEvent) analyticsAggregate {

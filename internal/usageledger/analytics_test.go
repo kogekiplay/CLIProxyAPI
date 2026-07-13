@@ -118,6 +118,67 @@ func TestSQLiteStoreAnalyticsAggregatesFilteredUsage(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreAnalyticsEventsOnlyPaginatesNewestFirst(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 6, 26, 10, 0, 0, 0, time.UTC)
+	events := []Event{
+		{RequestID: "req-oldest", Timestamp: base.Add(-time.Second), Provider: "codex", Model: "gpt-5.5"},
+		{RequestID: "req-same-ms-1", Timestamp: base.Add(100 * time.Microsecond), Provider: "codex", Model: "gpt-5.5"},
+		{RequestID: "req-same-ms-2", Timestamp: base.Add(200 * time.Microsecond), Provider: "codex", Model: "gpt-5.5"},
+		{RequestID: "req-newest", Timestamp: base.Add(time.Second), Provider: "codex", Model: "gpt-5.5"},
+		{RequestID: "req-other-provider", Timestamp: base.Add(2 * time.Second), Provider: "gemini", Model: "gemini-2.5-pro"},
+	}
+	for _, event := range events {
+		if _, err := store.InsertEvent(context.Background(), event); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+	}
+
+	request := AnalyticsRequest{
+		FromMS: base.Add(-time.Minute).UnixMilli(),
+		ToMS:   base.Add(time.Minute).UnixMilli(),
+		Filters: AnalyticsFilters{
+			Providers: []string{"codex"},
+		},
+		Include: AnalyticsInclude{
+			EventsPage: &AnalyticsEventsPage{Limit: 2},
+		},
+	}
+	first, err := store.Analytics(context.Background(), request)
+	if err != nil {
+		t.Fatalf("analytics first page: %v", err)
+	}
+	if first.Summary != nil || len(first.Timeline) != 0 || len(first.ModelStats) != 0 {
+		t.Fatalf("events-only response unexpectedly contains stats: %#v", first)
+	}
+	if first.Events == nil || first.Events.TotalCount != 4 || !first.Events.HasMore {
+		t.Fatalf("first page metadata = %#v", first.Events)
+	}
+	if got := []string{first.Events.Items[0].RequestID, first.Events.Items[1].RequestID}; got[0] != "req-newest" || got[1] != "req-same-ms-2" {
+		t.Fatalf("first page order = %v", got)
+	}
+
+	request.Include.EventsPage.BeforeMS = &first.Events.NextBeforeMS
+	request.Include.EventsPage.BeforeID = &first.Events.NextBeforeID
+	second, err := store.Analytics(context.Background(), request)
+	if err != nil {
+		t.Fatalf("analytics second page: %v", err)
+	}
+	if second.Events == nil || second.Events.TotalCount != 4 || second.Events.HasMore {
+		t.Fatalf("second page metadata = %#v", second.Events)
+	}
+	if got := []string{second.Events.Items[0].RequestID, second.Events.Items[1].RequestID}; got[0] != "req-same-ms-1" || got[1] != "req-oldest" {
+		t.Fatalf("second page order = %v", got)
+	}
+
+	var indexName string
+	if err := store.db.QueryRowContext(context.Background(), `SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'usage_events_time_idx'`).Scan(&indexName); err != nil {
+		t.Fatalf("lookup usage events time index: %v", err)
+	}
+}
+
 func TestSQLiteStoreAnalyticsEventsReadsModelAlias(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()

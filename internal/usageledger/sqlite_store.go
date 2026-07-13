@@ -86,6 +86,8 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS usage_events_request_id_unique
 			ON usage_events(request_id)
 			WHERE request_id <> ''`,
+		`CREATE INDEX IF NOT EXISTS usage_events_time_idx
+			ON usage_events(ts_ns, id)`,
 		`CREATE INDEX IF NOT EXISTS usage_events_scope_idx
 			ON usage_events(provider, auth_index, api_key_hash, account_ref, ts_ns)`,
 		`CREATE INDEX IF NOT EXISTS usage_events_model_idx
