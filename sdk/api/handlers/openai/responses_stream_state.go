@@ -167,24 +167,32 @@ func (s *ResponsesStreamState) observeSequence(payload []byte) {
 	s.sequenceSeen = true
 }
 
-func (s *ResponsesStreamState) syntheticSequences(count int, upstreamPayload []byte) []int {
+func (s *ResponsesStreamState) syntheticSequences(count int, upstreamPayload []byte) []*int {
 	if s == nil || count <= 0 {
 		return nil
 	}
 
-	lastSequence := -1
+	start := 0
 	if s.sequenceSeen {
-		lastSequence = s.SequenceNumber
+		start = s.SequenceNumber + 1
 	}
 	if upstreamSequence, ok := responseSequenceNumber(upstreamPayload); ok {
-		if upstreamSequence > lastSequence {
-			lastSequence = upstreamSequence
+		start = upstreamSequence - count
+		minimum := 0
+		if s.sequenceSeen {
+			minimum = s.SequenceNumber + 1
+		}
+		if start < minimum {
+			// The original upstream event cannot be renumbered. Omit synthetic
+			// sequence numbers when no integer range preserves output ordering.
+			return make([]*int, count)
 		}
 	}
 
-	sequences := make([]int, count)
+	sequences := make([]*int, count)
 	for i := range sequences {
-		sequences[i] = lastSequence + i + 1
+		sequenceNumber := start + i
+		sequences[i] = &sequenceNumber
 	}
 	return sequences
 }

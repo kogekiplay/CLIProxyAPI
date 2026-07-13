@@ -50,8 +50,8 @@ func TestResponsesEventRepairerSynthesizesMissingTextLifecycle(t *testing.T) {
 	if outputIndex := gjson.GetBytes(got[0], "output_index").Int(); outputIndex != 2 {
 		t.Fatalf("expected synthetic output index 2, got %d", outputIndex)
 	}
-	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 14 {
-		t.Fatalf("expected first synthetic sequence 14, got %d", sequence)
+	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 11 {
+		t.Fatalf("expected first synthetic sequence 11, got %d", sequence)
 	}
 	if itemID := gjson.GetBytes(got[1], "item_id").String(); itemID != "msg-1" {
 		t.Fatalf("expected synthetic content owner msg-1, got %q", itemID)
@@ -59,8 +59,8 @@ func TestResponsesEventRepairerSynthesizesMissingTextLifecycle(t *testing.T) {
 	if contentIndex := gjson.GetBytes(got[1], "content_index").Int(); contentIndex != 1 {
 		t.Fatalf("expected synthetic content index 1, got %d", contentIndex)
 	}
-	if sequence := gjson.GetBytes(got[1], "sequence_number").Int(); sequence != 15 {
-		t.Fatalf("expected second synthetic sequence 15, got %d", sequence)
+	if sequence := gjson.GetBytes(got[1], "sequence_number").Int(); sequence != 12 {
+		t.Fatalf("expected second synthetic sequence 12, got %d", sequence)
 	}
 }
 
@@ -77,8 +77,8 @@ func TestResponsesEventRepairerSynthesizesOnlyMissingContentPart(t *testing.T) {
 		"response.content_part.added",
 		"response.output_text.delta",
 	)
-	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 4 {
-		t.Fatalf("expected synthetic content sequence 4, got %d", sequence)
+	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 2 {
+		t.Fatalf("expected synthetic content sequence 2, got %d", sequence)
 	}
 	if !bytes.Equal(got[1], delta) {
 		t.Fatalf("expected original delta to remain unchanged.\nGot:  %s\nWant: %s", got[1], delta)
@@ -166,22 +166,51 @@ func TestResponsesEventRepairerRepairsFinalMessageAfterReasoning(t *testing.T) {
 	}
 }
 
-func TestResponsesEventRepairerLeavesFunctionCallFlowUntouched(t *testing.T) {
-	repairer := newResponsesEventRepairer()
-	toolAdded := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"tool-1","type":"function_call","name":"shell","arguments":""},"sequence_number":1}`)
-	toolDelta := []byte(`{"type":"response.function_call_arguments.delta","item_id":"tool-1","output_index":0,"delta":"{\"cmd\":\"pwd\"}","sequence_number":2}`)
+func TestResponsesEventRepairerLeavesToolCallFlowsUntouched(t *testing.T) {
+	tests := []struct {
+		name      string
+		itemID    string
+		itemType  string
+		deltaType string
+	}{
+		{name: "function call", itemID: "tool-1", itemType: "function_call", deltaType: "response.function_call_arguments.delta"},
+		{name: "custom tool call", itemID: "custom-1", itemType: "custom_tool_call", deltaType: "response.custom_tool_call_input.delta"},
+	}
 
-	for _, event := range [][]byte{toolAdded, toolDelta} {
-		got := repairer.repair(event)
-		if len(got) != 1 || !bytes.Equal(got[0], event) {
-			t.Fatalf("expected function-call event to pass through unchanged, got %q for %s", got, event)
-		}
-	}
-	if item := repairer.state.Items["tool-1"]; item == nil || item.Type != "function_call" || !item.Added {
-		t.Fatalf("expected function-call state to remain unpolluted, got %#v", item)
-	}
-	if _, exists := repairer.state.Items["msg-1"]; exists {
-		t.Fatalf("function-call flow unexpectedly created a message state: %#v", repairer.state.Items["msg-1"])
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repairer := newResponsesEventRepairer()
+			toolAdded := mustMarshalResponsesTestEvent(t, map[string]any{
+				"type":         "response.output_item.added",
+				"output_index": 0,
+				"item": map[string]any{
+					"id":   tt.itemID,
+					"type": tt.itemType,
+					"name": "shell",
+				},
+				"sequence_number": 1,
+			})
+			toolDelta := mustMarshalResponsesTestEvent(t, map[string]any{
+				"type":            tt.deltaType,
+				"item_id":         tt.itemID,
+				"output_index":    0,
+				"delta":           `{"cmd":"pwd"}`,
+				"sequence_number": 2,
+			})
+
+			for _, event := range [][]byte{toolAdded, toolDelta} {
+				got := repairer.repair(event)
+				if len(got) != 1 || !bytes.Equal(got[0], event) {
+					t.Fatalf("expected tool event to pass through unchanged, got %q for %s", got, event)
+				}
+			}
+			if item := repairer.state.Items[tt.itemID]; item == nil || item.Type != tt.itemType || !item.Added {
+				t.Fatalf("expected tool state to remain unpolluted, got %#v", item)
+			}
+			if _, exists := repairer.state.Items["msg-1"]; exists {
+				t.Fatalf("tool flow unexpectedly created a message state: %#v", repairer.state.Items["msg-1"])
+			}
+		})
 	}
 }
 
@@ -285,7 +314,7 @@ func TestResponsesEventRepairerSyntheticSequenceFollowsObservedUpstream(t *testi
 	}
 }
 
-func TestResponsesEventRepairerSyntheticSequenceExceedsCurrentUpstream(t *testing.T) {
+func TestResponsesEventRepairerSyntheticSequencePreservesOutputOrder(t *testing.T) {
 	repairer := newResponsesEventRepairer()
 	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello","sequence_number":100}`)
 
@@ -295,14 +324,33 @@ func TestResponsesEventRepairerSyntheticSequenceExceedsCurrentUpstream(t *testin
 		"response.content_part.added",
 		"response.output_text.delta",
 	)
-	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 101 {
-		t.Fatalf("expected synthetic item sequence 101, got %d", sequence)
+	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 98 {
+		t.Fatalf("expected synthetic item sequence 98, got %d", sequence)
 	}
-	if sequence := gjson.GetBytes(got[1], "sequence_number").Int(); sequence != 102 {
-		t.Fatalf("expected synthetic content sequence 102, got %d", sequence)
+	if sequence := gjson.GetBytes(got[1], "sequence_number").Int(); sequence != 99 {
+		t.Fatalf("expected synthetic content sequence 99, got %d", sequence)
 	}
 	if !bytes.Equal(got[2], delta) {
 		t.Fatalf("expected upstream sequence to remain unchanged, got %s", got[2])
+	}
+}
+
+func TestResponsesEventRepairerOmitsSyntheticSequenceWithoutAvailableRange(t *testing.T) {
+	repairer := newResponsesEventRepairer()
+	repairer.repair([]byte(`{"type":"response.created","response":{"id":"resp-1"},"sequence_number":99}`))
+	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello","sequence_number":100}`)
+
+	got := repairer.repair(delta)
+	assertResponsesEventTypes(t, got,
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+	)
+	if gjson.GetBytes(got[0], "sequence_number").Exists() || gjson.GetBytes(got[1], "sequence_number").Exists() {
+		t.Fatalf("expected synthetic sequence numbers to be omitted when no ordered range exists: %q", got[:2])
+	}
+	if !bytes.Equal(got[2], delta) {
+		t.Fatalf("expected upstream delta to remain unchanged, got %s", got[2])
 	}
 }
 

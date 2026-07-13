@@ -45,7 +45,7 @@ func repairOutputTextDeltaRule(state *ResponsesStreamState, payload []byte) [][]
 	return append(events, payload)
 }
 
-func syntheticOutputItemAdded(deltaPayload []byte, sequenceNumber int) []byte {
+func syntheticOutputItemAdded(deltaPayload []byte, sequenceNumber *int) []byte {
 	event := struct {
 		Type        string `json:"type"`
 		OutputIndex int    `json:"output_index"`
@@ -56,7 +56,7 @@ func syntheticOutputItemAdded(deltaPayload []byte, sequenceNumber int) []byte {
 			Role    string `json:"role"`
 			Content []any  `json:"content"`
 		} `json:"item"`
-		SequenceNumber int `json:"sequence_number"`
+		SequenceNumber *int `json:"sequence_number,omitempty"`
 	}{
 		Type:           "response.output_item.added",
 		OutputIndex:    responseEventIndex(deltaPayload, "output_index"),
@@ -71,7 +71,7 @@ func syntheticOutputItemAdded(deltaPayload []byte, sequenceNumber int) []byte {
 	return payload
 }
 
-func syntheticContentPartAdded(deltaPayload []byte, sequenceNumber int) []byte {
+func syntheticContentPartAdded(deltaPayload []byte, sequenceNumber *int) []byte {
 	event := struct {
 		Type         string `json:"type"`
 		ItemID       string `json:"item_id"`
@@ -83,7 +83,7 @@ func syntheticContentPartAdded(deltaPayload []byte, sequenceNumber int) []byte {
 			Logprobs    []any  `json:"logprobs"`
 			Text        string `json:"text"`
 		} `json:"part"`
-		SequenceNumber int `json:"sequence_number"`
+		SequenceNumber *int `json:"sequence_number,omitempty"`
 	}{
 		Type:           "response.content_part.added",
 		ItemID:         gjson.GetBytes(deltaPayload, "item_id").String(),
