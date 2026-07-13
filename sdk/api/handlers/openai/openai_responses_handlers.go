@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -50,6 +51,7 @@ type responsesSSEFramer struct {
 	outputItems          map[int][]byte
 	outputOrder          []int
 	unindexedOutputItems [][]byte
+	activeOutputItemID   string
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -107,15 +109,32 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 	}
 
 	switch gjson.GetBytes(payload, "type").String() {
+	case "response.output_item.added":
+		f.activeOutputItemID = strings.TrimSpace(gjson.GetBytes(payload, "item.id").String())
 	case "response.output_item.done":
 		f.recordOutputItem(payload)
+		f.activeOutputItemID = ""
+	case "response.output_text.delta":
+		itemID := strings.TrimSpace(gjson.GetBytes(payload, "item_id").String())
+		if itemID != "" && itemID != f.activeOutputItemID {
+			f.activeOutputItemID = itemID
+			return append(responsesSSESyntheticMessageAdded(payload), frame...)
+		}
 	case "response.completed":
+		f.activeOutputItemID = ""
 		repaired := f.repairCompletedPayload(payload)
 		if !bytes.Equal(repaired, payload) {
 			return responsesSSEFrameWithData(frame, repaired)
 		}
 	}
 	return frame
+}
+
+func responsesSSESyntheticMessageAdded(deltaPayload []byte) []byte {
+	payload := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"","type":"message","status":"in_progress","role":"assistant","content":[]}}`)
+	payload, _ = sjson.SetBytes(payload, "output_index", gjson.GetBytes(deltaPayload, "output_index").Int())
+	payload, _ = sjson.SetBytes(payload, "item.id", gjson.GetBytes(deltaPayload, "item_id").String())
+	return responsesSSEFrameWithData(nil, payload)
 }
 
 func responsesSSEDataPayload(frame []byte) ([]byte, bool) {

@@ -156,6 +156,50 @@ func TestForwardResponsesStreamRepairsMultilineCompletedOutputAsSSEDataLines(t *
 	}
 }
 
+func TestForwardResponsesStreamRepairsOutputTextDeltaWithoutActiveItem(t *testing.T) {
+	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
+
+	data := make(chan []byte, 3)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs-1","summary":[]}}`)
+	data <- []byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs-1","summary":[]}}`)
+	data <- []byte(`data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"item_id":"msg-1","delta":"hello"}`)
+	close(data)
+	close(errs)
+
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+
+	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+	if len(parts) != 4 {
+		t.Fatalf("expected synthetic output_item.added before orphan text delta, got %d events. Body: %q", len(parts), recorder.Body.String())
+	}
+
+	payload, ok := responsesSSEDataPayload([]byte(parts[2]))
+	if !ok {
+		t.Fatalf("expected synthetic event to contain data payload: %q", parts[2])
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != "response.output_item.added" {
+		t.Fatalf("expected synthetic output_item.added, got %q in %s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "output_index").Int(); got != 1 {
+		t.Fatalf("expected output index 1, got %d in %s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "item.id").String(); got != "msg-1" {
+		t.Fatalf("expected synthetic message id msg-1, got %q in %s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "item.type").String(); got != "message" {
+		t.Fatalf("expected synthetic message item, got %q in %s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "item.role").String(); got != "assistant" {
+		t.Fatalf("expected synthetic assistant role, got %q in %s", got, payload)
+	}
+
+	deltaPayload, ok := responsesSSEDataPayload([]byte(parts[3]))
+	if !ok || gjson.GetBytes(deltaPayload, "type").String() != "response.output_text.delta" {
+		t.Fatalf("expected original text delta after synthetic item, got %q", parts[3])
+	}
+}
+
 func TestForwardResponsesStreamReassemblesSplitSSEEventChunks(t *testing.T) {
 	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
 
