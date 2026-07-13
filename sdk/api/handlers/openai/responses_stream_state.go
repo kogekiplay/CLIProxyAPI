@@ -72,18 +72,8 @@ func (s *ResponsesStreamState) ensureItem(itemID string) *OutputItemState {
 	return item
 }
 
-func (s *ResponsesStreamState) resetItem(itemID string) {
-	if s == nil || s.Items == nil {
-		return
-	}
-	delete(s.Items, itemID)
-}
-
 func (s *ResponsesStreamState) recordOutputItemAdded(payload []byte) {
 	itemID := gjson.GetBytes(payload, "item.id").String()
-	if item := s.Items[itemID]; item != nil && item.Done {
-		s.resetItem(itemID)
-	}
 	item := s.ensureItem(itemID)
 	if item == nil {
 		return
@@ -100,9 +90,6 @@ func (s *ResponsesStreamState) recordOutputItemAdded(payload []byte) {
 
 func (s *ResponsesStreamState) recordContentPartAdded(payload []byte) {
 	itemID := gjson.GetBytes(payload, "item_id").String()
-	if item := s.Items[itemID]; item != nil && item.Done {
-		s.resetItem(itemID)
-	}
 	item := s.ensureItem(itemID)
 	if item == nil {
 		return
@@ -137,7 +124,8 @@ func (s *ResponsesStreamState) recordOutputItemDone(payload []byte) {
 	}
 
 	itemID := itemResult.Get("id").String()
-	if item := s.ensureItem(itemID); item != nil {
+	item := s.Items[itemID]
+	if item != nil {
 		if itemType := strings.TrimSpace(itemResult.Get("type").String()); itemType != "" {
 			item.Type = itemType
 		}
@@ -153,14 +141,16 @@ func (s *ResponsesStreamState) recordOutputItemDone(payload []byte) {
 			s.outputOrder = append(s.outputOrder, index)
 		}
 		s.outputItems[index] = append([]byte(nil), itemResult.Raw...)
-		if item := s.ensureItem(itemID); item != nil {
+		if item != nil {
 			item.OutputIndex = index
 			item.HasOutputIndex = true
 		}
+		delete(s.Items, itemID)
 		return
 	}
 
 	s.unindexedOutputItems = append(s.unindexedOutputItems, append([]byte(nil), itemResult.Raw...))
+	delete(s.Items, itemID)
 }
 
 func (s *ResponsesStreamState) observeSequence(payload []byte) {
@@ -177,32 +167,24 @@ func (s *ResponsesStreamState) observeSequence(payload []byte) {
 	s.sequenceSeen = true
 }
 
-func (s *ResponsesStreamState) syntheticSequences(count int, upstreamPayload []byte) []*int {
+func (s *ResponsesStreamState) syntheticSequences(count int, upstreamPayload []byte) []int {
 	if s == nil || count <= 0 {
 		return nil
 	}
 
-	start := 0
+	lastSequence := -1
 	if s.sequenceSeen {
-		start = s.SequenceNumber + 1
+		lastSequence = s.SequenceNumber
 	}
 	if upstreamSequence, ok := responseSequenceNumber(upstreamPayload); ok {
-		start = upstreamSequence - count
-		minimum := 0
-		if s.sequenceSeen {
-			minimum = s.SequenceNumber + 1
-		}
-		if start < minimum {
-			// The synthetic events must precede this upstream event. Omit their
-			// sequence numbers when no ordered integer range is available.
-			return make([]*int, count)
+		if upstreamSequence > lastSequence {
+			lastSequence = upstreamSequence
 		}
 	}
 
-	sequences := make([]*int, count)
+	sequences := make([]int, count)
 	for i := range sequences {
-		sequenceNumber := start + i
-		sequences[i] = &sequenceNumber
+		sequences[i] = lastSequence + i + 1
 	}
 	return sequences
 }
@@ -224,6 +206,10 @@ func (s *ResponsesStreamState) close() {
 			item.Done = true
 		}
 	}
+	s.Items = nil
+	s.outputItems = nil
+	s.outputOrder = nil
+	s.unindexedOutputItems = nil
 	s.Completed = true
 }
 

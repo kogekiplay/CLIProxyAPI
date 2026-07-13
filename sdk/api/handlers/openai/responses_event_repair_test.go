@@ -50,8 +50,8 @@ func TestResponsesEventRepairerSynthesizesMissingTextLifecycle(t *testing.T) {
 	if outputIndex := gjson.GetBytes(got[0], "output_index").Int(); outputIndex != 2 {
 		t.Fatalf("expected synthetic output index 2, got %d", outputIndex)
 	}
-	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 11 {
-		t.Fatalf("expected first synthetic sequence 11, got %d", sequence)
+	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 14 {
+		t.Fatalf("expected first synthetic sequence 14, got %d", sequence)
 	}
 	if itemID := gjson.GetBytes(got[1], "item_id").String(); itemID != "msg-1" {
 		t.Fatalf("expected synthetic content owner msg-1, got %q", itemID)
@@ -59,8 +59,8 @@ func TestResponsesEventRepairerSynthesizesMissingTextLifecycle(t *testing.T) {
 	if contentIndex := gjson.GetBytes(got[1], "content_index").Int(); contentIndex != 1 {
 		t.Fatalf("expected synthetic content index 1, got %d", contentIndex)
 	}
-	if sequence := gjson.GetBytes(got[1], "sequence_number").Int(); sequence != 12 {
-		t.Fatalf("expected second synthetic sequence 12, got %d", sequence)
+	if sequence := gjson.GetBytes(got[1], "sequence_number").Int(); sequence != 15 {
+		t.Fatalf("expected second synthetic sequence 15, got %d", sequence)
 	}
 }
 
@@ -77,8 +77,8 @@ func TestResponsesEventRepairerSynthesizesOnlyMissingContentPart(t *testing.T) {
 		"response.content_part.added",
 		"response.output_text.delta",
 	)
-	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 2 {
-		t.Fatalf("expected synthetic content sequence 2, got %d", sequence)
+	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 4 {
+		t.Fatalf("expected synthetic content sequence 4, got %d", sequence)
 	}
 	if !bytes.Equal(got[1], delta) {
 		t.Fatalf("expected original delta to remain unchanged.\nGot:  %s\nWant: %s", got[1], delta)
@@ -131,6 +131,60 @@ func TestResponsesEventRepairerTracksInterleavedItemsIndependently(t *testing.T)
 	}
 }
 
+func TestResponsesEventRepairerRepairsFinalMessageAfterReasoning(t *testing.T) {
+	repairer := newResponsesEventRepairer()
+	reasoningEvents := [][]byte{
+		[]byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"rs-1","type":"reasoning","summary":[]},"sequence_number":0}`),
+		[]byte(`{"type":"response.reasoning_summary_text.delta","item_id":"rs-1","output_index":0,"summary_index":0,"delta":"thinking","sequence_number":1}`),
+		[]byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"rs-1","type":"reasoning","summary":[]},"sequence_number":2}`),
+	}
+	for _, event := range reasoningEvents {
+		got := repairer.repair(event)
+		if len(got) != 1 || !bytes.Equal(got[0], event) {
+			t.Fatalf("expected reasoning event to pass through unchanged, got %q for %s", got, event)
+		}
+	}
+	if _, exists := repairer.state.Items["rs-1"]; exists {
+		t.Fatalf("expected completed reasoning item to leave active state: %#v", repairer.state.Items["rs-1"])
+	}
+
+	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":1,"content_index":0,"delta":"final answer","sequence_number":3}`)
+	got := repairer.repair(delta)
+	assertResponsesEventTypes(t, got,
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+	)
+	if owner := gjson.GetBytes(got[0], "item.id").String(); owner != "msg-1" {
+		t.Fatalf("expected final message owner msg-1, got %q", owner)
+	}
+	if !bytes.Equal(got[2], delta) {
+		t.Fatalf("expected final message delta to remain unchanged, got %s", got[2])
+	}
+	if item := repairer.state.Items["msg-1"]; item == nil || item.Type != "message" {
+		t.Fatalf("expected independent final message state, got %#v", item)
+	}
+}
+
+func TestResponsesEventRepairerLeavesFunctionCallFlowUntouched(t *testing.T) {
+	repairer := newResponsesEventRepairer()
+	toolAdded := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"tool-1","type":"function_call","name":"shell","arguments":""},"sequence_number":1}`)
+	toolDelta := []byte(`{"type":"response.function_call_arguments.delta","item_id":"tool-1","output_index":0,"delta":"{\"cmd\":\"pwd\"}","sequence_number":2}`)
+
+	for _, event := range [][]byte{toolAdded, toolDelta} {
+		got := repairer.repair(event)
+		if len(got) != 1 || !bytes.Equal(got[0], event) {
+			t.Fatalf("expected function-call event to pass through unchanged, got %q for %s", got, event)
+		}
+	}
+	if item := repairer.state.Items["tool-1"]; item == nil || item.Type != "function_call" || !item.Added {
+		t.Fatalf("expected function-call state to remain unpolluted, got %#v", item)
+	}
+	if _, exists := repairer.state.Items["msg-1"]; exists {
+		t.Fatalf("function-call flow unexpectedly created a message state: %#v", repairer.state.Items["msg-1"])
+	}
+}
+
 func TestResponsesEventRepairerDoesNotRepeatSyntheticLifecycle(t *testing.T) {
 	repairer := newResponsesEventRepairer()
 	firstDelta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello"}`)
@@ -163,6 +217,9 @@ func TestResponsesEventRepairerResetsDoneItemBeforeSameIDDelta(t *testing.T) {
 	if previous == nil || !previous.Done {
 		t.Fatalf("expected original item state to be done, got %#v", previous)
 	}
+	if _, exists := repairer.state.Items["msg-1"]; exists {
+		t.Fatalf("expected done item to be removed from active state: %#v", repairer.state.Items["msg-1"])
+	}
 
 	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":1,"content_index":0,"delta":"new lifecycle","sequence_number":5}`)
 	got := repairer.repair(delta)
@@ -180,6 +237,32 @@ func TestResponsesEventRepairerResetsDoneItemBeforeSameIDDelta(t *testing.T) {
 	}
 	if !bytes.Equal(got[2], delta) {
 		t.Fatalf("expected original delta to remain unchanged, got %s", got[2])
+	}
+}
+
+func TestResponsesEventRepairerRemovesItemStateOnDone(t *testing.T) {
+	repairer := newResponsesEventRepairer()
+	events := [][]byte{
+		[]byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg-1","type":"message","content":[]},"sequence_number":1}`),
+		[]byte(`{"type":"response.content_part.added","item_id":"msg-1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""},"sequence_number":2}`),
+		[]byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello","sequence_number":3}`),
+	}
+	for _, event := range events {
+		got := repairer.repair(event)
+		if len(got) != 1 || !bytes.Equal(got[0], event) {
+			t.Fatalf("expected normal item event to pass through unchanged, got %q for %s", got, event)
+		}
+	}
+	item := repairer.state.Items["msg-1"]
+	done := []byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-1","type":"message","status":"completed","content":[]},"sequence_number":4}`)
+	if got := repairer.repair(done); len(got) != 1 || !bytes.Equal(got[0], done) {
+		t.Fatalf("expected done event to pass through unchanged, got %q", got)
+	}
+	if item == nil || !item.Done {
+		t.Fatalf("expected prior item state to be marked done, got %#v", item)
+	}
+	if _, exists := repairer.state.Items["msg-1"]; exists {
+		t.Fatalf("expected done item to be removed from active state: %#v", repairer.state.Items["msg-1"])
 	}
 }
 
@@ -202,10 +285,9 @@ func TestResponsesEventRepairerSyntheticSequenceFollowsObservedUpstream(t *testi
 	}
 }
 
-func TestResponsesEventRepairerOmitsSyntheticSequenceWhenNoGapExists(t *testing.T) {
+func TestResponsesEventRepairerSyntheticSequenceExceedsCurrentUpstream(t *testing.T) {
 	repairer := newResponsesEventRepairer()
-	repairer.repair([]byte(`{"type":"response.created","response":{"id":"resp-1"},"sequence_number":100}`))
-	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello","sequence_number":101}`)
+	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"hello","sequence_number":100}`)
 
 	got := repairer.repair(delta)
 	assertResponsesEventTypes(t, got,
@@ -213,8 +295,11 @@ func TestResponsesEventRepairerOmitsSyntheticSequenceWhenNoGapExists(t *testing.
 		"response.content_part.added",
 		"response.output_text.delta",
 	)
-	if gjson.GetBytes(got[0], "sequence_number").Exists() || gjson.GetBytes(got[1], "sequence_number").Exists() {
-		t.Fatalf("expected synthetic sequence numbers to be omitted when no ordered gap exists: %q", got[:2])
+	if sequence := gjson.GetBytes(got[0], "sequence_number").Int(); sequence != 101 {
+		t.Fatalf("expected synthetic item sequence 101, got %d", sequence)
+	}
+	if sequence := gjson.GetBytes(got[1], "sequence_number").Int(); sequence != 102 {
+		t.Fatalf("expected synthetic content sequence 102, got %d", sequence)
 	}
 	if !bytes.Equal(got[2], delta) {
 		t.Fatalf("expected upstream sequence to remain unchanged, got %s", got[2])
@@ -246,13 +331,23 @@ func TestResponsesEventRepairerClosesStateOnCompleted(t *testing.T) {
 	repairer := newResponsesEventRepairer()
 	repairer.repair([]byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg-1","type":"message","content":[]}}`))
 	repairer.repair([]byte(`{"type":"response.content_part.added","item_id":"msg-1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`))
+	repairer.repair([]byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg-1","type":"message","status":"completed","content":[]}}`))
 	repairer.repair([]byte(`{"type":"response.completed","response":{"id":"resp-1","output":[]}}`))
 
 	if !repairer.state.Completed {
 		t.Fatal("expected completed event to close stream state")
 	}
-	if item := repairer.state.Items["msg-1"]; item == nil || !item.Done {
-		t.Fatalf("expected completed event to close msg-1, got %#v", item)
+	if len(repairer.state.Items) != 0 || repairer.state.outputItems != nil || repairer.state.outputOrder != nil || repairer.state.unindexedOutputItems != nil {
+		t.Fatalf("expected completed event to release stream state: %#v", repairer.state)
+	}
+
+	afterCompleted := []byte(`{"type":"response.output_text.delta","item_id":"msg-2","output_index":1,"content_index":0,"delta":"ignored"}`)
+	got := repairer.repair(afterCompleted)
+	if len(got) != 1 || !bytes.Equal(got[0], afterCompleted) {
+		t.Fatalf("expected post-completed event to pass through without reopening state, got %q", got)
+	}
+	if len(repairer.state.Items) != 0 {
+		t.Fatalf("expected completed stream to remain closed, got %#v", repairer.state.Items)
 	}
 }
 

@@ -21,6 +21,9 @@ func (r *responsesEventRepairer) repair(payload []byte) [][]byte {
 	if r.state == nil {
 		r.state = newResponsesStreamState()
 	}
+	if r.state.Completed {
+		return [][]byte{payload}
+	}
 
 	events := [][]byte{payload}
 	switch responseEventType(payload) {
