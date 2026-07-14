@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -77,6 +78,51 @@ func (e *failOnceStreamExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+type firstByteTimeoutStreamExecutor struct {
+	failOnceStreamExecutor
+	timeoutAttempts int
+	tailDelay       time.Duration
+}
+
+func (e *firstByteTimeoutStreamExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	call := e.calls
+	e.mu.Unlock()
+
+	if call <= e.timeoutAttempts {
+		ch := make(chan coreexecutor.StreamChunk)
+		go func() {
+			<-ctx.Done()
+			close(ch)
+		}()
+		return &coreexecutor.StreamResult{Chunks: ch}, nil
+	}
+
+	ch := make(chan coreexecutor.StreamChunk, 2)
+	ch <- coreexecutor.StreamChunk{Payload: []byte("first")}
+	if e.tailDelay <= 0 {
+		close(ch)
+		return &coreexecutor.StreamResult{
+			Headers: http.Header{"X-Upstream-Attempt": {"success"}},
+			Chunks:  ch,
+		}, nil
+	}
+
+	go func() {
+		timer := time.NewTimer(e.tailDelay)
+		defer timer.Stop()
+		defer close(ch)
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			ch <- coreexecutor.StreamChunk{Payload: []byte("second")}
+		}
+	}()
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
 }
 
 type payloadThenErrorStreamExecutor struct {
@@ -333,6 +379,115 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	upstreamAttemptHeader := upstreamHeaders.Get("X-Upstream-Attempt")
 	if upstreamAttemptHeader != "2" {
 		t.Fatalf("expected upstream header from retry attempt, got %q", upstreamAttemptHeader)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_RetriesAfterFirstByteTimeout(t *testing.T) {
+	executor := &firstByteTimeoutStreamExecutor{timeoutAttempts: 2}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "auth-timeout",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "timeout@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(auth): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		PassthroughHeaders: true,
+		Streaming: sdkconfig.StreamingConfig{
+			BootstrapRetries:        2,
+			FirstByteTimeoutSeconds: 1,
+		},
+	}, manager)
+	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+
+	if string(got) != "first" {
+		t.Fatalf("expected payload first, got %q", string(got))
+	}
+	if executor.Calls() != 3 {
+		t.Fatalf("expected 3 stream attempts, got %d", executor.Calls())
+	}
+	if upstreamHeaders.Get("X-Upstream-Attempt") != "success" {
+		t.Fatalf("expected headers from successful retry, got %#v", upstreamHeaders)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_FirstByteTimeoutStopsAfterPayload(t *testing.T) {
+	executor := &firstByteTimeoutStreamExecutor{tailDelay: 1100 * time.Millisecond}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "auth-tail",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "tail@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(auth): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{
+			BootstrapRetries:        2,
+			FirstByteTimeoutSeconds: 1,
+		},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+
+	if string(got) != "firstsecond" {
+		t.Fatalf("expected timeout to stop after first payload, got %q", string(got))
+	}
+	if executor.Calls() != 1 {
+		t.Fatalf("expected 1 stream attempt, got %d", executor.Calls())
+	}
+}
+
+func TestStreamFirstByteTimeoutError(t *testing.T) {
+	err := &streamFirstByteTimeoutError{timeout: 30 * time.Second}
+	if !errors.Is(err, errStreamFirstByteTimeout) {
+		t.Fatalf("expected timeout sentinel")
+	}
+	if err.StatusCode() != http.StatusGatewayTimeout {
+		t.Fatalf("expected status %d, got %d", http.StatusGatewayTimeout, err.StatusCode())
 	}
 }
 

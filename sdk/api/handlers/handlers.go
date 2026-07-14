@@ -54,12 +54,27 @@ type ErrorDetail struct {
 const idempotencyKeyMetadataKey = "idempotency_key"
 
 const (
-	defaultStreamingKeepAliveSeconds = 0
-	defaultStreamingBootstrapRetries = 0
+	defaultStreamingKeepAliveSeconds        = 0
+	defaultStreamingBootstrapRetries        = 0
+	defaultStreamingFirstByteTimeoutSeconds = 0
 	// Stream interceptor history is intentionally bounded and not configurable in the first SDK surface.
 	maxStreamInterceptorHistoryChunks = 64
 	maxStreamInterceptorHistoryBytes  = 1 << 20
 )
+
+var errStreamFirstByteTimeout = errors.New("upstream stream first-byte timeout")
+
+type streamFirstByteTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e *streamFirstByteTimeoutError) Error() string {
+	return fmt.Sprintf("upstream stream did not produce a first response within %s", e.timeout)
+}
+
+func (e *streamFirstByteTimeoutError) Unwrap() error { return errStreamFirstByteTimeout }
+
+func (e *streamFirstByteTimeoutError) StatusCode() int { return http.StatusGatewayTimeout }
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
@@ -247,6 +262,19 @@ func StreamingBootstrapRetries(cfg *config.SDKConfig) int {
 		retries = 0
 	}
 	return retries
+}
+
+// StreamingFirstByteTimeout returns how long a streaming attempt may wait for its first upstream payload.
+// Returning 0 disables the timeout (default when unset).
+func StreamingFirstByteTimeout(cfg *config.SDKConfig) time.Duration {
+	seconds := defaultStreamingFirstByteTimeoutSeconds
+	if cfg != nil {
+		seconds = cfg.Streaming.FirstByteTimeoutSeconds
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // PassthroughHeadersEnabled returns whether upstream response headers should be forwarded to clients.
@@ -1161,7 +1189,57 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 	opts.Metadata = reqMeta
 	req, opts = h.applyRequestInterceptorsBeforeAuth(ctx, entryProtocol, originalRequestedModel, req, opts, execOptions.SkipInterceptorPluginID)
-	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+	bootstrapRetries := 0
+	firstByteTimeout := StreamingFirstByteTimeout(h.Cfg)
+	noCancel := context.CancelFunc(func() {})
+	executeStreamAttempt := func() (*coreexecutor.StreamResult, context.CancelFunc, error) {
+		if firstByteTimeout <= 0 {
+			result, errAttempt := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+			return result, noCancel, errAttempt
+		}
+
+		parentCtx := ctx
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		attemptCtx, attemptCancel := context.WithCancel(parentCtx)
+		timedOut := make(chan struct{})
+		timer := time.AfterFunc(firstByteTimeout, func() {
+			close(timedOut)
+			attemptCancel()
+		})
+		result, errAttempt := h.AuthManager.ExecuteStream(attemptCtx, providers, req, opts)
+		if !timer.Stop() {
+			<-timedOut
+			if parentCtx.Err() == nil {
+				attemptCancel()
+				return nil, noCancel, &streamFirstByteTimeoutError{timeout: firstByteTimeout}
+			}
+		}
+		if errAttempt != nil {
+			attemptCancel()
+			return nil, noCancel, errAttempt
+		}
+		return result, attemptCancel, nil
+	}
+
+	var (
+		streamResult  *coreexecutor.StreamResult
+		attemptCancel context.CancelFunc
+		err           error
+	)
+	for {
+		streamResult, attemptCancel, err = executeStreamAttempt()
+		if err == nil {
+			break
+		}
+		if errors.Is(err, errStreamFirstByteTimeout) && bootstrapRetries < maxBootstrapRetries {
+			bootstrapRetries++
+			continue
+		}
+		break
+	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -1267,14 +1345,17 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+		defer func() {
+			if attemptCancel != nil {
+				attemptCancel()
+			}
+		}()
 		if streamCanceledBeforeRead {
 			return
 		}
 		sentPayload := false
-		bootstrapRetries := 0
 		chunkIndex := 0
 		var historyChunks [][]byte
-		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			if ctx == nil {
@@ -1332,10 +1413,14 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
 					if !sentPayload {
-						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
+						for bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
 							bootstrapRetries++
-							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+							if attemptCancel != nil {
+								attemptCancel()
+							}
+							retryResult, retryCancel, retryErr := executeStreamAttempt()
 							if retryErr == nil {
+								attemptCancel = retryCancel
 								rawStreamHeaders = cloneHeader(retryResult.Headers)
 								baseStreamHeaders = cloneHeader(retryResult.Headers)
 								replaceHeader(upstreamHeaders, downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled))
@@ -1347,6 +1432,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 								continue outer
 							}
 							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
+							if !errors.Is(streamErr, errStreamFirstByteTimeout) {
+								break
+							}
 						}
 					}
 
