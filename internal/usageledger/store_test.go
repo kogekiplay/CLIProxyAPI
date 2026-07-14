@@ -3,7 +3,9 @@ package usageledger
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,6 +17,115 @@ func openTestStore(t *testing.T) *SQLiteStore {
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	return store
+}
+
+func TestOpenSQLiteConfiguresConcurrentWALConnections(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	if got := store.db.Stats().MaxOpenConnections; got != sqliteFileMaxOpenConns {
+		t.Fatalf("max open connections = %d, want %d", got, sqliteFileMaxOpenConns)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connections := make([]*sql.Conn, 0, sqliteFileMaxOpenConns)
+	defer func() {
+		for _, connection := range connections {
+			_ = connection.Close()
+		}
+	}()
+
+	for i := 0; i < sqliteFileMaxOpenConns; i++ {
+		connection, err := store.db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("open pooled connection %d: %v", i, err)
+		}
+		connections = append(connections, connection)
+
+		var busyTimeout int
+		if err := connection.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+			t.Fatalf("read busy timeout from connection %d: %v", i, err)
+		}
+		if busyTimeout != sqliteBusyTimeoutMS {
+			t.Fatalf("connection %d busy timeout = %d, want %d", i, busyTimeout, sqliteBusyTimeoutMS)
+		}
+
+		var journalMode string
+		if err := connection.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+			t.Fatalf("read journal mode from connection %d: %v", i, err)
+		}
+		if journalMode != "wal" {
+			t.Fatalf("connection %d journal mode = %q, want wal", i, journalMode)
+		}
+	}
+}
+
+func TestSQLiteStoreHandlesConcurrentAnalyticsAndWrites(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 7, 14, 8, 0, 0, 0, time.UTC)
+	for i := 0; i < 20; i++ {
+		if _, err := store.InsertEvent(context.Background(), Event{
+			RequestID: fmt.Sprintf("seed-%d", i),
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+			Provider:  "codex",
+			Model:     "gpt-5.6",
+		}); err != nil {
+			t.Fatalf("seed event %d: %v", i, err)
+		}
+	}
+
+	request := AnalyticsRequest{
+		FromMS: base.Add(-time.Minute).UnixMilli(),
+		ToMS:   base.Add(time.Hour).UnixMilli(),
+		Include: AnalyticsInclude{
+			EventsPage: &AnalyticsEventsPage{Limit: 20},
+		},
+	}
+
+	const workers = 12
+	errors := make(chan error, workers)
+	var wait sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wait.Add(1)
+		go func(worker int) {
+			defer wait.Done()
+			if worker%3 == 0 {
+				_, err := store.InsertEvent(context.Background(), Event{
+					RequestID: fmt.Sprintf("concurrent-%d", worker),
+					Timestamp: base.Add(time.Duration(100+worker) * time.Second),
+					Provider:  "codex",
+					Model:     "gpt-5.6",
+				})
+				if err != nil {
+					errors <- fmt.Errorf("writer %d: %w", worker, err)
+				}
+				return
+			}
+			if _, err := store.Analytics(context.Background(), request); err != nil {
+				errors <- fmt.Errorf("reader %d: %w", worker, err)
+			}
+		}(i)
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
+}
+
+func TestOpenSQLiteKeepsPrivateInMemoryDatabaseOnOneConnection(t *testing.T) {
+	store, err := OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("open in-memory sqlite store: %v", err)
+	}
+	defer store.Close()
+
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("in-memory max open connections = %d, want 1", got)
+	}
 }
 
 func findModelPrice(prices []ModelPrice, model string) (ModelPrice, bool) {

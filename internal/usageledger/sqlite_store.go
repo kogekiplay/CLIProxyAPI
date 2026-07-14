@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -17,17 +18,24 @@ type SQLiteStore struct {
 	db *sql.DB
 }
 
+const (
+	sqliteBusyTimeoutMS    = 5000
+	sqliteFileMaxOpenConns = 4
+)
+
 // OpenSQLite opens a usage ledger database and applies the embedded schema.
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, errors.New("usage ledger sqlite path is required")
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqliteDataSourceName(path))
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	maxOpenConns := sqliteMaxOpenConns(path)
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxOpenConns)
 
 	store := &SQLiteStore{db: db}
 	if err := store.init(context.Background()); err != nil {
@@ -35,6 +43,23 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+func sqliteDataSourceName(path string) string {
+	params := url.Values{}
+	params.Add("_pragma", fmt.Sprintf("busy_timeout=%d", sqliteBusyTimeoutMS))
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + params.Encode()
+}
+
+func sqliteMaxOpenConns(path string) int {
+	if strings.Contains(strings.ToLower(path), ":memory:") {
+		return 1
+	}
+	return sqliteFileMaxOpenConns
 }
 
 // Close closes the database handle.
@@ -51,7 +76,6 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 	}
 	statements := []string{
 		`PRAGMA journal_mode=WAL`,
-		`PRAGMA busy_timeout=5000`,
 		`CREATE TABLE IF NOT EXISTS usage_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			request_id TEXT NOT NULL DEFAULT '',
