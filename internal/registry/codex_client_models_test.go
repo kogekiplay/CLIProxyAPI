@@ -182,6 +182,53 @@ func TestRefreshCodexClientModelsKeepsLastValidSnapshot(t *testing.T) {
 	}
 }
 
+func TestOfficialCodexClientModelsTakePriorityOverStaticRemote(t *testing.T) {
+	codexClientCatalogStore.mu.Lock()
+	previousData := append([]byte(nil), codexClientCatalogStore.data...)
+	previousRevision := codexClientCatalogStore.revision
+	previousPriority := codexClientCatalogStore.sourcePriority
+	codexClientCatalogStore.mu.Unlock()
+	t.Cleanup(func() {
+		codexClientCatalogStore.mu.Lock()
+		codexClientCatalogStore.data = previousData
+		codexClientCatalogStore.revision = previousRevision
+		codexClientCatalogStore.sourcePriority = previousPriority
+		codexClientCatalogStore.mu.Unlock()
+	})
+
+	staticModel := testCodexClientModel("gpt-5.5", 1)
+	staticModel["context_window"] = 372000
+	staticModel["max_context_window"] = 372000
+	staticCatalog := testCodexClientCatalog(t, staticModel)
+	if _, err := loadCodexClientModelsFromBytes(staticCatalog, "test static catalog"); err != nil {
+		t.Fatalf("load static catalog: %v", err)
+	}
+
+	officialModel := testCodexClientModel("gpt-5.5", 1)
+	officialModel["context_window"] = 272000
+	officialModel["max_context_window"] = 272000
+	officialCatalog := testCodexClientCatalog(t, officialModel)
+	changed, err := UpdateCodexClientModelsFromOfficial(officialCatalog, "test official catalog")
+	if err != nil {
+		t.Fatalf("load official catalog: %v", err)
+	}
+	if !changed {
+		t.Fatal("load official catalog changed = false, want true")
+	}
+
+	changed, err = loadCodexClientModelsFromBytes(staticCatalog, "later static catalog")
+	if err != nil {
+		t.Fatalf("load later static catalog: %v", err)
+	}
+	if changed {
+		t.Fatal("lower-priority static catalog replaced official catalog")
+	}
+	got, _ := GetCodexClientModelsSnapshot()
+	if string(got) != string(officialCatalog) {
+		t.Fatal("current catalog does not retain official data")
+	}
+}
+
 func testCodexClientModel(slug string, priority int) map[string]any {
 	return map[string]any{
 		"slug":                       slug,

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -27,6 +28,10 @@ import (
 // It holds a pool of clients to interact with the backend service.
 type OpenAIAPIHandler struct {
 	*handlers.BaseAPIHandler
+
+	codexModelsRefreshMu      sync.Mutex
+	codexModelsRefreshAfter   time.Time
+	codexModelsRefreshVersion string
 }
 
 // NewOpenAIAPIHandler creates a new OpenAI API handlers instance.
@@ -60,6 +65,7 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 // and specifications in OpenAI-compatible format.
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
+		h.RefreshCodexClientModels(c.Request.Context(), c.Query("client_version"), c.Request.Header)
 		c.JSON(http.StatusOK, h.codexClientModelsResponse())
 		return
 	}

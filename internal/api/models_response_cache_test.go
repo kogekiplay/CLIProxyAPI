@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -74,6 +75,49 @@ func TestModelsResponseCacheIsBounded(t *testing.T) {
 	}
 	if _, ok := cache.Get("four", 1, now); !ok {
 		t.Fatal("newest cache entry was evicted")
+	}
+}
+
+func TestCodexModelsResponseCacheKeyIncludesCatalogRevision(t *testing.T) {
+	original, _ := registry.GetCodexClientModelsSnapshot()
+	t.Cleanup(func() {
+		if _, err := registry.UpdateCodexClientModelsFromOfficial(original, "test cleanup"); err != nil {
+			t.Fatalf("restore Codex client model catalog: %v", err)
+		}
+	})
+
+	codexKeyBefore := scopedModelsResponseCacheKey("openai", "client-1", scopedModelsResponseCodexClient)
+	openAIKeyBefore := scopedModelsResponseCacheKey("openai", "client-1", scopedModelsResponseOpenAI)
+
+	var payload struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(original, &payload); err != nil {
+		t.Fatalf("decode original Codex client model catalog: %v", err)
+	}
+	if len(payload.Models) == 0 {
+		t.Fatal("original Codex client model catalog has no models")
+	}
+	payload.Models[0]["description"] = fmt.Sprint(payload.Models[0]["description"], " (cache revision test)")
+	updated, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode updated Codex client model catalog: %v", err)
+	}
+	changed, err := registry.UpdateCodexClientModelsFromOfficial(updated, "cache revision test")
+	if err != nil {
+		t.Fatalf("update Codex client model catalog: %v", err)
+	}
+	if !changed {
+		t.Fatal("update Codex client model catalog changed = false, want true")
+	}
+
+	codexKeyAfter := scopedModelsResponseCacheKey("openai", "client-1", scopedModelsResponseCodexClient)
+	if codexKeyAfter == codexKeyBefore {
+		t.Fatal("Codex client cache key did not change with catalog revision")
+	}
+	openAIKeyAfter := scopedModelsResponseCacheKey("openai", "client-1", scopedModelsResponseOpenAI)
+	if openAIKeyAfter != openAIKeyBefore {
+		t.Fatal("ordinary OpenAI cache key changed with Codex catalog revision")
 	}
 }
 

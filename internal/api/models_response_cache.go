@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,7 +57,12 @@ func scopedModelsResponseCacheKey(handlerType, clientCacheKey string, kind scope
 	if clientCacheKey == "" {
 		clientCacheKey = "<empty>"
 	}
-	return string(kind) + "\x00" + handlerType + "\x00" + clientCacheKey
+	key := string(kind) + "\x00" + handlerType + "\x00" + clientCacheKey
+	if kind == scopedModelsResponseCodexClient {
+		_, catalogRevision := registry.GetCodexClientModelsSnapshot()
+		key += "\x00catalog=" + strconv.FormatUint(catalogRevision, 10)
+	}
+	return key
 }
 
 func (c *modelsResponseCache) Get(key string, registryVersion uint64, now time.Time) ([]byte, bool) {

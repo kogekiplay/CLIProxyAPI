@@ -1,9 +1,17 @@
 package openai
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestCodexClientModelsResponse_InputModalitiesFromRegistry(t *testing.T) {
@@ -291,5 +299,99 @@ func TestLoadCodexClientModelTemplatesRefreshesOnRevision(t *testing.T) {
 	}
 	if got := stringModelValue(templates["gpt-5.5"], "display_name"); got != "Second" {
 		t.Fatalf("cached display_name = %q, want Second", got)
+	}
+}
+
+func TestRefreshCodexClientModelsUsesOfficialOAuthCatalogAndCaches(t *testing.T) {
+	original, _ := registry.GetCodexClientModelsSnapshot()
+	t.Cleanup(func() {
+		if _, err := registry.UpdateCodexClientModelsFromOfficial(original, "test cleanup"); err != nil {
+			t.Fatalf("restore Codex client model catalog: %v", err)
+		}
+	})
+
+	var payload struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(original, &payload); err != nil {
+		t.Fatalf("decode original Codex client model catalog: %v", err)
+	}
+	for _, model := range payload.Models {
+		switch stringModelValue(model, "slug") {
+		case "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
+			model["context_window"] = 272000
+			model["max_context_window"] = 272000
+		}
+	}
+	officialCatalog, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode official Codex client model catalog: %v", err)
+	}
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if got := r.URL.Query().Get("client_version"); got != "0.999.0" {
+			t.Errorf("client_version = %q, want 0.999.0", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-access-token" {
+			t.Errorf("Authorization = %q, want OAuth bearer token", got)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != "test-account" {
+			t.Errorf("ChatGPT-Account-ID = %q, want test-account", got)
+		}
+		if got := r.Header.Get("User-Agent"); got != "codex-test/1.0" {
+			t.Errorf("User-Agent = %q, want codex-test/1.0", got)
+		}
+		if got := r.Header.Get("Originator"); got != "codex-desktop" {
+			t.Errorf("Originator = %q, want codex-desktop", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(officialCatalog)
+	}))
+	defer server.Close()
+	previousURL := codexOfficialModelsURL
+	codexOfficialModelsURL = server.URL
+	t.Cleanup(func() { codexOfficialModelsURL = previousURL })
+
+	authManager := coreauth.NewManager(nil, nil, nil)
+	if _, err = authManager.Register(context.Background(), &coreauth.Auth{
+		ID:       "test-codex-oauth",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"access_token": "test-access-token",
+			"account_id":   "test-account",
+		},
+	}); err != nil {
+		t.Fatalf("register Codex OAuth credential: %v", err)
+	}
+	handler := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(&config.SDKConfig{}, authManager))
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer client-cpa-key")
+	headers.Set("User-Agent", "codex-test/1.0")
+	headers.Set("Originator", "codex-desktop")
+
+	handler.RefreshCodexClientModels(context.Background(), "0.999.0", headers)
+	handler.RefreshCodexClientModels(context.Background(), "0.999.0", headers)
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("official models requests = %d, want 1 within refresh interval", got)
+	}
+
+	response := CodexClientModelsResponse([]map[string]any{
+		{"id": "gpt-5.6-sol"},
+		{"id": "gpt-5.6-terra"},
+		{"id": "gpt-5.6-luna"},
+	})
+	models, ok := response["models"].([]map[string]any)
+	if !ok || len(models) != 3 {
+		t.Fatalf("models = %#v, want three models", response["models"])
+	}
+	for _, model := range models {
+		if got := intModelValue(model, "context_window"); got != 272000 {
+			t.Errorf("%s context_window = %d, want 272000", stringModelValue(model, "slug"), got)
+		}
+		if got := intModelValue(model, "max_context_window"); got != 272000 {
+			t.Errorf("%s max_context_window = %d, want 272000", stringModelValue(model, "slug"), got)
+		}
 	}
 }

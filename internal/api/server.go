@@ -1274,6 +1274,7 @@ func isAnthropicModelsRequest(c *gin.Context) bool {
 func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if _, ok := c.Request.URL.Query()["client_version"]; ok {
+			openaiHandler.RefreshCodexClientModels(c.Request.Context(), c.Query("client_version"), c.Request.Header)
 			if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
 				s.handleHomeCodexClientModels(c)
 				return

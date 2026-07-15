@@ -19,16 +19,25 @@ type codexClientModelsPayload struct {
 	Models []map[string]any `json:"models"`
 }
 
+type codexClientModelsSourcePriority uint8
+
+const (
+	codexClientModelsSourceEmbedded codexClientModelsSourcePriority = iota
+	codexClientModelsSourceRemote
+	codexClientModelsSourceOfficial
+)
+
 type codexClientModelsStore struct {
-	mu       sync.RWMutex
-	data     []byte
-	revision uint64
+	mu             sync.RWMutex
+	data           []byte
+	revision       uint64
+	sourcePriority codexClientModelsSourcePriority
 }
 
 var codexClientCatalogStore = &codexClientModelsStore{}
 
 func init() {
-	if _, err := loadCodexClientModelsFromBytes(embeddedCodexClientModelsJSON, "embed"); err != nil {
+	if _, err := loadCodexClientModelsWithPriority(embeddedCodexClientModelsJSON, "embed", codexClientModelsSourceEmbedded); err != nil {
 		log.Warnf("registry: failed to parse embedded codex_client_models.json (Codex client catalog will remain unavailable until a valid remote refresh): %v", err)
 	}
 }
@@ -48,6 +57,18 @@ func GetCodexClientModelsSnapshot() ([]byte, uint64) {
 }
 
 func loadCodexClientModelsFromBytes(data []byte, source string) (bool, error) {
+	return loadCodexClientModelsWithPriority(data, source, codexClientModelsSourceRemote)
+}
+
+// UpdateCodexClientModelsFromOfficial replaces the runtime Codex client model
+// catalog with a validated response from the official Codex models endpoint.
+// Official data takes precedence over the embedded and static remote catalogs
+// for the lifetime of the process.
+func UpdateCodexClientModelsFromOfficial(data []byte, source string) (bool, error) {
+	return loadCodexClientModelsWithPriority(data, source, codexClientModelsSourceOfficial)
+}
+
+func loadCodexClientModelsWithPriority(data []byte, source string, priority codexClientModelsSourcePriority) (bool, error) {
 	if err := ValidateCodexClientModelsJSON(data); err != nil {
 		return false, fmt.Errorf("%s: %w", source, err)
 	}
@@ -55,11 +76,19 @@ func loadCodexClientModelsFromBytes(data []byte, source string) (bool, error) {
 	cloned := append([]byte(nil), data...)
 	codexClientCatalogStore.mu.Lock()
 	defer codexClientCatalogStore.mu.Unlock()
+	if priority < codexClientCatalogStore.sourcePriority {
+		log.Debugf("registry: ignored lower-priority Codex client model catalog from %s", source)
+		return false, nil
+	}
 	if bytes.Equal(codexClientCatalogStore.data, cloned) {
+		if priority > codexClientCatalogStore.sourcePriority {
+			codexClientCatalogStore.sourcePriority = priority
+		}
 		return false, nil
 	}
 	codexClientCatalogStore.data = cloned
 	codexClientCatalogStore.revision++
+	codexClientCatalogStore.sourcePriority = priority
 	return true, nil
 }
 
