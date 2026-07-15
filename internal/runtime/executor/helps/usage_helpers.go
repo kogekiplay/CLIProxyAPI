@@ -613,9 +613,10 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		outputNode = usageNode.Get("output_tokens")
 	}
 	detail := usage.Detail{
-		InputTokens:  inputNode.Int(),
-		OutputTokens: outputNode.Int(),
-		TotalTokens:  usageNode.Get("total_tokens").Int(),
+		InputTokens:    inputNode.Int(),
+		OutputTokens:   outputNode.Int(),
+		CacheInputMode: usage.CacheInputModeIncluded,
+		TotalTokens:    usageNode.Get("total_tokens").Int(),
 	}
 	cached := usageNode.Get("prompt_tokens_details.cached_tokens")
 	if !cached.Exists() {
@@ -692,6 +693,7 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 		CachedTokens:        cacheReadTokens,
 		CacheReadTokens:     cacheReadTokens,
 		CacheCreationTokens: cacheCreationTokens,
+		CacheInputMode:      usage.CacheInputModeSeparate,
 	}
 	if detail.CachedTokens == 0 {
 		detail.CachedTokens = detail.CacheCreationTokens
@@ -709,6 +711,7 @@ func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
 		TotalTokens:     node.Get("totalTokenCount").Int(),
 		CachedTokens:    cachedTokens,
 		CacheReadTokens: cachedTokens,
+		CacheInputMode:  usage.CacheInputModeIncluded,
 	}
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
@@ -726,6 +729,7 @@ func parseInteractionsUsageDetail(node gjson.Result) usage.Detail {
 		CachedTokens:        firstExistingUsageNode(node, "cached_tokens", "cachedContentTokenCount", "total_cached_tokens").Int(),
 		CacheReadTokens:     cacheRead.Int(),
 		CacheCreationTokens: firstExistingUsageNode(node, "cache_creation_tokens", "cacheCreationTokens", "cache_write_tokens", "cacheWriteTokens").Int(),
+		CacheInputMode:      usage.CacheInputModeIncluded,
 	}
 	if !cacheRead.Exists() && detail.CachedTokens > 0 {
 		detail.CacheReadTokens = detail.CachedTokens

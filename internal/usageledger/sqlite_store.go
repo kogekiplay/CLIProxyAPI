@@ -90,7 +90,9 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 			credential_key_hash TEXT NOT NULL DEFAULT '',
 			account_ref TEXT NOT NULL DEFAULT '',
 			auth_type TEXT NOT NULL DEFAULT '',
+			executor_type TEXT NOT NULL DEFAULT '',
 			service_tier TEXT NOT NULL DEFAULT '',
+			cache_input_mode TEXT NOT NULL DEFAULT '',
 			reasoning_effort TEXT NOT NULL DEFAULT '',
 			status_code INTEGER NOT NULL DEFAULT 0,
 			latency_ms INTEGER NOT NULL DEFAULT 0,
@@ -104,6 +106,11 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 			cached_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			normalized_cached_tokens INTEGER NOT NULL DEFAULT 0,
+			normalized_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			normalized_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+			total_input_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			failed INTEGER NOT NULL DEFAULT 0
 		)`,
@@ -135,6 +142,16 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 			cached_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			normalized_cached_tokens INTEGER NOT NULL DEFAULT 0,
+			normalized_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			normalized_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
+			total_input_tokens INTEGER NOT NULL DEFAULT 0,
+			long_input_tokens INTEGER NOT NULL DEFAULT 0,
+			long_output_tokens INTEGER NOT NULL DEFAULT 0,
+			long_cached_tokens INTEGER NOT NULL DEFAULT 0,
+			long_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			long_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
 			total_tokens INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (
 				bucket_kind,
@@ -162,6 +179,10 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 			source_model_id TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL DEFAULT ''
 		)`,
+		`CREATE TABLE IF NOT EXISTS usage_ledger_migrations (
+			name TEXT PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -169,6 +190,12 @@ func (s *SQLiteStore) init(ctx context.Context) error {
 		}
 	}
 	if err := s.ensureUsageEventColumns(ctx); err != nil {
+		return err
+	}
+	if err := s.ensureUsageRollupColumns(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateCacheAccounting(ctx); err != nil {
 		return err
 	}
 	return s.ensureDefaultModelPrices(ctx)
@@ -186,6 +213,13 @@ func (s *SQLiteStore) ensureUsageEventColumns(ctx context.Context) error {
 		{name: "credential_key_hash", def: "TEXT NOT NULL DEFAULT ''"},
 		{name: "model_alias", def: "TEXT NOT NULL DEFAULT ''"},
 		{name: "auth_type", def: "TEXT NOT NULL DEFAULT ''"},
+		{name: "executor_type", def: "TEXT NOT NULL DEFAULT ''"},
+		{name: "cache_input_mode", def: "TEXT NOT NULL DEFAULT ''"},
+		{name: "normalized_cached_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "normalized_cache_read_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "normalized_cache_creation_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "uncached_input_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "total_input_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "reasoning_effort", def: "TEXT NOT NULL DEFAULT ''"},
 		{name: "status_code", def: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "latency_ms", def: "INTEGER NOT NULL DEFAULT 0"},
@@ -198,6 +232,36 @@ func (s *SQLiteStore) ensureUsageEventColumns(ctx context.Context) error {
 			continue
 		}
 		if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE usage_events ADD COLUMN %s %s", column.name, column.def)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteStore) ensureUsageRollupColumns(ctx context.Context) error {
+	columns, err := s.tableColumns(ctx, "usage_rollups")
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		name string
+		def  string
+	}{
+		{name: "normalized_cached_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "normalized_cache_read_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "normalized_cache_creation_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "uncached_input_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "total_input_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "long_input_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "long_output_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "long_cached_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "long_cache_read_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "long_cache_creation_tokens", def: "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if columns[column.name] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE usage_rollups ADD COLUMN %s %s", column.name, column.def)); err != nil {
 			return err
 		}
 	}
@@ -275,7 +339,11 @@ func (s *SQLiteStore) InsertEvent(ctx context.Context, event Event) (bool, error
 }
 
 func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
-	query := `INSERT INTO usage_events (
+	insertVerb := "INSERT"
+	if event.RequestID != "" {
+		insertVerb = "INSERT OR IGNORE"
+	}
+	query := insertVerb + ` INTO usage_events (
 		request_id,
 		ts_ns,
 		provider,
@@ -288,7 +356,9 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		credential_key_hash,
 		account_ref,
 		auth_type,
+		executor_type,
 		service_tier,
+		cache_input_mode,
 		reasoning_effort,
 		status_code,
 		latency_ms,
@@ -302,41 +372,14 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		cached_tokens,
 		cache_read_tokens,
 		cache_creation_tokens,
+		normalized_cached_tokens,
+		normalized_cache_read_tokens,
+		normalized_cache_creation_tokens,
+		uncached_input_tokens,
+		total_input_tokens,
 		total_tokens,
 		failed
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	if event.RequestID != "" {
-		query = `INSERT OR IGNORE INTO usage_events (
-			request_id,
-			ts_ns,
-			provider,
-			model,
-			model_alias,
-			endpoint,
-			auth_index,
-			auth_file_name,
-			api_key_hash,
-			credential_key_hash,
-			account_ref,
-			auth_type,
-			service_tier,
-			reasoning_effort,
-			status_code,
-			latency_ms,
-			ttft_ms,
-			fail_status_code,
-			fail_summary,
-			fail_body,
-			input_tokens,
-			output_tokens,
-			reasoning_tokens,
-			cached_tokens,
-			cache_read_tokens,
-			cache_creation_tokens,
-			total_tokens,
-			failed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	}
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	result, err := tx.ExecContext(ctx, query,
 		event.RequestID,
 		event.Timestamp.UnixNano(),
@@ -350,7 +393,9 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		event.CredentialKeyHash,
 		event.AccountRef,
 		event.AuthType,
+		event.ExecutorType,
 		event.ServiceTier,
+		event.CacheInputMode,
 		event.ReasoningEffort,
 		event.StatusCode,
 		event.LatencyMS,
@@ -364,6 +409,11 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 		event.Tokens.CachedTokens,
 		event.Tokens.CacheReadTokens,
 		event.Tokens.CacheCreationTokens,
+		event.NormalizedCached,
+		event.NormalizedRead,
+		event.NormalizedCreated,
+		event.UncachedInput,
+		event.TotalInput,
 		event.Tokens.TotalTokens,
 		boolInt(event.Failed),
 	)
@@ -378,6 +428,7 @@ func insertEventTx(ctx context.Context, tx *sql.Tx, event Event) (bool, error) {
 }
 
 func upsertRollupTx(ctx context.Context, tx *sql.Tx, kind string, start time.Time, event Event) error {
+	longInput, longOutput, longCached, longRead, longCreated := eventLongContextBuckets(event)
 	_, err := tx.ExecContext(ctx, `INSERT INTO usage_rollups (
 		bucket_kind,
 		bucket_start_ns,
@@ -397,8 +448,18 @@ func upsertRollupTx(ctx context.Context, tx *sql.Tx, kind string, start time.Tim
 		cached_tokens,
 		cache_read_tokens,
 		cache_creation_tokens,
+		normalized_cached_tokens,
+		normalized_cache_read_tokens,
+		normalized_cache_creation_tokens,
+		uncached_input_tokens,
+		total_input_tokens,
+		long_input_tokens,
+		long_output_tokens,
+		long_cached_tokens,
+		long_cache_read_tokens,
+		long_cache_creation_tokens,
 		total_tokens
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT (
 		bucket_kind,
 		bucket_start_ns,
@@ -419,6 +480,16 @@ func upsertRollupTx(ctx context.Context, tx *sql.Tx, kind string, start time.Tim
 		cached_tokens = cached_tokens + excluded.cached_tokens,
 		cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
 		cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+		normalized_cached_tokens = normalized_cached_tokens + excluded.normalized_cached_tokens,
+		normalized_cache_read_tokens = normalized_cache_read_tokens + excluded.normalized_cache_read_tokens,
+		normalized_cache_creation_tokens = normalized_cache_creation_tokens + excluded.normalized_cache_creation_tokens,
+		uncached_input_tokens = uncached_input_tokens + excluded.uncached_input_tokens,
+		total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+		long_input_tokens = long_input_tokens + excluded.long_input_tokens,
+		long_output_tokens = long_output_tokens + excluded.long_output_tokens,
+		long_cached_tokens = long_cached_tokens + excluded.long_cached_tokens,
+		long_cache_read_tokens = long_cache_read_tokens + excluded.long_cache_read_tokens,
+		long_cache_creation_tokens = long_cache_creation_tokens + excluded.long_cache_creation_tokens,
 		total_tokens = total_tokens + excluded.total_tokens`,
 		kind,
 		start.UTC().UnixNano(),
@@ -437,9 +508,30 @@ func upsertRollupTx(ctx context.Context, tx *sql.Tx, kind string, start time.Tim
 		event.Tokens.CachedTokens,
 		event.Tokens.CacheReadTokens,
 		event.Tokens.CacheCreationTokens,
+		event.NormalizedCached,
+		event.NormalizedRead,
+		event.NormalizedCreated,
+		event.UncachedInput,
+		event.TotalInput,
+		longInput,
+		longOutput,
+		longCached,
+		longRead,
+		longCreated,
 		event.Tokens.TotalTokens,
 	)
 	return err
+}
+
+func eventLongContextBuckets(event Event) (input, output, cached, read, created int64) {
+	if event.TotalInput <= LongContextInputTokenThreshold {
+		return 0, 0, 0, 0, 0
+	}
+	return event.TotalInput,
+		maxInt64(event.Tokens.OutputTokens, 0),
+		event.NormalizedCached,
+		event.NormalizedRead,
+		event.NormalizedCreated
 }
 
 // Summary returns scoped model usage for a time window.
@@ -478,33 +570,47 @@ func (s *SQLiteStore) Summary(ctx context.Context, filter SummaryFilter) (Summar
 }
 
 type aggregateRow struct {
-	model        string
-	requests     int64
-	failures     int64
-	input        int64
-	output       int64
-	reasoning    int64
-	cached       int64
-	cacheRead    int64
-	cacheCreated int64
-	total        int64
+	model         string
+	serviceTier   string
+	requests      int64
+	failures      int64
+	input         int64
+	uncachedInput int64
+	output        int64
+	reasoning     int64
+	cached        int64
+	cacheRead     int64
+	cacheCreated  int64
+	longInput     int64
+	longOutput    int64
+	longCached    int64
+	longRead      int64
+	longCreated   int64
+	total         int64
 }
 
 func (s *SQLiteStore) querySummaryEvents(ctx context.Context, filter SummaryFilter) ([]aggregateRow, error) {
 	where, args := buildSummaryWhere(filter, "ts_ns", false)
-	query := `SELECT
+	query := fmt.Sprintf(`SELECT
 		model,
+		service_tier,
 		COUNT(*),
 		COALESCE(SUM(CASE WHEN failed <> 0 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(input_tokens), 0),
+		COALESCE(SUM(total_input_tokens), 0),
+		COALESCE(SUM(uncached_input_tokens), 0),
 		COALESCE(SUM(output_tokens), 0),
 		COALESCE(SUM(reasoning_tokens), 0),
-		COALESCE(SUM(cached_tokens), 0),
-		COALESCE(SUM(cache_read_tokens), 0),
-		COALESCE(SUM(cache_creation_tokens), 0),
+		COALESCE(SUM(normalized_cached_tokens), 0),
+		COALESCE(SUM(normalized_cache_read_tokens), 0),
+		COALESCE(SUM(normalized_cache_creation_tokens), 0),
+		COALESCE(SUM(CASE WHEN total_input_tokens > %[1]d THEN total_input_tokens ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN total_input_tokens > %[1]d THEN output_tokens ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN total_input_tokens > %[1]d THEN normalized_cached_tokens ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN total_input_tokens > %[1]d THEN normalized_cache_read_tokens ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN total_input_tokens > %[1]d THEN normalized_cache_creation_tokens ELSE 0 END), 0),
 		COALESCE(SUM(total_tokens), 0)
-		FROM usage_events ` + where + `
-		GROUP BY model
+		FROM usage_events `, LongContextInputTokenThreshold) + where + `
+		GROUP BY model, service_tier
 		ORDER BY COUNT(*) DESC, model ASC`
 	return scanAggregateRows(s.db.QueryContext(ctx, query, args...))
 }
@@ -513,17 +619,24 @@ func (s *SQLiteStore) querySummaryRollups(ctx context.Context, filter SummaryFil
 	where, args := buildSummaryWhere(filter, "bucket_start_ns", true)
 	query := `SELECT
 		model,
+		service_tier,
 		COALESCE(SUM(request_count), 0),
 		COALESCE(SUM(failed_count), 0),
-		COALESCE(SUM(input_tokens), 0),
+		COALESCE(SUM(total_input_tokens), 0),
+		COALESCE(SUM(uncached_input_tokens), 0),
 		COALESCE(SUM(output_tokens), 0),
 		COALESCE(SUM(reasoning_tokens), 0),
-		COALESCE(SUM(cached_tokens), 0),
-		COALESCE(SUM(cache_read_tokens), 0),
-		COALESCE(SUM(cache_creation_tokens), 0),
+		COALESCE(SUM(normalized_cached_tokens), 0),
+		COALESCE(SUM(normalized_cache_read_tokens), 0),
+		COALESCE(SUM(normalized_cache_creation_tokens), 0),
+		COALESCE(SUM(long_input_tokens), 0),
+		COALESCE(SUM(long_output_tokens), 0),
+		COALESCE(SUM(long_cached_tokens), 0),
+		COALESCE(SUM(long_cache_read_tokens), 0),
+		COALESCE(SUM(long_cache_creation_tokens), 0),
 		COALESCE(SUM(total_tokens), 0)
 		FROM usage_rollups ` + where + `
-		GROUP BY model
+		GROUP BY model, service_tier
 		ORDER BY SUM(request_count) DESC, model ASC`
 	return scanAggregateRows(s.db.QueryContext(ctx, query, args...))
 }
@@ -538,14 +651,21 @@ func scanAggregateRows(rows *sql.Rows, err error) ([]aggregateRow, error) {
 		var row aggregateRow
 		if err := rows.Scan(
 			&row.model,
+			&row.serviceTier,
 			&row.requests,
 			&row.failures,
 			&row.input,
+			&row.uncachedInput,
 			&row.output,
 			&row.reasoning,
 			&row.cached,
 			&row.cacheRead,
 			&row.cacheCreated,
+			&row.longInput,
+			&row.longOutput,
+			&row.longCached,
+			&row.longRead,
+			&row.longCreated,
 			&row.total,
 		); err != nil {
 			return nil, err
@@ -592,9 +712,13 @@ func applySummaryRows(summary *Summary, rows []aggregateRow, prices modelPriceIn
 	missingSet := make(map[string]struct{})
 	var totalCost float64
 	anyPriced := false
+	modelRows := make(map[string]*ModelSummary)
+	modelOrder := make([]string, 0, len(rows))
 	for _, row := range rows {
 		tokens := TokenUsage{
 			InputTokens:         row.input,
+			UncachedInputTokens: row.uncachedInput,
+			TotalInputTokens:    row.input,
 			OutputTokens:        row.output,
 			ReasoningTokens:     row.reasoning,
 			CachedTokens:        row.cached,
@@ -602,14 +726,28 @@ func applySummaryRows(summary *Summary, rows []aggregateRow, prices modelPriceIn
 			CacheCreationTokens: row.cacheCreated,
 			TotalTokens:         row.total,
 		}.Normalize()
-		modelSummary := ModelSummary{
-			Model:        row.model,
-			RequestCount: row.requests,
-			FailedCount:  row.failures,
-			Tokens:       tokens,
+		longTokens := TokenUsage{
+			InputTokens:         row.longInput,
+			TotalInputTokens:    row.longInput,
+			OutputTokens:        row.longOutput,
+			CachedTokens:        row.longCached,
+			CacheReadTokens:     row.longRead,
+			CacheCreationTokens: row.longCreated,
 		}
-		if cost, ok, missing := costForUsageWithPriceIndex(row.model, tokens, prices); ok {
-			modelSummary.EstimatedCostUSD = floatPtr(cost)
+		modelSummary := modelRows[row.model]
+		if modelSummary == nil {
+			modelSummary = &ModelSummary{Model: row.model}
+			modelRows[row.model] = modelSummary
+			modelOrder = append(modelOrder, row.model)
+		}
+		modelSummary.RequestCount += row.requests
+		modelSummary.FailedCount += row.failures
+		modelSummary.Tokens = modelSummary.Tokens.Add(tokens)
+		if cost, ok, missing := costForAggregateWithPriceIndex(row.model, row.serviceTier, tokens, longTokens, prices); ok {
+			if modelSummary.EstimatedCostUSD == nil {
+				modelSummary.EstimatedCostUSD = floatPtr(0)
+			}
+			*modelSummary.EstimatedCostUSD += cost
 			totalCost += cost
 			anyPriced = true
 		} else {
@@ -621,7 +759,11 @@ func applySummaryRows(summary *Summary, rows []aggregateRow, prices modelPriceIn
 		summary.RequestCount += row.requests
 		summary.FailedCount += row.failures
 		summary.Tokens = summary.Tokens.Add(tokens)
-		summary.Rows = append(summary.Rows, modelSummary)
+	}
+	for _, model := range modelOrder {
+		row := modelRows[model]
+		row.MissingPriceModels = sortedUniqueStrings(row.MissingPriceModels)
+		summary.Rows = append(summary.Rows, *row)
 	}
 	if anyPriced {
 		summary.EstimatedCostUSD = floatPtr(totalCost)
@@ -759,7 +901,7 @@ func (s *SQLiteStore) ensureDefaultModelPrices(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if _, err := s.db.ExecContext(ctx, insertDefaultModelPriceSQL,
+		if _, err := s.db.ExecContext(ctx, upsertDefaultModelPriceSQL,
 			price.Model,
 			price.InputPer1M,
 			price.OutputPer1M,
@@ -769,6 +911,8 @@ func (s *SQLiteStore) ensureDefaultModelPrices(ctx context.Context) error {
 			price.Source,
 			price.SourceModelID,
 			price.UpdatedAt,
+			defaultModelPriceSource,
+			gpt56PricingSource,
 		); err != nil {
 			return err
 		}
@@ -809,7 +953,7 @@ ON CONFLICT(model) DO UPDATE SET
 	source_model_id = excluded.source_model_id,
 	updated_at = excluded.updated_at`
 
-const insertDefaultModelPriceSQL = `INSERT OR IGNORE INTO model_prices (
+const upsertDefaultModelPriceSQL = `INSERT INTO model_prices (
 	model,
 	input_per_1m,
 	output_per_1m,
@@ -819,7 +963,17 @@ const insertDefaultModelPriceSQL = `INSERT OR IGNORE INTO model_prices (
 	source,
 	source_model_id,
 	updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(model) DO UPDATE SET
+	input_per_1m = excluded.input_per_1m,
+	output_per_1m = excluded.output_per_1m,
+	cache_read_per_1m = excluded.cache_read_per_1m,
+	cache_creation_per_1m = excluded.cache_creation_per_1m,
+	cached_per_1m = excluded.cached_per_1m,
+	source = excluded.source,
+	source_model_id = excluded.source_model_id,
+	updated_at = excluded.updated_at
+WHERE model_prices.source IN (?, ?)`
 
 func normalizeEvent(event Event) Event {
 	if event.Timestamp.IsZero() {
@@ -838,7 +992,9 @@ func normalizeEvent(event Event) Event {
 	event.CredentialKeyHash = strings.TrimSpace(event.CredentialKeyHash)
 	event.AccountRef = strings.TrimSpace(event.AccountRef)
 	event.AuthType = strings.TrimSpace(event.AuthType)
+	event.ExecutorType = strings.TrimSpace(event.ExecutorType)
 	event.ServiceTier = strings.TrimSpace(event.ServiceTier)
+	event.CacheInputMode = normalizedCacheInputMode(event.CacheInputMode)
 	if event.StatusCode < 0 {
 		event.StatusCode = 0
 	}
@@ -865,6 +1021,20 @@ func normalizeEvent(event Event) Event {
 	if event.FailStatusCode >= 400 || event.StatusCode >= 400 {
 		event.Failed = true
 	}
+	accounting := NormalizeCacheAccounting(CacheInputContext{
+		ExplicitMode: event.CacheInputMode,
+		ExecutorType: event.ExecutorType,
+		Provider:     event.Provider,
+		Model:        event.Model,
+	}, event.Tokens)
+	event.CacheInputMode = accounting.Mode
+	event.NormalizedCached = accounting.CachedTokens
+	event.NormalizedRead = accounting.CacheReadTokens
+	event.NormalizedCreated = accounting.CacheCreationTokens
+	event.UncachedInput = accounting.UncachedInputTokens
+	event.TotalInput = accounting.TotalInputTokens
+	event.Tokens.UncachedInputTokens = accounting.UncachedInputTokens
+	event.Tokens.TotalInputTokens = accounting.TotalInputTokens
 	event.Tokens = event.Tokens.Normalize()
 	return event
 }
@@ -930,4 +1100,15 @@ func sortedStringSet(values map[string]struct{}) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func sortedUniqueStrings(values []string) []string {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			set[value] = struct{}{}
+		}
+	}
+	return sortedStringSet(set)
 }

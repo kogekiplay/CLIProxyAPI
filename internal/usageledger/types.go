@@ -8,6 +8,8 @@ import (
 // TokenUsage stores token buckets collected from one request or an aggregate.
 type TokenUsage struct {
 	InputTokens         int64 `json:"input_tokens"`
+	UncachedInputTokens int64 `json:"uncached_input_tokens,omitempty"`
+	TotalInputTokens    int64 `json:"total_input_tokens,omitempty"`
 	OutputTokens        int64 `json:"output_tokens"`
 	ReasoningTokens     int64 `json:"reasoning_tokens"`
 	CachedTokens        int64 `json:"cached_tokens"`
@@ -31,6 +33,8 @@ func (t TokenUsage) Normalize() TokenUsage {
 func (t TokenUsage) Add(other TokenUsage) TokenUsage {
 	return TokenUsage{
 		InputTokens:         t.InputTokens + other.InputTokens,
+		UncachedInputTokens: t.UncachedInputTokens + other.UncachedInputTokens,
+		TotalInputTokens:    t.TotalInputTokens + other.TotalInputTokens,
 		OutputTokens:        t.OutputTokens + other.OutputTokens,
 		ReasoningTokens:     t.ReasoningTokens + other.ReasoningTokens,
 		CachedTokens:        t.CachedTokens + other.CachedTokens,
@@ -67,7 +71,14 @@ type Event struct {
 	CredentialKeyHash string
 	AccountRef        string
 	AuthType          string
+	ExecutorType      string
 	ServiceTier       string
+	CacheInputMode    string
+	NormalizedCached  int64
+	NormalizedRead    int64
+	NormalizedCreated int64
+	UncachedInput     int64
+	TotalInput        int64
 	ReasoningEffort   string
 	StatusCode        int
 	LatencyMS         int64
@@ -133,12 +144,15 @@ type AnalyticsSummary struct {
 	SuccessCalls        int64    `json:"success_calls"`
 	FailureCalls        int64    `json:"failure_calls"`
 	InputTokens         int64    `json:"input_tokens"`
+	UncachedInputTokens int64    `json:"uncached_input_tokens"`
+	TotalInputTokens    int64    `json:"total_input_tokens"`
 	OutputTokens        int64    `json:"output_tokens"`
 	ReasoningTokens     int64    `json:"reasoning_tokens"`
 	CachedTokens        int64    `json:"cached_tokens"`
 	CacheReadTokens     int64    `json:"cache_read_tokens"`
 	CacheCreationTokens int64    `json:"cache_creation_tokens"`
 	TotalTokens         int64    `json:"total_tokens"`
+	CacheHitRate        float64  `json:"cache_hit_rate"`
 	TotalCost           *float64 `json:"total_cost,omitempty"`
 }
 
@@ -148,12 +162,15 @@ type AnalyticsTimelinePoint struct {
 	Success             int64    `json:"success"`
 	Failure             int64    `json:"failure"`
 	InputTokens         int64    `json:"input_tokens"`
+	UncachedInputTokens int64    `json:"uncached_input_tokens"`
+	TotalInputTokens    int64    `json:"total_input_tokens"`
 	OutputTokens        int64    `json:"output_tokens"`
 	ReasoningTokens     int64    `json:"reasoning_tokens"`
 	CachedTokens        int64    `json:"cached_tokens"`
 	CacheReadTokens     int64    `json:"cache_read_tokens"`
 	CacheCreationTokens int64    `json:"cache_creation_tokens"`
 	TotalTokens         int64    `json:"total_tokens"`
+	CacheHitRate        float64  `json:"cache_hit_rate"`
 	Cost                *float64 `json:"cost,omitempty"`
 }
 
@@ -163,12 +180,15 @@ type AnalyticsModelStat struct {
 	SuccessCalls        int64    `json:"success_calls"`
 	FailureCalls        int64    `json:"failure_calls"`
 	InputTokens         int64    `json:"input_tokens"`
+	UncachedInputTokens int64    `json:"uncached_input_tokens"`
+	TotalInputTokens    int64    `json:"total_input_tokens"`
 	OutputTokens        int64    `json:"output_tokens"`
 	ReasoningTokens     int64    `json:"reasoning_tokens"`
 	CachedTokens        int64    `json:"cached_tokens"`
 	CacheReadTokens     int64    `json:"cache_read_tokens"`
 	CacheCreationTokens int64    `json:"cache_creation_tokens"`
 	TotalTokens         int64    `json:"total_tokens"`
+	CacheHitRate        float64  `json:"cache_hit_rate"`
 	Cost                *float64 `json:"cost,omitempty"`
 }
 
@@ -182,12 +202,15 @@ type AnalyticsAPIKeyStat struct {
 	SuccessCalls        int64    `json:"success_calls"`
 	FailureCalls        int64    `json:"failure_calls"`
 	InputTokens         int64    `json:"input_tokens"`
+	UncachedInputTokens int64    `json:"uncached_input_tokens"`
+	TotalInputTokens    int64    `json:"total_input_tokens"`
 	OutputTokens        int64    `json:"output_tokens"`
 	ReasoningTokens     int64    `json:"reasoning_tokens"`
 	CachedTokens        int64    `json:"cached_tokens"`
 	CacheReadTokens     int64    `json:"cache_read_tokens"`
 	CacheCreationTokens int64    `json:"cache_creation_tokens"`
 	TotalTokens         int64    `json:"total_tokens"`
+	CacheHitRate        float64  `json:"cache_hit_rate"`
 	Cost                *float64 `json:"cost,omitempty"`
 }
 
@@ -201,12 +224,15 @@ type AnalyticsCredentialStat struct {
 	SuccessCalls          int64    `json:"success_calls"`
 	FailureCalls          int64    `json:"failure_calls"`
 	InputTokens           int64    `json:"input_tokens"`
+	UncachedInputTokens   int64    `json:"uncached_input_tokens"`
+	TotalInputTokens      int64    `json:"total_input_tokens"`
 	OutputTokens          int64    `json:"output_tokens"`
 	ReasoningTokens       int64    `json:"reasoning_tokens"`
 	CachedTokens          int64    `json:"cached_tokens"`
 	CacheReadTokens       int64    `json:"cache_read_tokens"`
 	CacheCreationTokens   int64    `json:"cache_creation_tokens"`
 	TotalTokens           int64    `json:"total_tokens"`
+	CacheHitRate          float64  `json:"cache_hit_rate"`
 	Cost                  *float64 `json:"cost,omitempty"`
 }
 
@@ -233,7 +259,9 @@ type AnalyticsEventRow struct {
 	CredentialKeyHash     string     `json:"credential_key_hash"`
 	AccountRef            string     `json:"account_ref"`
 	AuthType              string     `json:"auth_type"`
+	ExecutorType          string     `json:"executor_type,omitempty"`
 	ServiceTier           string     `json:"service_tier"`
+	CacheInputMode        string     `json:"cache_input_mode,omitempty"`
 	ReasoningEffort       string     `json:"reasoning_effort,omitempty"`
 	StatusCode            int        `json:"status_code,omitempty"`
 	LatencyMS             *int64     `json:"latency_ms,omitempty"`

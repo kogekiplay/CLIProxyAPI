@@ -75,7 +75,7 @@ func TestPluginStoresCacheUsageBuckets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := summary.Tokens; got.CachedTokens != 30 || got.CacheReadTokens != 30 || got.CacheCreationTokens != 12 {
+	if got := summary.Tokens; got.CachedTokens != 0 || got.CacheReadTokens != 30 || got.CacheCreationTokens != 12 || got.UncachedInputTokens != 58 || got.TotalInputTokens != 100 {
 		t.Fatalf("summary cache tokens = %#v", got)
 	}
 
@@ -96,8 +96,33 @@ func TestPluginStoresCacheUsageBuckets(t *testing.T) {
 	if result.Events == nil || len(result.Events.Items) != 1 {
 		t.Fatalf("analytics events = %#v", result.Events)
 	}
-	if got := result.Events.Items[0].Tokens; got.CachedTokens != 30 || got.CacheReadTokens != 30 || got.CacheCreationTokens != 12 {
+	if got := result.Events.Items[0].Tokens; got.CachedTokens != 0 || got.CacheReadTokens != 30 || got.CacheCreationTokens != 12 || got.UncachedInputTokens != 58 || got.TotalInputTokens != 100 {
 		t.Fatalf("analytics event cache tokens = %#v", got)
+	}
+}
+
+func TestPluginPrefersResponseServiceTier(t *testing.T) {
+	p := &plugin{now: time.Now}
+	event := p.eventFromRecord(context.Background(), coreusage.Record{
+		Provider:            "codex",
+		Model:               "gpt-5.6-sol",
+		RequestServiceTier:  "flex",
+		ServiceTier:         "auto",
+		ResponseServiceTier: "priority",
+		Detail:              coreusage.Detail{ResponseServiceTier: "batch"},
+	})
+	if event.ServiceTier != "priority" {
+		t.Fatalf("service tier = %q, want response priority", event.ServiceTier)
+	}
+
+	event = p.eventFromRecord(context.Background(), coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5.6-sol",
+		ServiceTier: "auto",
+		Detail:      coreusage.Detail{ResponseServiceTier: "batch"},
+	})
+	if event.ServiceTier != "batch" {
+		t.Fatalf("service tier = %q, want detail response batch", event.ServiceTier)
 	}
 }
 

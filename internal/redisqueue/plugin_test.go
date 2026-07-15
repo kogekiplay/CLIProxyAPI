@@ -39,9 +39,10 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 			RequestedAt:         time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC),
 			Latency:             1500 * time.Millisecond,
 			Detail: coreusage.Detail{
-				InputTokens:  10,
-				OutputTokens: 20,
-				TotalTokens:  30,
+				InputTokens:    10,
+				OutputTokens:   20,
+				CacheInputMode: coreusage.CacheInputModeIncluded,
+				TotalTokens:    30,
 			},
 			ResponseHeaders: responseHeaders.Clone(),
 		})
@@ -61,6 +62,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 		requireMissingField(t, payload, "request_service_tier")
 		requireStringField(t, payload, "response_service_tier", "default")
 		requireTokensBoolField(t, payload, "cache_read_tokens_present", true)
+		requireTokensStringField(t, payload, "cache_input_mode", string(coreusage.CacheInputModeIncluded))
 		requireHeaderField(t, payload, "response_headers", "X-Upstream-Request-Id", []string{"upstream-req-1"})
 		requireHeaderField(t, payload, "response_headers", "Retry-After", []string{"30"})
 		requireBoolField(t, payload, "failed", false)
@@ -401,6 +403,18 @@ func requireTokensPayload(t *testing.T, payload map[string]json.RawMessage) map[
 func requireTokensBoolField(t *testing.T, payload map[string]json.RawMessage, key string, want bool) {
 	t.Helper()
 	requireBoolField(t, requireTokensPayload(t, payload), key, want)
+}
+
+func requireTokensStringField(t *testing.T, payload map[string]json.RawMessage, key, want string) {
+	t.Helper()
+	tokens := requireTokensPayload(t, payload)
+	var got string
+	if err := json.Unmarshal(tokens[key], &got); err != nil {
+		t.Fatalf("unmarshal tokens.%s: %v", key, err)
+	}
+	if got != want {
+		t.Fatalf("tokens.%s = %q, want %q", key, got, want)
+	}
 }
 
 func requireFailField(t *testing.T, payload map[string]json.RawMessage, wantStatus int, wantBody string) {

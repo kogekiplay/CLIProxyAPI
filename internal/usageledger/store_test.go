@@ -207,6 +207,112 @@ func TestOpenSQLiteAddsModelAliasColumn(t *testing.T) {
 	}
 }
 
+func TestOpenSQLiteBackfillsCanonicalCacheAccountingAndRebuildsRollups(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	store, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("create sqlite store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close initial sqlite store: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite for legacy seed: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM usage_ledger_migrations WHERE name = ?`, cacheAccountingMigration); err != nil {
+		t.Fatalf("clear migration marker: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM usage_rollups`); err != nil {
+		t.Fatalf("clear rollups: %v", err)
+	}
+	ts := time.Date(2026, 7, 15, 8, 30, 0, 0, time.UTC).UnixNano()
+	for _, seed := range []struct {
+		requestID    string
+		provider     string
+		model        string
+		executorType string
+		input        int64
+		cached       int64
+		read         int64
+		created      int64
+	}{
+		{requestID: "legacy-codex", provider: "codex", model: "gpt-5.6-sol", executorType: "CodexExecutor", input: 1000, cached: 300, read: 300, created: 100},
+		{requestID: "legacy-claude", provider: "claude", model: "claude-opus", executorType: "ClaudeExecutor", input: 100, cached: 300, read: 300, created: 50},
+	} {
+		if _, err := db.Exec(`INSERT INTO usage_events (
+			request_id, ts_ns, provider, model, executor_type,
+			input_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			seed.requestID, ts, seed.provider, seed.model, seed.executorType,
+			seed.input, seed.cached, seed.read, seed.created,
+		); err != nil {
+			t.Fatalf("insert legacy event %s: %v", seed.requestID, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy seed database: %v", err)
+	}
+
+	store, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("open migrated sqlite store: %v", err)
+	}
+	assertCacheAccounting := func(requestID, mode string, cached, read, created, uncached, total int64) {
+		t.Helper()
+		var gotMode string
+		var gotCached, gotRead, gotCreated, gotUncached, gotTotal int64
+		if err := store.db.QueryRow(`SELECT
+			cache_input_mode,
+			normalized_cached_tokens,
+			normalized_cache_read_tokens,
+			normalized_cache_creation_tokens,
+			uncached_input_tokens,
+			total_input_tokens
+			FROM usage_events WHERE request_id = ?`, requestID).Scan(
+			&gotMode, &gotCached, &gotRead, &gotCreated, &gotUncached, &gotTotal,
+		); err != nil {
+			t.Fatalf("read migrated event %s: %v", requestID, err)
+		}
+		if gotMode != mode || gotCached != cached || gotRead != read || gotCreated != created || gotUncached != uncached || gotTotal != total {
+			t.Fatalf("migrated event %s = mode=%q C=%d CR=%d CW=%d uncached=%d total=%d", requestID, gotMode, gotCached, gotRead, gotCreated, gotUncached, gotTotal)
+		}
+	}
+	assertCacheAccounting("legacy-codex", CacheInputModeIncluded, 0, 300, 100, 600, 1000)
+	assertCacheAccounting("legacy-claude", CacheInputModeSeparate, 0, 300, 50, 100, 450)
+
+	var rollupCount, markerCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_rollups`).Scan(&rollupCount); err != nil {
+		t.Fatalf("count rebuilt rollups: %v", err)
+	}
+	if rollupCount != 4 {
+		t.Fatalf("rollup count = %d, want 4", rollupCount)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_ledger_migrations WHERE name = ?`, cacheAccountingMigration).Scan(&markerCount); err != nil {
+		t.Fatalf("count migration marker: %v", err)
+	}
+	if markerCount != 1 {
+		t.Fatalf("migration marker count = %d, want 1", markerCount)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+
+	store, err = OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("reopen migrated sqlite store: %v", err)
+	}
+	defer store.Close()
+	var reopenedRollupCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM usage_rollups`).Scan(&reopenedRollupCount); err != nil {
+		t.Fatalf("count rollups after reopen: %v", err)
+	}
+	if reopenedRollupCount != rollupCount {
+		t.Fatalf("rollup count after reopen = %d, want %d", reopenedRollupCount, rollupCount)
+	}
+}
+
 func TestSQLiteStoreInsertEventUpdatesRollupsOnce(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()
@@ -460,6 +566,31 @@ func TestSQLiteStoreSeedsDefaultModelPricesWithoutOverridingManualPrices(t *test
 	}
 	if gptImage15.InputPer1M != 8 || gptImage15.OutputPer1M != 32 || gptImage15.CacheReadPer1M != 2 {
 		t.Fatalf("gpt-image-1.5 default price = %#v", gptImage15)
+	}
+
+	staleDefault := ModelPrice{
+		Model:              "gpt-5.6-sol",
+		InputPer1M:         5,
+		OutputPer1M:        30,
+		CacheReadPer1M:     0.5,
+		CacheCreationPer1M: 0,
+		Source:             defaultModelPriceSource,
+		SourceModelID:      "gpt-5.6-sol",
+		UpdatedAt:          "2026-06-25T00:00:00Z",
+	}
+	if err := store.UpsertModelPrice(context.Background(), staleDefault); err != nil {
+		t.Fatalf("upsert stale default price: %v", err)
+	}
+	if err := store.ensureDefaultModelPrices(context.Background()); err != nil {
+		t.Fatalf("refresh default prices: %v", err)
+	}
+	prices, err = store.ListModelPrices(context.Background())
+	if err != nil {
+		t.Fatalf("list refreshed default prices: %v", err)
+	}
+	refreshed, ok := findModelPrice(prices, "gpt-5.6-sol")
+	if !ok || refreshed.CacheCreationPer1M != 6.25 || refreshed.Source != gpt56PricingSource {
+		t.Fatalf("refreshed gpt-5.6-sol default price = %#v", refreshed)
 	}
 
 	manual := ModelPrice{

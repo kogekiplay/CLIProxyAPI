@@ -54,7 +54,16 @@ func (p *plugin) eventFromRecord(ctx context.Context, record coreusage.Record) E
 	if authIndex == "" {
 		authIndex = strings.TrimSpace(record.AuthID)
 	}
-	serviceTier := strings.TrimSpace(record.ServiceTier)
+	serviceTier := strings.TrimSpace(record.ResponseServiceTier)
+	if serviceTier == "" {
+		serviceTier = strings.TrimSpace(record.Detail.ResponseServiceTier)
+	}
+	if serviceTier == "" {
+		serviceTier = strings.TrimSpace(record.ServiceTier)
+	}
+	if serviceTier == "" {
+		serviceTier = strings.TrimSpace(record.RequestServiceTier)
+	}
 	if serviceTier == "" {
 		serviceTier = coreusage.ServiceTierFromContext(ctx)
 	}
@@ -83,7 +92,9 @@ func (p *plugin) eventFromRecord(ctx context.Context, record coreusage.Record) E
 		CredentialKeyHash: strings.TrimSpace(record.CredentialKeyHash),
 		AccountRef:        accountRefFromSource(record.Source),
 		AuthType:          strings.TrimSpace(record.AuthType),
+		ExecutorType:      strings.TrimSpace(record.ExecutorType),
 		ServiceTier:       serviceTier,
+		CacheInputMode:    string(record.Detail.CacheInputMode),
 		ReasoningEffort:   reasoningEffort,
 		StatusCode:        statusCode,
 		LatencyMS:         durationMillis(record.Latency),

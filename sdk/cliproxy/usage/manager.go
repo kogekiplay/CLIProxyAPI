@@ -20,6 +20,15 @@ const pluginDispatchTimeout = 30 * time.Second
 // historical direct-SDK default.
 const AutoServiceTier = "auto"
 
+// CacheInputMode describes whether fine-grained cache tokens are already
+// included in InputTokens. The zero value remains unknown for older callers.
+type CacheInputMode string
+
+const (
+	CacheInputModeIncluded CacheInputMode = "included_in_input"
+	CacheInputModeSeparate CacheInputMode = "separate_from_input"
+)
+
 // Record contains the usage statistics captured for a single provider request.
 type Record struct {
 	Provider string
@@ -68,6 +77,7 @@ type Detail struct {
 	CachedTokens        int64
 	CacheReadTokens     int64
 	CacheCreationTokens int64
+	CacheInputMode      CacheInputMode
 	TotalTokens         int64
 	ResponseServiceTier string
 }

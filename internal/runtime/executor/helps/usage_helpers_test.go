@@ -33,6 +33,9 @@ func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	if detail.ReasoningTokens != 5 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 5)
 	}
+	if detail.CacheInputMode != usage.CacheInputModeIncluded {
+		t.Fatalf("cache input mode = %q, want included", detail.CacheInputMode)
+	}
 }
 
 func TestParseOpenAIUsageResponses(t *testing.T) {
@@ -58,6 +61,9 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.ResponseServiceTier != "default" {
 		t.Fatalf("response service tier = %q, want default", detail.ResponseServiceTier)
+	}
+	if detail.CacheInputMode != usage.CacheInputModeIncluded {
+		t.Fatalf("cache input mode = %q, want included", detail.CacheInputMode)
 	}
 }
 
@@ -87,6 +93,9 @@ func TestParseCodexUsageIncludesCacheWriteTokens(t *testing.T) {
 	}
 	if detail.ResponseServiceTier != "priority" {
 		t.Fatalf("response service tier = %q, want priority", detail.ResponseServiceTier)
+	}
+	if detail.CacheInputMode != usage.CacheInputModeIncluded {
+		t.Fatalf("cache input mode = %q, want included", detail.CacheInputMode)
 	}
 }
 
@@ -284,6 +293,9 @@ func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
 	if detail.TotalTokens != 22859 {
 		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 22859)
 	}
+	if detail.CacheInputMode != usage.CacheInputModeSeparate {
+		t.Fatalf("cache input mode = %q, want separate", detail.CacheInputMode)
+	}
 }
 
 func TestParseClaudeUsageFallsBackCachedTokensToCacheCreation(t *testing.T) {
@@ -319,6 +331,9 @@ func TestParseGeminiUsageNormalizesCachedContent(t *testing.T) {
 	if detail.CacheReadTokens != 4 {
 		t.Fatalf("cache read tokens = %d, want 4", detail.CacheReadTokens)
 	}
+	if detail.CacheInputMode != usage.CacheInputModeIncluded {
+		t.Fatalf("cache input mode = %q, want included", detail.CacheInputMode)
+	}
 }
 
 func TestParseInteractionsUsage(t *testing.T) {
@@ -334,6 +349,9 @@ func TestParseInteractionsUsage(t *testing.T) {
 	}
 	if detail.TotalTokens != 12 {
 		t.Fatalf("total tokens = %d, want 12", detail.TotalTokens)
+	}
+	if detail.CacheInputMode != usage.CacheInputModeIncluded {
+		t.Fatalf("cache input mode = %q, want included", detail.CacheInputMode)
 	}
 	if detail.CachedTokens != 2 {
 		t.Fatalf("cached tokens = %d, want 2", detail.CachedTokens)

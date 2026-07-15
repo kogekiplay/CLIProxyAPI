@@ -25,7 +25,9 @@ const analyticsEventsSelect = `SELECT
 		credential_key_hash,
 		account_ref,
 		auth_type,
+		executor_type,
 		service_tier,
+		cache_input_mode,
 		reasoning_effort,
 		status_code,
 		latency_ms,
@@ -39,6 +41,11 @@ const analyticsEventsSelect = `SELECT
 		cached_tokens,
 		cache_read_tokens,
 		cache_creation_tokens,
+		normalized_cached_tokens,
+		normalized_cache_read_tokens,
+		normalized_cache_creation_tokens,
+		uncached_input_tokens,
+		total_input_tokens,
 		total_tokens,
 		failed
 		FROM usage_events `
@@ -192,6 +199,7 @@ type analyticsRowScanner interface {
 func scanAnalyticsEvent(scanner analyticsRowScanner, prices modelPriceIndex, modelAliases modelAliasIndex) (analyticsEvent, error) {
 	var item analyticsEvent
 	var failed int
+	var rawInput, rawCached, rawCacheRead, rawCacheCreation int64
 	if err := scanner.Scan(
 		&item.id,
 		&item.event.RequestID,
@@ -206,7 +214,9 @@ func scanAnalyticsEvent(scanner analyticsRowScanner, prices modelPriceIndex, mod
 		&item.event.CredentialKeyHash,
 		&item.event.AccountRef,
 		&item.event.AuthType,
+		&item.event.ExecutorType,
 		&item.event.ServiceTier,
+		&item.event.CacheInputMode,
 		&item.event.ReasoningEffort,
 		&item.event.StatusCode,
 		&item.event.LatencyMS,
@@ -214,17 +224,28 @@ func scanAnalyticsEvent(scanner analyticsRowScanner, prices modelPriceIndex, mod
 		&item.event.FailStatusCode,
 		&item.event.FailSummary,
 		&item.event.FailBody,
-		&item.tokens.InputTokens,
+		&rawInput,
 		&item.tokens.OutputTokens,
 		&item.tokens.ReasoningTokens,
+		&rawCached,
+		&rawCacheRead,
+		&rawCacheCreation,
 		&item.tokens.CachedTokens,
 		&item.tokens.CacheReadTokens,
 		&item.tokens.CacheCreationTokens,
+		&item.tokens.UncachedInputTokens,
+		&item.tokens.TotalInputTokens,
 		&item.tokens.TotalTokens,
 		&failed,
 	); err != nil {
 		return analyticsEvent{}, err
 	}
+	item.tokens.InputTokens = item.tokens.TotalInputTokens
+	item.event.NormalizedCached = item.tokens.CachedTokens
+	item.event.NormalizedRead = item.tokens.CacheReadTokens
+	item.event.NormalizedCreated = item.tokens.CacheCreationTokens
+	item.event.UncachedInput = item.tokens.UncachedInputTokens
+	item.event.TotalInput = item.tokens.TotalInputTokens
 	item.event.Timestamp = time.Unix(0, item.unixNano).UTC()
 	item.event.Tokens = item.tokens.Normalize()
 	item.tokens = item.event.Tokens
@@ -232,7 +253,7 @@ func scanAnalyticsEvent(scanner analyticsRowScanner, prices modelPriceIndex, mod
 	item.event.Failed = item.failed
 	item.upstreamModel = strings.TrimSpace(item.event.Model)
 	item.event.Model = modelAliases.resolve(item.event)
-	if cost, ok, missing := costForUsageWithPriceIndex(item.event.Model, item.tokens, prices); ok {
+	if cost, ok, missing := costForUsageWithBehaviorAndPriceIndex(item.event.Model, item.upstreamModel, item.event.ServiceTier, item.tokens, prices); ok {
 		item.cost = cost
 		item.hasCost = true
 	} else if len(missing) > 0 {
@@ -359,12 +380,15 @@ func buildAnalyticsSummary(events []analyticsEvent) *AnalyticsSummary {
 		SuccessCalls:        agg.success,
 		FailureCalls:        agg.failure,
 		InputTokens:         agg.tokens.InputTokens,
+		UncachedInputTokens: agg.tokens.UncachedInputTokens,
+		TotalInputTokens:    agg.tokens.TotalInputTokens,
 		OutputTokens:        agg.tokens.OutputTokens,
 		ReasoningTokens:     agg.tokens.ReasoningTokens,
 		CachedTokens:        agg.tokens.CachedTokens,
 		CacheReadTokens:     agg.tokens.CacheReadTokens,
 		CacheCreationTokens: agg.tokens.CacheCreationTokens,
 		TotalTokens:         agg.tokens.TotalTokens,
+		CacheHitRate:        CacheHitRate(agg.tokens),
 	}
 	if agg.hasCost {
 		summary.TotalCost = floatPtr(agg.cost)
@@ -394,12 +418,15 @@ func buildAnalyticsTimeline(events []analyticsEvent) []AnalyticsTimelinePoint {
 			Success:             agg.success,
 			Failure:             agg.failure,
 			InputTokens:         agg.tokens.InputTokens,
+			UncachedInputTokens: agg.tokens.UncachedInputTokens,
+			TotalInputTokens:    agg.tokens.TotalInputTokens,
 			OutputTokens:        agg.tokens.OutputTokens,
 			ReasoningTokens:     agg.tokens.ReasoningTokens,
 			CachedTokens:        agg.tokens.CachedTokens,
 			CacheReadTokens:     agg.tokens.CacheReadTokens,
 			CacheCreationTokens: agg.tokens.CacheCreationTokens,
 			TotalTokens:         agg.tokens.TotalTokens,
+			CacheHitRate:        CacheHitRate(agg.tokens),
 		}
 		if agg.hasCost {
 			point.Cost = floatPtr(agg.cost)
@@ -427,12 +454,15 @@ func buildAnalyticsModelStats(events []analyticsEvent) []AnalyticsModelStat {
 			SuccessCalls:        agg.success,
 			FailureCalls:        agg.failure,
 			InputTokens:         agg.tokens.InputTokens,
+			UncachedInputTokens: agg.tokens.UncachedInputTokens,
+			TotalInputTokens:    agg.tokens.TotalInputTokens,
 			OutputTokens:        agg.tokens.OutputTokens,
 			ReasoningTokens:     agg.tokens.ReasoningTokens,
 			CachedTokens:        agg.tokens.CachedTokens,
 			CacheReadTokens:     agg.tokens.CacheReadTokens,
 			CacheCreationTokens: agg.tokens.CacheCreationTokens,
 			TotalTokens:         agg.tokens.TotalTokens,
+			CacheHitRate:        CacheHitRate(agg.tokens),
 		}
 		if agg.hasCost {
 			row.Cost = floatPtr(agg.cost)
@@ -496,12 +526,15 @@ func buildAnalyticsAPIKeyStats(events []analyticsEvent) []AnalyticsAPIKeyStat {
 			SuccessCalls:        agg.success,
 			FailureCalls:        agg.failure,
 			InputTokens:         agg.tokens.InputTokens,
+			UncachedInputTokens: agg.tokens.UncachedInputTokens,
+			TotalInputTokens:    agg.tokens.TotalInputTokens,
 			OutputTokens:        agg.tokens.OutputTokens,
 			ReasoningTokens:     agg.tokens.ReasoningTokens,
 			CachedTokens:        agg.tokens.CachedTokens,
 			CacheReadTokens:     agg.tokens.CacheReadTokens,
 			CacheCreationTokens: agg.tokens.CacheCreationTokens,
 			TotalTokens:         agg.tokens.TotalTokens,
+			CacheHitRate:        CacheHitRate(agg.tokens),
 		}
 		if agg.hasCost {
 			row.Cost = floatPtr(agg.cost)
@@ -616,12 +649,15 @@ func buildAnalyticsCredentialStats(events []analyticsEvent) []AnalyticsCredentia
 			SuccessCalls:        agg.success,
 			FailureCalls:        agg.failure,
 			InputTokens:         agg.tokens.InputTokens,
+			UncachedInputTokens: agg.tokens.UncachedInputTokens,
+			TotalInputTokens:    agg.tokens.TotalInputTokens,
 			OutputTokens:        agg.tokens.OutputTokens,
 			ReasoningTokens:     agg.tokens.ReasoningTokens,
 			CachedTokens:        agg.tokens.CachedTokens,
 			CacheReadTokens:     agg.tokens.CacheReadTokens,
 			CacheCreationTokens: agg.tokens.CacheCreationTokens,
 			TotalTokens:         agg.tokens.TotalTokens,
+			CacheHitRate:        CacheHitRate(agg.tokens),
 		}
 		if agg.hasCost {
 			row.Cost = floatPtr(agg.cost)
@@ -704,7 +740,9 @@ func analyticsEventRow(event analyticsEvent) AnalyticsEventRow {
 		CredentialKeyHash:     event.event.CredentialKeyHash,
 		AccountRef:            event.event.AccountRef,
 		AuthType:              event.event.AuthType,
+		ExecutorType:          event.event.ExecutorType,
 		ServiceTier:           event.event.ServiceTier,
+		CacheInputMode:        event.event.CacheInputMode,
 		ReasoningEffort:       event.event.ReasoningEffort,
 		StatusCode:            event.event.StatusCode,
 		LatencyMS:             int64PtrIfPositive(event.event.LatencyMS),
