@@ -1276,6 +1276,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	chunks := streamResult.Chunks
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
+	// http.Header is a map, so finish first-chunk interception before exposing it to callers.
+	headersReady := make(chan struct{})
+	var headersReadyOnce sync.Once
+	markHeadersReady := func() {
+		headersReadyOnce.Do(func() { close(headersReady) })
+	}
 	streamHeaderInitialized := false
 	streamHeadersCommitted := false
 
@@ -1345,6 +1351,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	go func() {
 		defer close(dataChan)
 		defer close(errChan)
+		defer markHeadersReady()
 		defer func() {
 			if attemptCancel != nil {
 				attemptCancel()
@@ -1456,6 +1463,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 				if len(chunk.Payload) > 0 {
 					applyStreamHeaderInit()
 					payload := cloneBytes(chunk.Payload)
+					dropChunk := false
 					if streamInterceptorsActive {
 						executedReq, executedOpts := executedRequest()
 						intercepted := interceptStreamChunk(ctx, interceptorHost, pluginapi.StreamChunkInterceptRequest{
@@ -1476,11 +1484,14 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 							payload = cloneBytes(intercepted.Body)
 						}
 						chunkIndex++
-						if intercepted.DropChunk {
-							continue
-						}
+						dropChunk = intercepted.DropChunk
 					} else {
 						chunkIndex++
+					}
+					if dropChunk {
+						streamHeadersCommitted = true
+						markHeadersReady()
+						continue
 					}
 					if responseProtocol == "openai-response" {
 						if errValidate := validateSSEDataJSON(payload); errValidate != nil {
@@ -1490,6 +1501,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					}
 					sentPayload = true
 					streamHeadersCommitted = true
+					markHeadersReady()
 					if okSendData := sendData(payload); !okSendData {
 						return
 					}
@@ -1498,10 +1510,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					}
 				}
 			}
-			applyStreamHeaderInit()
-			return
 		}
 	}()
+	<-headersReady
 	return dataChan, upstreamHeaders, errChan
 }
 

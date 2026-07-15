@@ -6,10 +6,79 @@ import (
 
 const tokensPerMillion = 1_000_000.0
 
+type modelPriceWildcard struct {
+	prefix string
+	price  ModelPrice
+}
+
+// modelPriceIndex is compiled once for bulk analytics queries. It preserves the
+// first-match behavior of MatchModelPrice while avoiding a full price scan for
+// every usage event.
+type modelPriceIndex struct {
+	exact     map[string]ModelPrice
+	wildcards []modelPriceWildcard
+}
+
+func compileModelPriceIndex(prices []ModelPrice) modelPriceIndex {
+	index := modelPriceIndex{
+		exact:     make(map[string]ModelPrice, len(prices)),
+		wildcards: make([]modelPriceWildcard, 0),
+	}
+	for _, price := range prices {
+		pattern := strings.TrimSpace(price.Model)
+		if pattern == "" {
+			continue
+		}
+		normalizedPattern := strings.ToLower(pattern)
+		if _, exists := index.exact[normalizedPattern]; !exists {
+			index.exact[normalizedPattern] = price
+		}
+		if strings.HasSuffix(normalizedPattern, "*") {
+			prefix := strings.TrimSuffix(normalizedPattern, "*")
+			if prefix != "" {
+				index.wildcards = append(index.wildcards, modelPriceWildcard{prefix: prefix, price: price})
+			}
+		}
+	}
+	return index
+}
+
+func (i modelPriceIndex) match(model string) (ModelPrice, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ModelPrice{}, false
+	}
+	normalizedModel := strings.ToLower(model)
+	if price, ok := i.exact[normalizedModel]; ok {
+		return price, true
+	}
+	if baseModel := modelWithoutReasoningSuffix(model); baseModel != model {
+		if price, ok := i.exact[strings.ToLower(baseModel)]; ok {
+			return price, true
+		}
+	}
+	for _, wildcard := range i.wildcards {
+		if strings.HasPrefix(normalizedModel, wildcard.prefix) {
+			return wildcard.price, true
+		}
+	}
+	return ModelPrice{}, false
+}
+
 // CostForUsage computes the estimated USD cost for one model and token set.
 func CostForUsage(model string, tokens TokenUsage, prices []ModelPrice) (float64, bool, []string) {
 	model = strings.TrimSpace(model)
 	price, ok := MatchModelPrice(model, prices)
+	return costForUsageWithPrice(model, tokens, price, ok)
+}
+
+func costForUsageWithPriceIndex(model string, tokens TokenUsage, prices modelPriceIndex) (float64, bool, []string) {
+	model = strings.TrimSpace(model)
+	price, ok := prices.match(model)
+	return costForUsageWithPrice(model, tokens, price, ok)
+}
+
+func costForUsageWithPrice(model string, tokens TokenUsage, price ModelPrice, ok bool) (float64, bool, []string) {
 	if !ok {
 		if model == "" {
 			model = "unknown"

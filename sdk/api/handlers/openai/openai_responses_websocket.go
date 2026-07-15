@@ -1375,6 +1375,24 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	if c != nil && c.Request != nil {
 		downstreamSessionKey = websocketDownstreamSessionKey(c.Request)
 	}
+	forwardStreamError := func(errMsg *interfaces.ErrorMessage) error {
+		if errMsg == nil {
+			cancel(nil)
+			return nil
+		}
+		h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+		markAPIResponseTimestamp(c)
+		errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
+		log.Infof(
+			"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+			sessionID,
+			websocket.TextMessage,
+			websocketPayloadEventType(errorPayload),
+			websocketPayloadPreview(errorPayload),
+		)
+		cancel(errMsg.Error)
+		return errWrite
+	}
 
 	for {
 		select {
@@ -1386,36 +1404,24 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				errs = nil
 				continue
 			}
-			if errMsg != nil {
-				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-				markAPIResponseTimestamp(c)
-				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, errMsg)
-				log.Infof(
-					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
-					sessionID,
-					websocket.TextMessage,
-					websocketPayloadEventType(errorPayload),
-					websocketPayloadPreview(errorPayload),
-				)
-				if errWrite != nil {
-					// log.Warnf(
-					// 	"responses websocket: downstream_out write failed id=%s event=%s error=%v",
-					// 	sessionID,
-					// 	websocketPayloadEventType(errorPayload),
-					// 	errWrite,
-					// )
-					cancel(errMsg.Error)
-					return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errWrite
-				}
-			}
-			if errMsg != nil {
-				cancel(errMsg.Error)
-			} else {
-				cancel(nil)
-			}
-			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, nil
+			errWrite := forwardStreamError(errMsg)
+			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errWrite
 		case chunk, ok := <-data:
 			if !ok {
+				// The producer may enqueue a terminal error and close both channels before
+				// this select runs. Prefer that real error over synthesizing a timeout from
+				// the concurrently closed data channel.
+				if errs != nil {
+					select {
+					case errMsg, errOpen := <-errs:
+						if errOpen {
+							errWrite := forwardStreamError(errMsg)
+							return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), errMsg, errWrite
+						}
+						errs = nil
+					default:
+					}
+				}
 				if !completed {
 					errMsg := &interfaces.ErrorMessage{
 						StatusCode: http.StatusRequestTimeout,

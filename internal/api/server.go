@@ -1373,15 +1373,11 @@ func (s *Server) scopedModelsForRequest(c *gin.Context, handlerType string) scop
 	if !restricted {
 		return scopedModelsSnapshot{}
 	}
-	reg := registry.GetGlobalRegistry()
-	models, expiresAt, version := reg.GetAvailableModelsForClientCacheSnapshot(handlerType, clientCacheKey, clientIDs)
 	return scopedModelsSnapshot{
-		models:          models,
-		handlerType:     handlerType,
-		clientCacheKey:  clientCacheKey,
-		registryVersion: version,
-		expiresAt:       expiresAt,
-		scoped:          true,
+		handlerType:    handlerType,
+		clientCacheKey: clientCacheKey,
+		clientIDs:      clientIDs,
+		scoped:         true,
 	}
 }
 

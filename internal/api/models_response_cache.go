@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
 )
 
@@ -18,30 +19,35 @@ const (
 	scopedModelsResponseClaude      scopedModelsResponseKind = "claude"
 	scopedModelsResponseGemini      scopedModelsResponseKind = "gemini"
 	scopedModelsResponseCodexClient scopedModelsResponseKind = "codex-client"
+	maxModelsResponseCacheEntries                            = 512
 )
 
 type scopedModelsSnapshot struct {
-	models          []map[string]any
-	handlerType     string
-	clientCacheKey  string
-	registryVersion uint64
-	expiresAt       time.Time
-	scoped          bool
+	handlerType    string
+	clientCacheKey string
+	clientIDs      []string
+	scoped         bool
 }
 
 type modelsResponseCacheEntry struct {
 	body            []byte
 	registryVersion uint64
 	expiresAt       time.Time
+	storedAt        time.Time
 }
 
 type modelsResponseCache struct {
-	mu      sync.RWMutex
-	entries map[string]modelsResponseCacheEntry
+	mu            sync.RWMutex
+	entries       map[string]modelsResponseCacheEntry
+	latestVersion uint64
+	maxEntries    int
 }
 
 func newModelsResponseCache() *modelsResponseCache {
-	return &modelsResponseCache{entries: make(map[string]modelsResponseCacheEntry)}
+	return &modelsResponseCache{
+		entries:    make(map[string]modelsResponseCacheEntry),
+		maxEntries: maxModelsResponseCacheEntries,
+	}
 }
 
 func scopedModelsResponseCacheKey(handlerType, clientCacheKey string, kind scopedModelsResponseKind) string {
@@ -64,9 +70,19 @@ func (c *modelsResponseCache) Get(key string, registryVersion uint64, now time.T
 		return nil, false
 	}
 	if !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt) {
+		c.deleteExpired(key, now)
 		return nil, false
 	}
 	return entry.body, true
+}
+
+func (c *modelsResponseCache) deleteExpired(key string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if ok && !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt) {
+		delete(c.entries, key)
+	}
 }
 
 func (c *modelsResponseCache) Set(key string, registryVersion uint64, expiresAt time.Time, body []byte) {
@@ -75,10 +91,41 @@ func (c *modelsResponseCache) Set(key string, registryVersion uint64, expiresAt 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if registryVersion < c.latestVersion {
+		return
+	}
+	if registryVersion > c.latestVersion {
+		clear(c.entries)
+		c.latestVersion = registryVersion
+	}
+	now := time.Now()
+	for existingKey, entry := range c.entries {
+		if !entry.expiresAt.IsZero() && !now.Before(entry.expiresAt) {
+			delete(c.entries, existingKey)
+		}
+	}
+	if _, exists := c.entries[key]; !exists && c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+		c.evictOldestLocked()
+	}
 	c.entries[key] = modelsResponseCacheEntry{
 		body:            append([]byte(nil), body...),
 		registryVersion: registryVersion,
 		expiresAt:       expiresAt,
+		storedAt:        now,
+	}
+}
+
+func (c *modelsResponseCache) evictOldestLocked() {
+	oldestKey := ""
+	var oldestAt time.Time
+	for key, entry := range c.entries {
+		if oldestKey == "" || entry.storedAt.Before(oldestAt) {
+			oldestKey = key
+			oldestAt = entry.storedAt
+		}
+	}
+	if oldestKey != "" {
+		delete(c.entries, oldestKey)
 	}
 }
 
@@ -89,20 +136,23 @@ func (s *Server) writeScopedModelsResponse(c *gin.Context, snapshot scopedModels
 
 	key := scopedModelsResponseCacheKey(snapshot.handlerType, snapshot.clientCacheKey, kind)
 	now := time.Now()
+	reg := registry.GetGlobalRegistry()
+	registryVersion := reg.CacheVersion()
 	if s != nil && s.modelsResponseCache != nil {
-		if body, ok := s.modelsResponseCache.Get(key, snapshot.registryVersion, now); ok {
+		if body, ok := s.modelsResponseCache.Get(key, registryVersion, now); ok {
 			writeModelsJSONBody(c, body)
 			return
 		}
 	}
 
-	body, err := marshalScopedModelsResponse(kind, snapshot.models)
+	models, expiresAt, registryVersion := reg.GetAvailableModelsForClientCacheSnapshot(snapshot.handlerType, snapshot.clientCacheKey, snapshot.clientIDs)
+	body, err := marshalScopedModelsResponse(kind, models)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to encode models response"})
 		return
 	}
 	if s != nil && s.modelsResponseCache != nil {
-		s.modelsResponseCache.Set(key, snapshot.registryVersion, snapshot.expiresAt, body)
+		s.modelsResponseCache.Set(key, registryVersion, expiresAt, body)
 	}
 	writeModelsJSONBody(c, body)
 }

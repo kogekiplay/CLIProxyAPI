@@ -473,7 +473,7 @@ func (s *SQLiteStore) Summary(ctx context.Context, filter SummaryFilter) (Summar
 	if err != nil {
 		return Summary{}, err
 	}
-	applySummaryRows(&summary, rows, prices)
+	applySummaryRows(&summary, rows, compileModelPriceIndex(prices))
 	return summary, nil
 }
 
@@ -585,7 +585,7 @@ func buildSummaryWhere(filter SummaryFilter, timeColumn string, rollup bool) (st
 	return "WHERE " + strings.Join(clauses, " AND "), args
 }
 
-func applySummaryRows(summary *Summary, rows []aggregateRow, prices []ModelPrice) {
+func applySummaryRows(summary *Summary, rows []aggregateRow, prices modelPriceIndex) {
 	if summary == nil {
 		return
 	}
@@ -608,7 +608,7 @@ func applySummaryRows(summary *Summary, rows []aggregateRow, prices []ModelPrice
 			FailedCount:  row.failures,
 			Tokens:       tokens,
 		}
-		if cost, ok, missing := CostForUsage(row.model, tokens, prices); ok {
+		if cost, ok, missing := costForUsageWithPriceIndex(row.model, tokens, prices); ok {
 			modelSummary.EstimatedCostUSD = floatPtr(cost)
 			totalCost += cost
 			anyPriced = true

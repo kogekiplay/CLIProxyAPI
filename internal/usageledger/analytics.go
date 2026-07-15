@@ -79,17 +79,18 @@ func (s *SQLiteStore) Analytics(ctx context.Context, req AnalyticsRequest) (Anal
 	if err != nil {
 		return AnalyticsResponse{}, err
 	}
+	priceIndex := compileModelPriceIndex(prices)
 	modelAliases := compileModelAliasIndex(req.ModelAliases)
 	resp := AnalyticsResponse{GeneratedAtMS: time.Now().UnixMilli()}
 	if canUseAnalyticsEventsFastPath(req) {
-		resp.Events, err = s.analyticsEventsPageWithModelAliasIndex(ctx, req, prices, modelAliases)
+		resp.Events, err = s.analyticsEventsPageWithModelAliasIndex(ctx, req, priceIndex, modelAliases)
 		if err != nil {
 			return AnalyticsResponse{}, err
 		}
 		return resp, nil
 	}
 
-	events, err := s.analyticsEventsWithModelAliasIndex(ctx, req, prices, modelAliases)
+	events, err := s.analyticsEventsWithModelAliasIndex(ctx, req, priceIndex, modelAliases)
 	if err != nil {
 		return AnalyticsResponse{}, err
 	}
@@ -126,15 +127,15 @@ func canUseAnalyticsEventsFastPath(req AnalyticsRequest) bool {
 }
 
 func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest, prices []ModelPrice) ([]analyticsEvent, error) {
-	return s.analyticsEventsWithModelAliasIndex(ctx, req, prices, compileModelAliasIndex(req.ModelAliases))
+	return s.analyticsEventsWithModelAliasIndex(ctx, req, compileModelPriceIndex(prices), compileModelAliasIndex(req.ModelAliases))
 }
 
-func (s *SQLiteStore) analyticsEventsWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices []ModelPrice, modelAliases modelAliasIndex) ([]analyticsEvent, error) {
+func (s *SQLiteStore) analyticsEventsWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices modelPriceIndex, modelAliases modelAliasIndex) ([]analyticsEvent, error) {
 	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
 	return s.queryAnalyticsEvents(ctx, analyticsEventsSelect+where+` ORDER BY ts_ns ASC, id ASC`, args, prices, modelAliases, cleanedAnalyticsValues(req.Filters.Models))
 }
 
-func (s *SQLiteStore) analyticsEventsPageWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices []ModelPrice, modelAliases modelAliasIndex) (*AnalyticsEventsResponse, error) {
+func (s *SQLiteStore) analyticsEventsPageWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices modelPriceIndex, modelAliases modelAliasIndex) (*AnalyticsEventsResponse, error) {
 	page := *req.Include.EventsPage
 	limit := normalizeAnalyticsEventsLimit(page.Limit)
 	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
@@ -160,7 +161,7 @@ func (s *SQLiteStore) analyticsEventsPageWithModelAliasIndex(ctx context.Context
 	return buildAnalyticsEventsPageFromDescending(events, limit, totalCount), nil
 }
 
-func (s *SQLiteStore) queryAnalyticsEvents(ctx context.Context, query string, args []any, prices []ModelPrice, modelAliases modelAliasIndex, requestedModels []string) ([]analyticsEvent, error) {
+func (s *SQLiteStore) queryAnalyticsEvents(ctx context.Context, query string, args []any, prices modelPriceIndex, modelAliases modelAliasIndex, requestedModels []string) ([]analyticsEvent, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -188,7 +189,7 @@ type analyticsRowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanAnalyticsEvent(scanner analyticsRowScanner, prices []ModelPrice, modelAliases modelAliasIndex) (analyticsEvent, error) {
+func scanAnalyticsEvent(scanner analyticsRowScanner, prices modelPriceIndex, modelAliases modelAliasIndex) (analyticsEvent, error) {
 	var item analyticsEvent
 	var failed int
 	if err := scanner.Scan(
@@ -231,7 +232,7 @@ func scanAnalyticsEvent(scanner analyticsRowScanner, prices []ModelPrice, modelA
 	item.event.Failed = item.failed
 	item.upstreamModel = strings.TrimSpace(item.event.Model)
 	item.event.Model = modelAliases.resolve(item.event)
-	if cost, ok, missing := CostForUsage(item.event.Model, item.tokens, prices); ok {
+	if cost, ok, missing := costForUsageWithPriceIndex(item.event.Model, item.tokens, prices); ok {
 		item.cost = cost
 		item.hasCost = true
 	} else if len(missing) > 0 {

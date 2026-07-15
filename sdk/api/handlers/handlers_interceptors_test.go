@@ -727,6 +727,56 @@ func TestHandlerStreamInterceptorInitializesHeadersBeforeReturn(t *testing.T) {
 	}
 }
 
+func TestHandlerStreamHeadersRemainImmutableAfterReturn(t *testing.T) {
+	model := "handler-interceptor-stream-immutable-headers-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 2)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("first")}
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("second")}
+			close(chunks)
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{PassthroughHeaders: true})
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			headers := cloneHeader(req.ResponseHeaders)
+			if req.ChunkIndex >= 0 {
+				headers.Set("X-Chunk", fmt.Sprintf("%d", req.ChunkIndex))
+			}
+			return pluginapi.StreamChunkInterceptResponse{Headers: headers, Body: cloneBytes(req.Body)}
+		},
+	})
+
+	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(),
+		"openai",
+		model,
+		[]byte(fmt.Sprintf(`{"model":%q}`, model)),
+		"",
+	)
+	if got := upstreamHeaders.Get("X-Chunk"); got != "0" {
+		t.Fatalf("upstream header at return = %q, want first chunk header", got)
+	}
+	for range dataChan {
+		if got := upstreamHeaders.Get("X-Chunk"); got != "0" {
+			t.Fatalf("upstream header changed while streaming = %q, want 0", got)
+		}
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if got := upstreamHeaders.Get("X-Chunk"); got != "0" {
+		t.Fatalf("upstream header after stream = %q, want immutable first chunk header", got)
+	}
+}
+
 func TestHandlerStreamSkipsInterceptorsWhenHostReportsNoStreamInterceptors(t *testing.T) {
 	model := "handler-interceptor-no-stream-capability-model"
 	executor := &interceptorCaptureExecutor{
