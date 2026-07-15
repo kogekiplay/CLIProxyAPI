@@ -46,6 +46,61 @@ func TestPluginNormalizesUsageRecord(t *testing.T) {
 	}
 }
 
+func TestPluginStoresCacheUsageBuckets(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	now := time.Date(2026, 7, 15, 10, 0, 0, 0, time.UTC)
+	plugin := NewPlugin(store, func() time.Time { return now })
+	plugin.HandleUsage(context.Background(), coreusage.Record{
+		Provider:  "codex",
+		Model:     "gpt-5.6-sol",
+		AuthIndex: "auth-cache",
+		Detail: coreusage.Detail{
+			InputTokens:         100,
+			OutputTokens:        20,
+			CachedTokens:        30,
+			CacheReadTokens:     30,
+			CacheCreationTokens: 12,
+			TotalTokens:         120,
+		},
+	})
+
+	window := Window{Start: now.Add(-time.Minute), End: now.Add(time.Minute)}
+	summary, err := store.Summary(context.Background(), SummaryFilter{
+		Provider:  "codex",
+		AuthIndex: "auth-cache",
+		Window:    window,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := summary.Tokens; got.CachedTokens != 30 || got.CacheReadTokens != 30 || got.CacheCreationTokens != 12 {
+		t.Fatalf("summary cache tokens = %#v", got)
+	}
+
+	result, err := store.Analytics(context.Background(), AnalyticsRequest{
+		FromMS: window.Start.UnixMilli(),
+		ToMS:   window.End.UnixMilli(),
+		Include: AnalyticsInclude{
+			Summary:    true,
+			EventsPage: &AnalyticsEventsPage{Limit: 10},
+		},
+	})
+	if err != nil {
+		t.Fatalf("analytics: %v", err)
+	}
+	if result.Summary == nil || result.Summary.CacheReadTokens != 30 || result.Summary.CacheCreationTokens != 12 {
+		t.Fatalf("analytics summary = %#v", result.Summary)
+	}
+	if result.Events == nil || len(result.Events.Items) != 1 {
+		t.Fatalf("analytics events = %#v", result.Events)
+	}
+	if got := result.Events.Items[0].Tokens; got.CachedTokens != 30 || got.CacheReadTokens != 30 || got.CacheCreationTokens != 12 {
+		t.Fatalf("analytics event cache tokens = %#v", got)
+	}
+}
+
 func TestPluginStoresOpenCodeAPIKeyHashAndAccountRef(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()
