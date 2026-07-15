@@ -600,6 +600,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 
 		var param any
+		receivedUpstreamPayload := false
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
@@ -613,6 +614,33 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 					_ = send(cliproxyexecutor.StreamChunk{Err: ctx.Err()})
+					return
+				}
+				if !receivedUpstreamPayload && isCodexWebsocketMessageTooBig(errRead) {
+					mappedErr := mapCodexWebsocketReadError(errRead)
+					helps.RecordAPIWebsocketError(ctx, e.cfg, "read_http_fallback", mappedErr)
+					log.Warnf("codex websockets executor: upstream rejected %d-byte message; falling back to HTTP streaming", len(wsReqBody))
+
+					fallback, fallbackErr := e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+					if fallbackErr != nil {
+						terminateReason = "http_fallback_error"
+						terminateErr = fallbackErr
+						_ = send(cliproxyexecutor.StreamChunk{Err: fallbackErr})
+						return
+					}
+
+					terminateReason = "http_fallback"
+					for chunk := range fallback.Chunks {
+						if chunk.Err != nil {
+							terminateReason = "http_fallback_error"
+							terminateErr = chunk.Err
+						}
+						if !send(chunk) {
+							terminateReason = "context_done"
+							terminateErr = ctx.Err()
+							return
+						}
+					}
 					return
 				}
 				mappedErr := mapCodexWebsocketReadError(errRead)
@@ -643,6 +671,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if len(payload) == 0 {
 				continue
 			}
+			receivedUpstreamPayload = true
 			reporter.MarkFirstResponseByte()
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
@@ -736,11 +765,15 @@ func mapCodexWebsocketReadError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var closeErr *websocket.CloseError
-	if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig {
+	if isCodexWebsocketMessageTooBig(err) {
 		return statusErr{code: http.StatusRequestEntityTooLarge, msg: `{"error":{"message":"upstream websocket message too big","type":"invalid_request_error","code":"message_too_big"}}`}
 	}
 	return err
+}
+
+func isCodexWebsocketMessageTooBig(err error) bool {
+	var closeErr *websocket.CloseError
+	return errors.As(err, &closeErr) && closeErr.Code == websocket.CloseMessageTooBig
 }
 
 func buildCodexWebsocketRequestBody(body []byte) []byte {

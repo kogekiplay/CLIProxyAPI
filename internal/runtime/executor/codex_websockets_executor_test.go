@@ -288,9 +288,20 @@ func TestCodexWebsocketsExecuteStreamPropagatesUpstreamErrorForDownstreamWebsock
 	}
 }
 
-func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
+func TestCodexWebsocketsExecuteStreamFallsBackToHTTPOnMessageTooBigClose(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var websocketCalls atomic.Int32
+	var httpCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			httpCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","item_id":"msg-1","delta":"fallback"}` + "\n\n"))
+			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp-http","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+			return
+		}
+
+		websocketCalls.Add(1)
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			t.Errorf("upgrade websocket: %v", err)
@@ -312,6 +323,84 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 	defer server.Close()
 
 	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	sessionID := t.Name()
+	exec.CloseExecutionSession(sessionID)
+	defer exec.CloseExecutionSession(sessionID)
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: sessionID,
+		},
+	}
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+
+	result, err := exec.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	var gotCompleted bool
+	for chunk := range result.Chunks {
+		if chunk.Err == nil {
+			payload := bytes.TrimSpace(chunk.Payload)
+			payload = bytes.TrimSpace(bytes.TrimPrefix(payload, []byte("data:")))
+			if gjson.GetBytes(payload, "type").String() == "response.completed" {
+				gotCompleted = true
+			}
+			continue
+		}
+		t.Fatalf("fallback stream error = %v", chunk.Err)
+	}
+	if !gotCompleted {
+		t.Fatal("HTTP fallback stream did not return response.completed")
+	}
+	if got := websocketCalls.Load(); got != 1 {
+		t.Fatalf("websocket calls = %d, want 1", got)
+	}
+	if got := httpCalls.Load(); got != 1 {
+		t.Fatalf("HTTP fallback calls = %d, want 1", got)
+	}
+}
+
+func TestCodexWebsocketsExecuteStreamDoesNotFallbackAfterUpstreamPayload(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var httpCalls atomic.Int32
+	delta := []byte(`{"type":"response.output_text.delta","item_id":"msg-1","delta":"partial"}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			httpCalls.Add(1)
+			http.Error(w, "unexpected HTTP fallback", http.StatusInternalServerError)
+			return
+		}
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			t.Errorf("read upstream websocket message: %v", errRead)
+			return
+		}
+		if errWrite := conn.WriteMessage(websocket.TextMessage, delta); errWrite != nil {
+			t.Errorf("write delta websocket message: %v", errWrite)
+			return
+		}
+		closeMessage := websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "message too big")
+		if errWrite := conn.WriteControl(websocket.CloseMessage, closeMessage, time.Now().Add(time.Second)); errWrite != nil {
+			t.Errorf("write close websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
@@ -321,32 +410,35 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 		SourceFormat:   sdktranslator.FromString("openai-response"),
 		ResponseFormat: sdktranslator.FromString("openai-response"),
 	}
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 
-	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	result, err := exec.ExecuteStream(ctx, auth, req, opts)
 	if err != nil {
 		t.Fatalf("ExecuteStream() error = %v", err)
 	}
 
-	select {
-	case chunk, ok := <-result.Chunks:
-		if !ok {
-			t.Fatal("stream closed before error chunk")
-		}
+	var gotDelta bool
+	var gotMessageTooBig bool
+	for chunk := range result.Chunks {
 		if chunk.Err == nil {
-			t.Fatal("error chunk Err = nil, want message-too-big error")
+			if bytes.Equal(bytes.TrimSpace(chunk.Payload), delta) {
+				gotDelta = true
+			}
+			continue
 		}
 		statusErr, ok := chunk.Err.(interface{ StatusCode() int })
-		if !ok {
-			t.Fatalf("error type %T does not expose StatusCode", chunk.Err)
+		if ok && statusErr.StatusCode() == http.StatusRequestEntityTooLarge {
+			gotMessageTooBig = true
 		}
-		if got := statusErr.StatusCode(); got != http.StatusRequestEntityTooLarge {
-			t.Fatalf("status = %d, want %d", got, http.StatusRequestEntityTooLarge)
-		}
-		if got := gjson.Get(chunk.Err.Error(), "error.code").String(); got != "message_too_big" {
-			t.Fatalf("error code = %q, want message_too_big; err=%v", got, chunk.Err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for error stream chunk")
+	}
+	if !gotDelta {
+		t.Fatal("upstream delta was not forwarded before close")
+	}
+	if !gotMessageTooBig {
+		t.Fatal("message-too-big close was not preserved after an upstream payload")
+	}
+	if got := httpCalls.Load(); got != 0 {
+		t.Fatalf("HTTP fallback calls = %d, want 0", got)
 	}
 }
 
