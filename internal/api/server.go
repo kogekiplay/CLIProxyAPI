@@ -69,8 +69,9 @@ var corsExposedResponseHeaders = []string{
 var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, ", ")
 
 const (
-	exampleAPIKeyManagementPath = "/management.html"
-	exampleAPIKeyManagementURL  = "/management.html?safe-mode=configure"
+	managementControlPanelPath       = "/manage"
+	legacyManagementControlPanelPath = "/management.html"
+	exampleAPIKeyManagementURL       = managementControlPanelPath + "?safe-mode=configure"
 )
 
 type serverOptionConfig struct {
@@ -456,7 +457,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" || strings.HasPrefix(path, "/management-assets/") {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == managementControlPanelPath || path == legacyManagementControlPanelPath || strings.HasPrefix(path, "/management-assets/") {
 				c.Next()
 				return
 			}
@@ -482,11 +483,11 @@ func (s *Server) exampleAPIKeySafeModeMiddleware() gin.HandlerFunc {
 		}
 
 		path := c.Request.URL.Path
-		if path == exampleAPIKeyManagementPath && c.Query("safe-mode") == "configure" {
+		if path == managementControlPanelPath && c.Query("safe-mode") == "configure" {
 			c.Next()
 			return
 		}
-		if (path == "/" || path == exampleAPIKeyManagementPath) && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) {
+		if (path == "/" || path == managementControlPanelPath) && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) {
 			s.serveExampleAPIKeyWarningPage(c)
 			return
 		}
@@ -498,7 +499,7 @@ func (s *Server) exampleAPIKeySafeModeMiddleware() gin.HandlerFunc {
 		c.Header("X-CPA-SAFE-MODE", "example-api-key")
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 			"error":   "unsafe_example_api_key",
-			"message": "Proxy API endpoints are disabled because api-keys contains template values. Open /management.html?safe-mode=configure, update api-keys in Management, then retry.",
+			"message": "Proxy API endpoints are disabled because api-keys contains template values. Open /manage?safe-mode=configure, update api-keys in Management, then retry.",
 		})
 	}
 }
@@ -549,7 +550,10 @@ func (s *Server) setupRoutes() {
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
 
-	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET(managementControlPanelPath, s.serveManagementControlPanel)
+	s.engine.HEAD(managementControlPanelPath, s.serveManagementControlPanel)
+	s.engine.GET(legacyManagementControlPanelPath, s.redirectLegacyManagementControlPanel)
+	s.engine.HEAD(legacyManagementControlPanelPath, s.redirectLegacyManagementControlPanel)
 	s.engine.GET("/management-assets/*filepath", s.serveManagementAsset)
 	s.engine.HEAD("/management-assets/*filepath", s.serveManagementAsset)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
@@ -1145,6 +1149,20 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	s.serveStaticPanel(c, managementasset.ManagementFileName)
+}
+
+func (s *Server) redirectLegacyManagementControlPanel(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	target := managementControlPanelPath
+	if query := strings.TrimSpace(c.Request.URL.RawQuery); query != "" {
+		target += "?" + query
+	}
+	c.Redirect(http.StatusPermanentRedirect, target)
 }
 
 func (s *Server) serveManagementAsset(c *gin.Context) {

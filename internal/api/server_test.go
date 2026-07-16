@@ -793,7 +793,7 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 	})
 
 	t.Run("management control panel returns 404", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+		req := httptest.NewRequest(http.MethodGet, "/manage", nil)
 		rr := httptest.NewRecorder()
 		server.engine.ServeHTTP(rr, req)
 		if rr.Code != http.StatusNotFound {
@@ -841,7 +841,7 @@ func TestManagementAssetsUseImmutableCaching(t *testing.T) {
 	}
 }
 
-func TestManagementHTMLUsesRevalidationCaching(t *testing.T) {
+func TestManagementRouteUsesRevalidationCaching(t *testing.T) {
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
 	if err := os.WriteFile(filepath.Join(staticDir, managementasset.ManagementFileName), []byte("<html>management app</html>"), 0o600); err != nil {
@@ -849,14 +849,34 @@ func TestManagementHTMLUsesRevalidationCaching(t *testing.T) {
 	}
 
 	server := newTestServer(t)
-	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/manage", nil)
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+			}
+			if got := rr.Header().Get("Cache-Control"); got != "no-cache" {
+				t.Fatalf("Cache-Control = %q, want no-cache", got)
+			}
+			if method == http.MethodHead && rr.Body.Len() != 0 {
+				t.Fatalf("HEAD body length = %d, want 0", rr.Body.Len())
+			}
+		})
+	}
+}
+
+func TestLegacyManagementRouteRedirectsToManage(t *testing.T) {
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/management.html?safe-mode=configure", nil)
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	if rr.Code != http.StatusPermanentRedirect {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusPermanentRedirect, rr.Body.String())
 	}
-	if got := rr.Header().Get("Cache-Control"); got != "no-cache" {
-		t.Fatalf("Cache-Control = %q, want no-cache", got)
+	if got := rr.Header().Get("Location"); got != "/manage?safe-mode=configure" {
+		t.Fatalf("Location = %q, want %q", got, "/manage?safe-mode=configure")
 	}
 }
 
@@ -881,27 +901,27 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
 		}
 		body := rr.Body.String()
-		for _, want := range []string{"Example API key detected", "Open Management", `href="/management.html?safe-mode=configure"`} {
+		for _, want := range []string{"Example API key detected", "Open Management", `href="/manage?safe-mode=configure"`} {
 			if !strings.Contains(body, want) {
 				t.Fatalf("warning page missing %q: %s", want, body)
 			}
 		}
 	})
 
-	t.Run("management html defaults to warning page", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	t.Run("manage defaults to warning page", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/manage", nil)
 		rr := httptest.NewRecorder()
 		server.engine.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
 		}
 		if !strings.Contains(rr.Body.String(), "Example API key detected") {
-			t.Fatalf("management.html did not show warning page: %s", rr.Body.String())
+			t.Fatalf("manage did not show warning page: %s", rr.Body.String())
 		}
 	})
 
-	t.Run("management html head stops at warning page", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodHead, "/management.html", nil)
+	t.Run("manage head stops at warning page", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodHead, "/manage", nil)
 		rr := httptest.NewRecorder()
 		server.engine.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
@@ -916,7 +936,7 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 	})
 
 	t.Run("management button query opens control panel", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/management.html?safe-mode=configure", nil)
+		req := httptest.NewRequest(http.MethodGet, "/manage?safe-mode=configure", nil)
 		rr := httptest.NewRecorder()
 		server.engine.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
@@ -943,7 +963,7 @@ func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {
 		if strings.Contains(rr.Body.String(), "management_url") {
 			t.Fatalf("body should not include management_url field: %s", rr.Body.String())
 		}
-		if !strings.Contains(rr.Body.String(), "/management.html?safe-mode=configure") {
+		if !strings.Contains(rr.Body.String(), "/manage?safe-mode=configure") {
 			t.Fatalf("body missing management link in message: %s", rr.Body.String())
 		}
 	})
