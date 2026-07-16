@@ -423,15 +423,9 @@ func decodeCapturedRequestBody(raw []byte, encoding string) ([]byte, error) {
 }
 
 func decodeCapturedZstdRequestBody(raw []byte) ([]byte, error) {
-	decoder, errNewReader := zstd.NewReader(bytes.NewReader(raw))
-	if errNewReader != nil {
-		return nil, fmt.Errorf("failed to create zstd request decoder: %w", errNewReader)
-	}
-	defer decoder.Close()
-
-	decoded, errRead := io.ReadAll(decoder)
-	if errRead != nil {
-		return nil, fmt.Errorf("failed to decode zstd request body: %w", errRead)
+	decoded, errDecode := util.DecodeZstd(raw)
+	if errDecode != nil {
+		return nil, fmt.Errorf("failed to decode zstd request body: %w", errDecode)
 	}
 	return decoded, nil
 }

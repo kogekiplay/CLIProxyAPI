@@ -1653,9 +1653,16 @@ func sortedStringSet(values map[string]struct{}) []string {
 
 func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 	payloads := make([][]byte, 0, 2)
-	lines := bytes.Split(chunk, []byte("\n"))
-	for i := range lines {
-		line := bytes.TrimSpace(lines[i])
+	remaining := chunk
+	for len(remaining) > 0 {
+		line := remaining
+		if lineEnd := bytes.IndexByte(remaining, '\n'); lineEnd >= 0 {
+			line = remaining[:lineEnd]
+			remaining = remaining[lineEnd+1:]
+		} else {
+			remaining = nil
+		}
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 || bytes.HasPrefix(line, []byte("event:")) {
 			continue
 		}
@@ -1665,7 +1672,7 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 		if len(line) == 0 || bytes.Equal(line, []byte(wsDoneMarker)) {
 			continue
 		}
-		if json.Valid(line) {
+		if gjson.ValidBytes(line) {
 			payloads = append(payloads, bytes.Clone(line))
 		}
 	}
@@ -1678,7 +1685,7 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 	if bytes.HasPrefix(trimmed, []byte("data:")) {
 		trimmed = bytes.TrimSpace(trimmed[len("data:"):])
 	}
-	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte(wsDoneMarker)) && json.Valid(trimmed) {
+	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte(wsDoneMarker)) && gjson.ValidBytes(trimmed) {
 		payloads = append(payloads, bytes.Clone(trimmed))
 	}
 	return payloads

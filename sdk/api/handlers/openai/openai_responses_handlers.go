@@ -9,7 +9,6 @@ package openai
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,14 +57,18 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		f.pending = append(f.pending, '\n')
 	}
 	f.pending = append(f.pending, chunk...)
+	consumed := 0
 	for {
-		frameLen := responsesSSEFrameLen(f.pending)
+		frameLen := responsesSSEFrameLen(f.pending[consumed:])
 		if frameLen == 0 {
 			break
 		}
-		f.writeFrame(w, f.pending[:frameLen])
-		copy(f.pending, f.pending[frameLen:])
-		f.pending = f.pending[:len(f.pending)-frameLen]
+		f.writeFrame(w, f.pending[consumed:consumed+frameLen])
+		consumed += frameLen
+	}
+	if consumed > 0 {
+		remaining := copy(f.pending, f.pending[consumed:])
+		f.pending = f.pending[:remaining]
 	}
 	if len(bytes.TrimSpace(f.pending)) == 0 {
 		f.pending = f.pending[:0]
@@ -107,7 +110,7 @@ func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
 
 func (f *responsesSSEFramer) repairFrame(frame []byte) [][]byte {
 	payload, ok := responsesSSEDataPayload(frame)
-	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
+	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
 		return nil
 	}
 	if f.repairer == nil {
@@ -134,28 +137,53 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) [][]byte {
 }
 
 func responsesSSEDataPayload(frame []byte) ([]byte, bool) {
+	var firstData []byte
 	var payload []byte
 	found := false
-	for _, line := range bytes.Split(frame, []byte("\n")) {
-		line = bytes.TrimRight(line, "\r")
+	remaining := frame
+	for len(remaining) > 0 {
+		line := remaining
+		if lineEnd := bytes.IndexByte(remaining, '\n'); lineEnd >= 0 {
+			line = remaining[:lineEnd]
+			remaining = remaining[lineEnd+1:]
+		} else {
+			remaining = nil
+		}
 		trimmed := bytes.TrimSpace(line)
 		if !bytes.HasPrefix(trimmed, []byte("data:")) {
 			continue
 		}
 		data := bytes.TrimSpace(trimmed[len("data:"):])
-		if found {
-			payload = append(payload, '\n')
+		if !found {
+			firstData = data
+			found = true
+			continue
 		}
+		if payload == nil {
+			payload = make([]byte, 0, len(firstData)+1+len(data))
+			payload = append(payload, firstData...)
+		}
+		payload = append(payload, '\n')
 		payload = append(payload, data...)
-		found = true
+	}
+	if payload == nil {
+		return firstData, found
 	}
 	return payload, found
 }
 
 func responsesSSEFrameWithData(frame, payload []byte) []byte {
 	var out bytes.Buffer
-	for _, line := range bytes.Split(frame, []byte("\n")) {
-		line = bytes.TrimRight(line, "\r")
+	remaining := frame
+	for len(remaining) > 0 {
+		line := remaining
+		if lineEnd := bytes.IndexByte(remaining, '\n'); lineEnd >= 0 {
+			line = remaining[:lineEnd]
+			remaining = remaining[lineEnd+1:]
+		} else {
+			remaining = nil
+		}
+		line = bytes.TrimSuffix(line, []byte("\r"))
 		trimmed := bytes.TrimSpace(line)
 		if len(trimmed) == 0 || bytes.HasPrefix(trimmed, []byte("data:")) {
 			continue
@@ -163,10 +191,21 @@ func responsesSSEFrameWithData(frame, payload []byte) []byte {
 		out.Write(line)
 		out.WriteByte('\n')
 	}
-	for _, line := range bytes.Split(payload, []byte("\n")) {
+	remaining = payload
+	for {
+		line := remaining
+		if lineEnd := bytes.IndexByte(remaining, '\n'); lineEnd >= 0 {
+			line = remaining[:lineEnd]
+			remaining = remaining[lineEnd+1:]
+		} else {
+			remaining = nil
+		}
 		out.WriteString("data: ")
 		out.Write(line)
 		out.WriteByte('\n')
+		if remaining == nil {
+			break
+		}
 	}
 	out.WriteByte('\n')
 	return out.Bytes()
@@ -245,7 +284,7 @@ func responsesSSEDataLinesValid(chunk []byte) bool {
 		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 			continue
 		}
-		if !json.Valid(data) {
+		if !gjson.ValidBytes(data) {
 			return false
 		}
 	}

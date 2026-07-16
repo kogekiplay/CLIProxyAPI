@@ -1,14 +1,12 @@
 package handlers
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/klauspost/compress/zstd"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 // ReadRequestBody reads the incoming request body and decodes supported
@@ -59,13 +57,7 @@ func decodeRequestBody(raw []byte, encoding string) ([]byte, error) {
 }
 
 func decodeZstdRequestBody(raw []byte) ([]byte, error) {
-	decoder, err := zstd.NewReader(bytes.NewReader(raw))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create zstd request decoder: %w", err)
-	}
-	defer decoder.Close()
-
-	decoded, err := io.ReadAll(decoder)
+	decoded, err := util.DecodeZstd(raw)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode zstd request body: %w", err)
 	}

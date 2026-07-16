@@ -43,6 +43,7 @@ type ResponseWriterWrapper struct {
 	requestInfo         *RequestInfo               // requestInfo holds the details of the original request.
 	statusCode          int                        // statusCode stores the HTTP status code of the response.
 	headers             map[string][]string        // headers stores the response headers.
+	headersCaptured     bool                       // headersCaptured records whether the committed response headers were copied.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
 	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
 }
@@ -60,10 +61,8 @@ type ResponseWriterWrapper struct {
 func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger, requestInfo *RequestInfo) *ResponseWriterWrapper {
 	return &ResponseWriterWrapper{
 		ResponseWriter: w,
-		body:           &bytes.Buffer{},
 		logger:         logger,
 		requestInfo:    requestInfo,
-		headers:        make(map[string][]string),
 	}
 }
 
@@ -73,9 +72,9 @@ func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger
 // CRITICAL: This method prioritizes writing to the client to ensure zero latency,
 // handling logging operations subsequently.
 func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
-	// Ensure headers are captured before first write
-	// This is critical because Write() may trigger WriteHeader() internally
-	w.ensureHeadersCaptured()
+	if w.shouldCaptureResponse() {
+		w.ensureHeadersCaptured()
+	}
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.Write(data)
@@ -95,6 +94,7 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 	}
 
 	if w.shouldBufferResponseBody() {
+		w.ensureBodyBuffer()
 		w.body.Write(data)
 	}
 
@@ -119,11 +119,33 @@ func (w *ResponseWriterWrapper) shouldBufferResponseBody() bool {
 	return status >= http.StatusBadRequest
 }
 
+func (w *ResponseWriterWrapper) shouldCaptureResponse() bool {
+	if w.logger != nil && w.logger.IsEnabled() {
+		return true
+	}
+	if !w.logOnErrorOnly {
+		return false
+	}
+	status := w.statusCode
+	if status == 0 {
+		status = w.ResponseWriter.Status()
+	}
+	return status >= http.StatusBadRequest
+}
+
+func (w *ResponseWriterWrapper) ensureBodyBuffer() {
+	if w.body == nil {
+		w.body = &bytes.Buffer{}
+	}
+}
+
 // WriteString wraps the underlying ResponseWriter's WriteString method to capture response data.
 // Some handlers (and fmt/io helpers) write via io.StringWriter; without this override, those writes
 // bypass Write() and would be missing from request logs.
 func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
-	w.ensureHeadersCaptured()
+	if w.shouldCaptureResponse() {
+		w.ensureHeadersCaptured()
+	}
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.WriteString(data)
@@ -142,6 +164,7 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 	}
 
 	if w.shouldBufferResponseBody() {
+		w.ensureBodyBuffer()
 		w.body.WriteString(data)
 	}
 	return n, err
@@ -153,15 +176,16 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 
-	// Capture response headers using the new method
-	w.captureCurrentHeaders()
+	if w.shouldCaptureResponse() {
+		w.ensureHeadersCaptured()
+	}
 
 	// Detect streaming based on Content-Type
 	contentType := w.ResponseWriter.Header().Get("Content-Type")
 	w.isStreaming = w.detectStreaming(contentType)
 
 	// If streaming, initialize streaming log writer
-	if w.isStreaming && w.logger.IsEnabled() {
+	if w.isStreaming && w.logger != nil && w.logger.IsEnabled() {
 		streamWriter, err := w.logger.LogStreamingRequest(
 			w.requestInfo.URL,
 			w.requestInfo.Method,
@@ -187,29 +211,28 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
-// ensureHeadersCaptured is a helper function to make sure response headers are captured.
-// It is safe to call this method multiple times; it will always refresh the headers
-// with the latest state from the underlying ResponseWriter.
+// ensureHeadersCaptured snapshots response headers before the response is committed.
 func (w *ResponseWriterWrapper) ensureHeadersCaptured() {
-	// Always capture the current headers to ensure we have the latest state
+	if w.headersCaptured {
+		return
+	}
 	w.captureCurrentHeaders()
 }
 
 // captureCurrentHeaders reads all headers from the underlying ResponseWriter and stores them
 // in the wrapper's headers map. It creates copies of the header values to prevent race conditions.
 func (w *ResponseWriterWrapper) captureCurrentHeaders() {
-	// Initialize headers map if needed
-	if w.headers == nil {
-		w.headers = make(map[string][]string)
-	}
+	headers := w.ResponseWriter.Header()
+	w.headers = make(map[string][]string, len(headers))
 
 	// Capture all current headers from the underlying ResponseWriter
-	for key, values := range w.ResponseWriter.Header() {
+	for key, values := range headers {
 		// Make a copy of the values slice to avoid reference issues
 		headerValues := make([]string, len(values))
 		copy(headerValues, values)
 		w.headers[key] = headerValues
 	}
+	w.headersCaptured = true
 }
 
 // detectStreaming determines if a response should be treated as a streaming response.

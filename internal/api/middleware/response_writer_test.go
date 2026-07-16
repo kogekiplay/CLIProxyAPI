@@ -1,7 +1,11 @@
 package middleware
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -121,6 +125,80 @@ func TestExtractWebsocketTimelineUsesOverride(t *testing.T) {
 	}
 }
 
+func TestResponseWriterSkipsCaptureForSuccessfulResponseWhenLoggingDisabled(t *testing.T) {
+	underlying := newBenchmarkGinWriter()
+	wrapper := NewResponseWriterWrapper(underlying, &testRequestLogger{}, &RequestInfo{})
+	wrapper.logOnErrorOnly = true
+	underlying.Header().Set("Content-Type", "text/event-stream")
+
+	wrapper.WriteHeader(http.StatusOK)
+	if _, err := wrapper.Write([]byte("data: ok\n\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if wrapper.body != nil {
+		t.Fatal("successful response allocated a body capture while logging was disabled")
+	}
+	if wrapper.headers != nil || wrapper.headersCaptured {
+		t.Fatal("successful response captured headers while logging was disabled")
+	}
+}
+
+func TestResponseWriterCapturesErrorResponseWhenLoggingDisabled(t *testing.T) {
+	underlying := newBenchmarkGinWriter()
+	wrapper := NewResponseWriterWrapper(underlying, &testRequestLogger{}, &RequestInfo{})
+	wrapper.logOnErrorOnly = true
+	underlying.Header().Set("Content-Type", "application/json")
+
+	wrapper.WriteHeader(http.StatusBadRequest)
+	if _, err := wrapper.WriteString(`{"error":"bad request"}`); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+
+	if wrapper.body == nil || wrapper.body.String() != `{"error":"bad request"}` {
+		t.Fatalf("captured body = %q", wrapper.body)
+	}
+	if got := wrapper.headers["Content-Type"]; len(got) != 1 || got[0] != "application/json" {
+		t.Fatalf("captured Content-Type = %#v", got)
+	}
+}
+
+func TestResponseWriterCapturesHeadersOnceBeforeCommit(t *testing.T) {
+	underlying := newBenchmarkGinWriter()
+	wrapper := NewResponseWriterWrapper(underlying, &testRequestLogger{enabled: true}, &RequestInfo{})
+	underlying.Header().Set("X-Test", "before")
+
+	wrapper.WriteHeader(http.StatusOK)
+	underlying.Header().Set("X-Test", "after")
+	if _, err := wrapper.Write([]byte("ok")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if got := wrapper.headers["X-Test"]; len(got) != 1 || got[0] != "before" {
+		t.Fatalf("captured X-Test = %#v, want pre-commit value", got)
+	}
+}
+
+func BenchmarkResponseWriterDisabledStreaming(b *testing.B) {
+	underlying := newBenchmarkGinWriter()
+	underlying.Header().Set("Content-Type", "text/event-stream")
+	logger := &testRequestLogger{}
+	requestInfo := &RequestInfo{}
+	chunk := []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		underlying.reset()
+		wrapper := NewResponseWriterWrapper(underlying, logger, requestInfo)
+		wrapper.logOnErrorOnly = true
+		wrapper.WriteHeader(http.StatusOK)
+		for range 100 {
+			_, _ = wrapper.Write(chunk)
+		}
+	}
+}
+
 func TestFinalizeStreamingWritesAPIWebsocketTimeline(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -174,6 +252,65 @@ type testStreamingLogWriter struct {
 	apiWebsocketTimeline []byte
 	closed               bool
 }
+
+type benchmarkGinWriter struct {
+	header http.Header
+	status int
+	size   int
+}
+
+func newBenchmarkGinWriter() *benchmarkGinWriter {
+	return &benchmarkGinWriter{header: make(http.Header)}
+}
+
+func (w *benchmarkGinWriter) reset() {
+	w.status = 0
+	w.size = 0
+}
+
+func (w *benchmarkGinWriter) Header() http.Header { return w.header }
+
+func (w *benchmarkGinWriter) Write(data []byte) (int, error) {
+	w.WriteHeaderNow()
+	w.size += len(data)
+	return len(data), nil
+}
+
+func (w *benchmarkGinWriter) WriteString(data string) (int, error) {
+	w.WriteHeaderNow()
+	w.size += len(data)
+	return len(data), nil
+}
+
+func (w *benchmarkGinWriter) WriteHeader(statusCode int) {
+	if w.status == 0 {
+		w.status = statusCode
+	}
+}
+
+func (w *benchmarkGinWriter) WriteHeaderNow() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+}
+
+func (w *benchmarkGinWriter) Status() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func (w *benchmarkGinWriter) Size() int     { return w.size }
+func (w *benchmarkGinWriter) Written() bool { return w.status != 0 }
+func (w *benchmarkGinWriter) Flush()        { w.WriteHeaderNow() }
+func (w *benchmarkGinWriter) CloseNotify() <-chan bool {
+	return make(chan bool)
+}
+func (w *benchmarkGinWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, errors.New("hijack is not supported")
+}
+func (w *benchmarkGinWriter) Pusher() http.Pusher { return nil }
 
 func (w *testStreamingLogWriter) WriteChunkAsync([]byte) {}
 

@@ -182,6 +182,90 @@ func TestSQLiteStoreAnalyticsEventsOnlyPaginatesNewestFirst(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreAnalyticsEventsCanSkipTotalCount(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	base := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
+	for i, requestID := range []string{"req-old", "req-new"} {
+		if _, err := store.InsertEvent(context.Background(), Event{
+			RequestID: requestID,
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+			Provider:  "codex",
+			Model:     "gpt-5.6",
+		}); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+	}
+
+	includeTotalCount := false
+	result, err := store.Analytics(context.Background(), AnalyticsRequest{
+		FromMS: base.Add(-time.Minute).UnixMilli(),
+		ToMS:   base.Add(time.Minute).UnixMilli(),
+		Include: AnalyticsInclude{EventsPage: &AnalyticsEventsPage{
+			Limit:             1,
+			IncludeTotalCount: &includeTotalCount,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("analytics: %v", err)
+	}
+	if result.Events == nil || len(result.Events.Items) != 1 || !result.Events.HasMore {
+		t.Fatalf("events = %#v", result.Events)
+	}
+	if result.Events.TotalCount != 0 {
+		t.Fatalf("total count = %d, want omitted zero value", result.Events.TotalCount)
+	}
+}
+
+func TestSQLiteStoreAnalyticsModelFilteredEventsCanSkipTotalCount(t *testing.T) {
+	store := openTestStore(t)
+	defer store.Close()
+
+	const (
+		provider = "provider-a"
+		upstream = "shared-upstream"
+		aliasA   = "alias-a"
+		aliasB   = "alias-b"
+	)
+	base := time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
+	for _, event := range []Event{
+		{RequestID: "req-matching", Timestamp: base, Provider: provider, Model: upstream, AuthIndex: "auth-a"},
+		{RequestID: "req-newer-nonmatching", Timestamp: base.Add(time.Second), Provider: provider, Model: upstream, AuthIndex: "auth-b"},
+	} {
+		if _, err := store.InsertEvent(context.Background(), event); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+	}
+
+	includeTotalCount := false
+	result, err := store.Analytics(context.Background(), AnalyticsRequest{
+		FromMS:  base.Add(-time.Minute).UnixMilli(),
+		ToMS:    base.Add(time.Minute).UnixMilli(),
+		Filters: AnalyticsFilters{Models: []string{aliasA}},
+		ModelAliases: []ModelAliasRule{
+			{Provider: provider, AuthIndex: "auth-a", UpstreamModel: upstream, Alias: aliasA},
+			{Provider: provider, AuthIndex: "auth-b", UpstreamModel: upstream, Alias: aliasB},
+		},
+		Include: AnalyticsInclude{EventsPage: &AnalyticsEventsPage{
+			Limit:             1,
+			IncludeTotalCount: &includeTotalCount,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("analytics: %v", err)
+	}
+	if result.Events == nil || len(result.Events.Items) != 1 {
+		t.Fatalf("events = %#v", result.Events)
+	}
+	if result.Events.Items[0].RequestID != "req-matching" {
+		t.Fatalf("request id = %q, want req-matching", result.Events.Items[0].RequestID)
+	}
+	if result.Events.TotalCount != 0 {
+		t.Fatalf("total count = %d, want omitted zero value", result.Events.TotalCount)
+	}
+}
+
 func TestSQLiteStoreAnalyticsEventsReadsModelAlias(t *testing.T) {
 	store := openTestStore(t)
 	defer store.Close()

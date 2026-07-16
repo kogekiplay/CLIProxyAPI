@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
@@ -1575,13 +1574,7 @@ func (l *FileRequestLogger) decompressBrotli(data []byte) ([]byte, error) {
 //   - []byte: The decompressed data
 //   - error: An error if decompression fails, nil otherwise
 func (l *FileRequestLogger) decompressZstd(data []byte) ([]byte, error) {
-	decoder, err := zstd.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create zstd reader: %w", err)
-	}
-	defer decoder.Close()
-
-	decompressed, err := io.ReadAll(decoder)
+	decompressed, err := util.DecodeZstd(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress zstd data: %w", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,6 +17,11 @@ import (
 // SQLiteStore persists usage events, hourly/daily rollups, and model prices.
 type SQLiteStore struct {
 	db *sql.DB
+
+	modelPricesMu     sync.RWMutex
+	modelPricesLoaded bool
+	modelPrices       []ModelPrice
+	modelPriceIndex   modelPriceIndex
 }
 
 const (
@@ -563,11 +569,11 @@ func (s *SQLiteStore) Summary(ctx context.Context, filter SummaryFilter) (Summar
 		}
 		summary.Source = "rollup"
 	}
-	prices, err := s.ListModelPrices(ctx)
+	prices, err := s.compiledModelPriceIndex(ctx)
 	if err != nil {
 		return Summary{}, err
 	}
-	applySummaryRows(&summary, rows, compileModelPriceIndex(prices))
+	applySummaryRows(&summary, rows, prices)
 	return summary, nil
 }
 
@@ -778,6 +784,34 @@ func (s *SQLiteStore) ListModelPrices(ctx context.Context) ([]ModelPrice, error)
 	if s == nil || s.db == nil {
 		return nil, errors.New("usage ledger sqlite store is nil")
 	}
+	prices, _, err := s.loadModelPrices(ctx)
+	return prices, err
+}
+
+func (s *SQLiteStore) compiledModelPriceIndex(ctx context.Context) (modelPriceIndex, error) {
+	if s == nil || s.db == nil {
+		return modelPriceIndex{}, errors.New("usage ledger sqlite store is nil")
+	}
+	_, index, err := s.loadModelPrices(ctx)
+	return index, err
+}
+
+func (s *SQLiteStore) loadModelPrices(ctx context.Context) ([]ModelPrice, modelPriceIndex, error) {
+	s.modelPricesMu.RLock()
+	if s.modelPricesLoaded {
+		prices := append([]ModelPrice(nil), s.modelPrices...)
+		index := s.modelPriceIndex
+		s.modelPricesMu.RUnlock()
+		return prices, index, nil
+	}
+	s.modelPricesMu.RUnlock()
+
+	s.modelPricesMu.Lock()
+	defer s.modelPricesMu.Unlock()
+	if s.modelPricesLoaded {
+		return append([]ModelPrice(nil), s.modelPrices...), s.modelPriceIndex, nil
+	}
+
 	rows, err := s.db.QueryContext(ctx, `SELECT
 		model,
 		input_per_1m,
@@ -791,7 +825,7 @@ func (s *SQLiteStore) ListModelPrices(ctx context.Context) ([]ModelPrice, error)
 		FROM model_prices
 		ORDER BY model ASC`)
 	if err != nil {
-		return nil, err
+		return nil, modelPriceIndex{}, err
 	}
 	defer rows.Close()
 
@@ -809,14 +843,28 @@ func (s *SQLiteStore) ListModelPrices(ctx context.Context) ([]ModelPrice, error)
 			&price.SourceModelID,
 			&price.UpdatedAt,
 		); err != nil {
-			return nil, err
+			return nil, modelPriceIndex{}, err
 		}
 		prices = append(prices, price)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, modelPriceIndex{}, err
 	}
-	return prices, nil
+	s.modelPrices = append(s.modelPrices[:0], prices...)
+	s.modelPriceIndex = compileModelPriceIndex(s.modelPrices)
+	s.modelPricesLoaded = true
+	return append([]ModelPrice(nil), s.modelPrices...), s.modelPriceIndex, nil
+}
+
+func (s *SQLiteStore) invalidateModelPrices() {
+	if s == nil {
+		return
+	}
+	s.modelPricesMu.Lock()
+	s.modelPricesLoaded = false
+	s.modelPrices = nil
+	s.modelPriceIndex = modelPriceIndex{}
+	s.modelPricesMu.Unlock()
 }
 
 // UpsertModelPrice creates or replaces one model price.
@@ -839,6 +887,9 @@ func (s *SQLiteStore) UpsertModelPrice(ctx context.Context, price ModelPrice) er
 		price.SourceModelID,
 		price.UpdatedAt,
 	)
+	if err == nil {
+		s.invalidateModelPrices()
+	}
 	return err
 }
 
@@ -878,7 +929,11 @@ func (s *SQLiteStore) ReplaceModelPrices(ctx context.Context, prices []ModelPric
 			return err
 		}
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateModelPrices()
+	return nil
 }
 
 // DeleteModelPrice removes one configured model price.
@@ -891,6 +946,9 @@ func (s *SQLiteStore) DeleteModelPrice(ctx context.Context, model string) error 
 		return errors.New("model is required")
 	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM model_prices WHERE model = ?`, model)
+	if err == nil {
+		s.invalidateModelPrices()
+	}
 	return err
 }
 

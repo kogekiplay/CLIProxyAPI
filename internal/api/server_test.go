@@ -16,6 +16,7 @@ import (
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -799,6 +800,64 @@ func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
 			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
 		}
 	})
+
+	t.Run("management assets return 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/management-assets/v-test/app.js", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
+}
+
+func TestManagementAssetsUseImmutableCaching(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	assetPath := filepath.Join(staticDir, managementasset.ManagementAssetsDirName, "v-test", "app.js")
+	if err := os.MkdirAll(filepath.Dir(assetPath), 0o755); err != nil {
+		t.Fatalf("create management asset directory: %v", err)
+	}
+	if err := os.WriteFile(assetPath, []byte("console.log('ok')"), 0o600); err != nil {
+		t.Fatalf("write management asset: %v", err)
+	}
+
+	server := newTestServer(t)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/management-assets/v-test/app.js", nil)
+			rr := httptest.NewRecorder()
+			server.engine.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+			}
+			if got := rr.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+				t.Fatalf("Cache-Control = %q", got)
+			}
+			if method == http.MethodHead && rr.Body.Len() != 0 {
+				t.Fatalf("HEAD body length = %d, want 0", rr.Body.Len())
+			}
+		})
+	}
+}
+
+func TestManagementHTMLUsesRevalidationCaching(t *testing.T) {
+	staticDir := t.TempDir()
+	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	if err := os.WriteFile(filepath.Join(staticDir, managementasset.ManagementFileName), []byte("<html>management app</html>"), 0o600); err != nil {
+		t.Fatalf("write management page: %v", err)
+	}
+
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("Cache-Control = %q, want no-cache", got)
+	}
 }
 
 func TestExampleAPIKeySafeModeShowsWarningAndKeepsManagement(t *testing.T) {

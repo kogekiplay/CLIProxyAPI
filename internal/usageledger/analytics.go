@@ -109,16 +109,24 @@ func (s *SQLiteStore) Analytics(ctx context.Context, req AnalyticsRequest) (Anal
 		return resp, nil
 	}
 
-	prices, err := s.ListModelPrices(ctx)
+	priceIndex, err := s.compiledModelPriceIndex(ctx)
 	if err != nil {
 		return AnalyticsResponse{}, err
 	}
-	priceIndex := compileModelPriceIndex(prices)
 	modelAliases := compileModelAliasIndex(req.ModelAliases)
 
-	// Alias-aware model filters require post-resolution matching. Keep their
-	// strict full-event path so pagination and totals remain exact.
+	// Alias-aware model filters require post-resolution matching. Events-only
+	// callers that do not need an exact total can stream just enough matching
+	// rows for the requested page; aggregates and exact totals retain the
+	// strict full-event path.
 	if len(cleanedAnalyticsValues(req.Filters.Models)) > 0 {
+		if !hasAggregates && req.Include.EventsPage != nil && !analyticsEventsPageIncludesTotalCount(*req.Include.EventsPage) {
+			resp.Events, err = s.analyticsFilteredEventsPageWithoutTotalCount(ctx, req, priceIndex, modelAliases)
+			if err != nil {
+				return AnalyticsResponse{}, err
+			}
+			return resp, nil
+		}
 		events, queryErr := s.analyticsEventsWithModelAliasIndex(ctx, req, priceIndex, modelAliases)
 		if queryErr != nil {
 			return AnalyticsResponse{}, queryErr
@@ -172,8 +180,9 @@ func (s *SQLiteStore) scanAnalyticsAggregateEvents(ctx context.Context, req Anal
 	defer rows.Close()
 
 	requestedModels := cleanedAnalyticsValues(req.Filters.Models)
+	scanBuffer := newAnalyticsAggregateScanBuffer()
 	for rows.Next() {
-		item, scanErr := scanAnalyticsAggregateEvent(rows, prices, modelAliases)
+		item, scanErr := scanBuffer.scan(rows, prices, modelAliases)
 		if scanErr != nil {
 			return scanErr
 		}
@@ -191,8 +200,10 @@ func (s *SQLiteStore) analyticsEventsPageWithModelAliasIndex(ctx context.Context
 	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
 
 	var totalCount int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events `+where, args...).Scan(&totalCount); err != nil {
-		return nil, err
+	if analyticsEventsPageIncludesTotalCount(page) {
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events `+where, args...).Scan(&totalCount); err != nil {
+			return nil, err
+		}
 	}
 
 	pageWhere, pageArgs := addAnalyticsEventsPageCursor(where, append([]any(nil), args...), page)
@@ -211,6 +222,43 @@ func (s *SQLiteStore) analyticsEventsPageWithModelAliasIndex(ctx context.Context
 	return buildAnalyticsEventsPageFromDescending(events, limit, totalCount), nil
 }
 
+func (s *SQLiteStore) analyticsFilteredEventsPageWithoutTotalCount(ctx context.Context, req AnalyticsRequest, prices modelPriceIndex, modelAliases modelAliasIndex) (*AnalyticsEventsResponse, error) {
+	page := *req.Include.EventsPage
+	limit := normalizeAnalyticsEventsLimit(page.Limit)
+	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
+	where, args = addAnalyticsEventsPageCursor(where, args, page)
+	rows, err := s.db.QueryContext(ctx, analyticsEventsSelect+where+` ORDER BY ts_ns DESC, id DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	requestedModels := cleanedAnalyticsValues(req.Filters.Models)
+	events := make([]analyticsEvent, 0, limit+1)
+	scanBuffer := newAnalyticsEventScanBuffer()
+	for rows.Next() {
+		item, scanErr := scanBuffer.scan(rows, prices, modelAliases)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if !matchesAnalyticsModelFilter(requestedModels, item.event.Model, item.upstreamModel) {
+			continue
+		}
+		events = append(events, item)
+		if len(events) >= limit+1 {
+			break
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return buildAnalyticsEventsPageFromDescending(events, limit, 0), nil
+}
+
+func analyticsEventsPageIncludesTotalCount(page AnalyticsEventsPage) bool {
+	return page.IncludeTotalCount == nil || *page.IncludeTotalCount
+}
+
 func (s *SQLiteStore) queryAnalyticsEvents(ctx context.Context, query string, args []any, prices modelPriceIndex, modelAliases modelAliasIndex, requestedModels []string) ([]analyticsEvent, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -219,8 +267,9 @@ func (s *SQLiteStore) queryAnalyticsEvents(ctx context.Context, query string, ar
 	defer rows.Close()
 
 	out := make([]analyticsEvent, 0)
+	scanBuffer := newAnalyticsEventScanBuffer()
 	for rows.Next() {
-		item, err := scanAnalyticsEvent(rows, prices, modelAliases)
+		item, err := scanBuffer.scan(rows, prices, modelAliases)
 		if err != nil {
 			return nil, err
 		}
@@ -239,83 +288,112 @@ type analyticsRowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanAnalyticsEvent(scanner analyticsRowScanner, prices modelPriceIndex, modelAliases modelAliasIndex) (analyticsEvent, error) {
-	var item analyticsEvent
-	var failed int
-	var rawInput, rawCached, rawCacheRead, rawCacheCreation int64
-	if err := scanner.Scan(
-		&item.id,
-		&item.event.RequestID,
-		&item.unixNano,
-		&item.event.Provider,
-		&item.event.Model,
-		&item.event.ModelAlias,
-		&item.event.Endpoint,
-		&item.event.AuthIndex,
-		&item.event.AuthFileName,
-		&item.event.APIKeyHash,
-		&item.event.CredentialKeyHash,
-		&item.event.AccountRef,
-		&item.event.AuthType,
-		&item.event.ExecutorType,
-		&item.event.ServiceTier,
-		&item.event.CacheInputMode,
-		&item.event.ReasoningEffort,
-		&item.event.StatusCode,
-		&item.event.LatencyMS,
-		&item.event.TTFTMS,
-		&item.event.FailStatusCode,
-		&item.event.FailSummary,
-		&item.event.FailBody,
-		&rawInput,
-		&item.tokens.OutputTokens,
-		&item.tokens.ReasoningTokens,
-		&rawCached,
-		&rawCacheRead,
-		&rawCacheCreation,
-		&item.tokens.CachedTokens,
-		&item.tokens.CacheReadTokens,
-		&item.tokens.CacheCreationTokens,
-		&item.tokens.UncachedInputTokens,
-		&item.tokens.TotalInputTokens,
-		&item.tokens.TotalTokens,
-		&failed,
-	); err != nil {
-		return analyticsEvent{}, err
-	}
-	finalizeAnalyticsEvent(&item, failed, prices, modelAliases)
-	return item, nil
+type analyticsEventScanBuffer struct {
+	item                           analyticsEvent
+	failed                         int
+	rawInput, rawCached            int64
+	rawCacheRead, rawCacheCreation int64
+	destinations                   []any
 }
 
-func scanAnalyticsAggregateEvent(scanner analyticsRowScanner, prices modelPriceIndex, modelAliases modelAliasIndex) (analyticsEvent, error) {
-	var item analyticsEvent
-	var failed int
-	if err := scanner.Scan(
-		&item.unixNano,
-		&item.event.Provider,
-		&item.event.Model,
-		&item.event.ModelAlias,
-		&item.event.AuthIndex,
-		&item.event.AuthFileName,
-		&item.event.APIKeyHash,
-		&item.event.CredentialKeyHash,
-		&item.event.AccountRef,
-		&item.event.AuthType,
-		&item.event.ServiceTier,
-		&item.tokens.OutputTokens,
-		&item.tokens.ReasoningTokens,
-		&item.tokens.CachedTokens,
-		&item.tokens.CacheReadTokens,
-		&item.tokens.CacheCreationTokens,
-		&item.tokens.UncachedInputTokens,
-		&item.tokens.TotalInputTokens,
-		&item.tokens.TotalTokens,
-		&failed,
-	); err != nil {
+func newAnalyticsEventScanBuffer() *analyticsEventScanBuffer {
+	b := &analyticsEventScanBuffer{}
+	b.destinations = []any{
+		&b.item.id,
+		&b.item.event.RequestID,
+		&b.item.unixNano,
+		&b.item.event.Provider,
+		&b.item.event.Model,
+		&b.item.event.ModelAlias,
+		&b.item.event.Endpoint,
+		&b.item.event.AuthIndex,
+		&b.item.event.AuthFileName,
+		&b.item.event.APIKeyHash,
+		&b.item.event.CredentialKeyHash,
+		&b.item.event.AccountRef,
+		&b.item.event.AuthType,
+		&b.item.event.ExecutorType,
+		&b.item.event.ServiceTier,
+		&b.item.event.CacheInputMode,
+		&b.item.event.ReasoningEffort,
+		&b.item.event.StatusCode,
+		&b.item.event.LatencyMS,
+		&b.item.event.TTFTMS,
+		&b.item.event.FailStatusCode,
+		&b.item.event.FailSummary,
+		&b.item.event.FailBody,
+		&b.rawInput,
+		&b.item.tokens.OutputTokens,
+		&b.item.tokens.ReasoningTokens,
+		&b.rawCached,
+		&b.rawCacheRead,
+		&b.rawCacheCreation,
+		&b.item.tokens.CachedTokens,
+		&b.item.tokens.CacheReadTokens,
+		&b.item.tokens.CacheCreationTokens,
+		&b.item.tokens.UncachedInputTokens,
+		&b.item.tokens.TotalInputTokens,
+		&b.item.tokens.TotalTokens,
+		&b.failed,
+	}
+	return b
+}
+
+func (b *analyticsEventScanBuffer) scan(scanner analyticsRowScanner, prices modelPriceIndex, modelAliases modelAliasIndex) (analyticsEvent, error) {
+	b.item = analyticsEvent{}
+	b.failed = 0
+	b.rawInput = 0
+	b.rawCached = 0
+	b.rawCacheRead = 0
+	b.rawCacheCreation = 0
+	if err := scanner.Scan(b.destinations...); err != nil {
 		return analyticsEvent{}, err
 	}
-	finalizeAnalyticsEvent(&item, failed, prices, modelAliases)
-	return item, nil
+	finalizeAnalyticsEvent(&b.item, b.failed, prices, modelAliases)
+	return b.item, nil
+}
+
+type analyticsAggregateScanBuffer struct {
+	item         analyticsEvent
+	failed       int
+	destinations []any
+}
+
+func newAnalyticsAggregateScanBuffer() *analyticsAggregateScanBuffer {
+	b := &analyticsAggregateScanBuffer{}
+	b.destinations = []any{
+		&b.item.unixNano,
+		&b.item.event.Provider,
+		&b.item.event.Model,
+		&b.item.event.ModelAlias,
+		&b.item.event.AuthIndex,
+		&b.item.event.AuthFileName,
+		&b.item.event.APIKeyHash,
+		&b.item.event.CredentialKeyHash,
+		&b.item.event.AccountRef,
+		&b.item.event.AuthType,
+		&b.item.event.ServiceTier,
+		&b.item.tokens.OutputTokens,
+		&b.item.tokens.ReasoningTokens,
+		&b.item.tokens.CachedTokens,
+		&b.item.tokens.CacheReadTokens,
+		&b.item.tokens.CacheCreationTokens,
+		&b.item.tokens.UncachedInputTokens,
+		&b.item.tokens.TotalInputTokens,
+		&b.item.tokens.TotalTokens,
+		&b.failed,
+	}
+	return b
+}
+
+func (b *analyticsAggregateScanBuffer) scan(scanner analyticsRowScanner, prices modelPriceIndex, modelAliases modelAliasIndex) (analyticsEvent, error) {
+	b.item = analyticsEvent{}
+	b.failed = 0
+	if err := scanner.Scan(b.destinations...); err != nil {
+		return analyticsEvent{}, err
+	}
+	finalizeAnalyticsEvent(&b.item, b.failed, prices, modelAliases)
+	return b.item, nil
 }
 
 func finalizeAnalyticsEvent(item *analyticsEvent, failed int, prices modelPriceIndex, modelAliases modelAliasIndex) {
@@ -540,6 +618,9 @@ func buildAnalyticsEventsPage(events []analyticsEvent, page AnalyticsEventsPage)
 		Items:      items,
 		HasMore:    hasMore,
 		TotalCount: int64(len(events)),
+	}
+	if !analyticsEventsPageIncludesTotalCount(page) {
+		resp.TotalCount = 0
 	}
 	if len(items) > 0 {
 		last := items[len(items)-1]

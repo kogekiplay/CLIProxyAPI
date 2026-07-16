@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -536,6 +537,42 @@ func TestResponsesSSENeedsLineBreakSkipsChunksThatAlreadyStartWithNewline(t *tes
 	}
 	if responsesSSENeedsLineBreak([]byte("event: response.created"), []byte("\r\n")) {
 		t.Fatal("expected no injected newline before CRLF chunk")
+	}
+}
+
+func TestResponsesSSEFramerProcessesBatchedFramesAndPreservesTail(t *testing.T) {
+	var out bytes.Buffer
+	framer := &responsesSSEFramer{}
+	first := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n"
+	second := "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-1\"}}\r\n\r\n"
+	tailStart := "data: {\"type\":\"response.completed\",\"response\":"
+	tailEnd := "{\"id\":\"resp-1\"}}\n\n"
+
+	framer.WriteChunk(&out, []byte(first+second+tailStart))
+	if got := out.String(); got != first+second {
+		t.Fatalf("unexpected completed frames before tail.\nGot:  %q\nWant: %q", got, first+second)
+	}
+	if got := string(framer.pending); got != tailStart {
+		t.Fatalf("unexpected pending tail.\nGot:  %q\nWant: %q", got, tailStart)
+	}
+
+	framer.WriteChunk(&out, []byte(tailEnd))
+	framer.Flush(&out)
+	want := first + second + tailStart + tailEnd
+	if got := out.String(); got != want {
+		t.Fatalf("unexpected reassembled batched stream.\nGot:  %q\nWant: %q", got, want)
+	}
+}
+
+func TestResponsesSSEDataPayloadPreservesMultilineAndCRLF(t *testing.T) {
+	frame := []byte("event: response.completed\r\ndata: {\"type\":\"response.completed\",\r\ndata: \"response\":{\"id\":\"resp-1\"}}\r\n\r\n")
+	payload, ok := responsesSSEDataPayload(frame)
+	if !ok {
+		t.Fatal("expected data payload")
+	}
+	want := "{\"type\":\"response.completed\",\n\"response\":{\"id\":\"resp-1\"}}"
+	if got := string(payload); got != want {
+		t.Fatalf("unexpected multiline payload.\nGot:  %q\nWant: %q", got, want)
 	}
 }
 

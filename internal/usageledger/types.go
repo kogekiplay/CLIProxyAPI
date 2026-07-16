@@ -123,9 +123,10 @@ type AnalyticsInclude struct {
 
 // AnalyticsEventsPage requests a descending event page.
 type AnalyticsEventsPage struct {
-	Limit    int    `json:"limit"`
-	BeforeMS *int64 `json:"before_ms,omitempty"`
-	BeforeID *int64 `json:"before_id,omitempty"`
+	Limit             int    `json:"limit"`
+	BeforeMS          *int64 `json:"before_ms,omitempty"`
+	BeforeID          *int64 `json:"before_id,omitempty"`
+	IncludeTotalCount *bool  `json:"include_total_count,omitempty"`
 }
 
 // AnalyticsResponse contains management-facing usage analytics.

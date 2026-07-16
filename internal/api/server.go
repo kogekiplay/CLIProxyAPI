@@ -456,7 +456,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" || strings.HasPrefix(path, "/management-assets/") {
 				c.Next()
 				return
 			}
@@ -550,6 +550,8 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/management-assets/*filepath", s.serveManagementAsset)
+	s.engine.HEAD("/management-assets/*filepath", s.serveManagementAsset)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
@@ -1145,6 +1147,41 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	s.serveStaticPanel(c, managementasset.ManagementFileName)
 }
 
+func (s *Server) serveManagementAsset(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	rawPath := strings.TrimPrefix(strings.TrimSpace(c.Param("filepath")), "/")
+	cleanPath := filepath.Clean(filepath.FromSlash(rawPath))
+	if rawPath == "" || cleanPath == "." || filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	assetsRoot := managementasset.FilePathFor(s.configFilePath, managementasset.ManagementAssetsDirName)
+	if strings.TrimSpace(assetsRoot) == "" {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	filePath := filepath.Join(assetsRoot, cleanPath)
+	relativePath, err := filepath.Rel(assetsRoot, filePath)
+	if err != nil || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	info, err := os.Stat(filePath)
+	if err != nil || !info.Mode().IsRegular() {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.File(filePath)
+}
+
 func (s *Server) serveStaticPanel(c *gin.Context, name string) {
 	cfg := s.cfg
 	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
@@ -1176,6 +1213,9 @@ func (s *Server) serveStaticPanel(c *gin.Context, name string) {
 		}
 	}
 
+	if name == managementasset.ManagementFileName {
+		c.Header("Cache-Control", "no-cache")
+	}
 	c.File(filePath)
 }
 
