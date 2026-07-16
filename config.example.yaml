@@ -29,6 +29,10 @@ remote-management:
   # When enabled, the panel is only downloaded on first access if missing, and never auto-updated afterward.
   # disable-auto-update-panel: false
 
+  # Expose redacted request monitoring and usage analytics without a management key (default: false).
+  # This only enables the read-only /v0/public/usage-* endpoints; all management APIs remain protected.
+  public-usage-viewer: false
+
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
   panel-github-repository: "https://github.com/kogekiplay/Cli-Proxy-API-Management-Center"
 

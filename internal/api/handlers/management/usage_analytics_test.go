@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,20 @@ func TestUsageAnalyticsEndpointReturnsUsageLedgerAnalytics(t *testing.T) {
 		Tokens:          usageledger.TokenUsage{InputTokens: 20, OutputTokens: 10, TotalTokens: 30},
 	}); err != nil {
 		t.Fatalf("insert event: %v", err)
+	}
+	if _, err := store.InsertEvent(context.Background(), usageledger.Event{
+		RequestID:    "req-private-credential",
+		Timestamp:    now.Add(-time.Second),
+		Provider:     "codex",
+		Model:        "gpt-5.6",
+		Endpoint:     "/v1/responses",
+		AuthIndex:    "auth-index-credential-filter",
+		AuthFileName: "/private/auth/bob.json",
+		AccountRef:   "account-private",
+		StatusCode:   http.StatusOK,
+		Tokens:       usageledger.TokenUsage{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+	}); err != nil {
+		t.Fatalf("insert credential event: %v", err)
 	}
 
 	body := map[string]any{
@@ -67,6 +82,164 @@ func TestUsageAnalyticsEndpointReturnsUsageLedgerAnalytics(t *testing.T) {
 	}
 	if response.Events.Items[0].ReasoningEffort != "high" {
 		t.Fatalf("reasoning effort = %q, want high", response.Events.Items[0].ReasoningEffort)
+	}
+}
+
+func TestPublicUsageViewerDisabledByDefault(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	router := usageManagementTestRouter(h)
+
+	rec := performUsageManagementJSON(http.MethodGet, "/v0/public/usage-viewer", nil, router)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status endpoint = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+	rec = performUsageManagementJSON(http.MethodPost, "/v0/public/usage-analytics", map[string]any{}, router)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("analytics endpoint = %d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPublicUsageAnalyticsRedactsSensitiveEventFields(t *testing.T) {
+	store := openManagementUsageStore(t)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		RemoteManagement: config.RemoteManagement{PublicUsageViewer: true},
+	}, nil)
+	h.SetUsageLedger(store)
+	router := usageManagementTestRouter(h)
+
+	now := time.Now().UTC().Add(-time.Minute)
+	if _, err := store.InsertEvent(context.Background(), usageledger.Event{
+		RequestID:         "req-private-id",
+		Timestamp:         now,
+		Provider:          "codex",
+		Model:             "gpt-5.6",
+		Endpoint:          "/v1/responses",
+		AuthIndex:         "auth-index-public-filter",
+		AuthFileName:      "/private/auth/alice.json",
+		APIKeyHash:        "api-key-hash-public-filter",
+		CredentialKeyHash: "credential-key-hash-private",
+		AccountRef:        "workspace-private",
+		StatusCode:        http.StatusTooManyRequests,
+		FailStatusCode:    http.StatusTooManyRequests,
+		FailSummary:       "rate limit reached",
+		FailBody:          `{"error":{"message":"rate limit reached"}}`,
+		Tokens:            usageledger.TokenUsage{InputTokens: 20, OutputTokens: 10, TotalTokens: 30},
+		Failed:            true,
+	}); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	rec := performUsageManagementJSON(http.MethodPost, "/v0/public/usage-analytics", map[string]any{
+		"from_ms": now.Add(-time.Minute).UnixMilli(),
+		"to_ms":   now.Add(time.Minute).UnixMilli(),
+		"include": map[string]any{
+			"api_key_stats":    true,
+			"credential_stats": true,
+			"events_page":      map[string]any{"limit": 500, "include_total_count": true},
+		},
+	}, router)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	var response usageledger.AnalyticsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Events == nil || len(response.Events.Items) != 1 {
+		t.Fatalf("events = %#v", response.Events)
+	}
+	var apiKeyRow *usageledger.AnalyticsEventRow
+	for i := range response.Events.Items {
+		row := &response.Events.Items[i]
+		if row.ID == 0 {
+			t.Fatal("event database id should remain available for stable pagination")
+		}
+		if row.RequestID != "" || row.AuthFileName != "" || row.CredentialKeyHash != "" || row.AccountRef != "" || row.FailBody != "" {
+			t.Fatalf("public event leaked sensitive fields: %#v", row)
+		}
+		if row.APIKeyHash != "" {
+			apiKeyRow = row
+		}
+	}
+	if apiKeyRow == nil || apiKeyRow.AuthIndex == "" {
+		t.Fatalf("public filter identifiers were removed: %#v", response.Events.Items)
+	}
+	if apiKeyRow.FailSummary != "rate limit reached" {
+		t.Fatalf("fail summary = %q, want sanitized summary", apiKeyRow.FailSummary)
+	}
+	if len(response.APIKeyStats) != 1 || response.APIKeyStats[0].AccountRef != "" {
+		t.Fatalf("api key stats were not redacted: %#v", response.APIKeyStats)
+	}
+}
+
+func TestRedactPublicUsageAnalyticsRemovesCredentialPathsAndFallbackLabels(t *testing.T) {
+	resp := usageledger.AnalyticsResponse{
+		CredentialStats: []usageledger.AnalyticsCredentialStat{{
+			AuthIndex:             "public-filter-id",
+			AuthFileName:          "/private/auth/alice.json",
+			CredentialDisplayName: "alice.json",
+			AccountRef:            "account-private",
+		}},
+		Events: &usageledger.AnalyticsEventsResponse{Items: []usageledger.AnalyticsEventRow{{
+			FailSummary: "Authorization: Bearer secret-token-123 alice@example.com",
+		}}},
+	}
+
+	redactPublicUsageAnalytics(&resp)
+
+	row := resp.CredentialStats[0]
+	if row.AuthIndex != "public-filter-id" {
+		t.Fatalf("auth index = %q, want public filter identifier", row.AuthIndex)
+	}
+	if row.AuthFileName != "" || row.CredentialDisplayName != "" || row.AccountRef != "" {
+		t.Fatalf("credential row was not redacted: %#v", row)
+	}
+	failSummary := resp.Events.Items[0].FailSummary
+	if strings.Contains(failSummary, "secret-token-123") || strings.Contains(failSummary, "alice@example.com") {
+		t.Fatalf("historical failure summary was not sanitized: %q", failSummary)
+	}
+}
+
+func TestNormalizePublicUsageAnalyticsRequestBoundsWindowAndEvents(t *testing.T) {
+	now := time.Now()
+	includeTotalCount := true
+	providers := make([]string, publicUsageAnalyticsMaxFilter+5)
+	for i := range providers {
+		providers[i] = strings.Repeat("p", publicUsageAnalyticsMaxValue+5)
+	}
+	req := usageledger.AnalyticsRequest{
+		FromMS:  now.Add(-90 * 24 * time.Hour).UnixMilli(),
+		ToMS:    now.Add(time.Hour).UnixMilli(),
+		Filters: usageledger.AnalyticsFilters{Providers: providers},
+		Include: usageledger.AnalyticsInclude{EventsPage: &usageledger.AnalyticsEventsPage{
+			Limit:             500,
+			IncludeTotalCount: &includeTotalCount,
+		}},
+	}
+
+	normalizePublicUsageAnalyticsRequest(&req)
+
+	if req.ToMS > time.Now().UnixMilli() {
+		t.Fatalf("to_ms = %d, want no later than now", req.ToMS)
+	}
+	if got := time.Duration(req.ToMS-req.FromMS) * time.Millisecond; got > publicUsageAnalyticsMaxWindow {
+		t.Fatalf("window = %s, want <= %s", got, publicUsageAnalyticsMaxWindow)
+	}
+	if req.Include.EventsPage.Limit != publicUsageAnalyticsMaxEvents {
+		t.Fatalf("limit = %d, want %d", req.Include.EventsPage.Limit, publicUsageAnalyticsMaxEvents)
+	}
+	if req.Include.EventsPage.IncludeTotalCount == nil || *req.Include.EventsPage.IncludeTotalCount {
+		t.Fatal("public exact total count must be disabled")
+	}
+	if len(req.Filters.Providers) != publicUsageAnalyticsMaxFilter {
+		t.Fatalf("provider filters = %d, want %d", len(req.Filters.Providers), publicUsageAnalyticsMaxFilter)
+	}
+	if got := len([]rune(req.Filters.Providers[0])); got != publicUsageAnalyticsMaxValue {
+		t.Fatalf("provider filter length = %d, want %d", got, publicUsageAnalyticsMaxValue)
 	}
 }
 

@@ -20,6 +20,7 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 			SecretKey:              "old",
 			DisableControlPanel:    false,
 			DisableAutoUpdatePanel: false,
+			PublicUsageViewer:      false,
 			PanelGitHubRepository:  "repo-old",
 		},
 		OAuthExcludedModels: map[string][]string{
@@ -47,6 +48,7 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 			SecretKey:              "new",
 			DisableControlPanel:    true,
 			DisableAutoUpdatePanel: true,
+			PublicUsageViewer:      true,
 			PanelGitHubRepository:  "repo-new",
 		},
 		OAuthExcludedModels: map[string][]string{
@@ -77,6 +79,7 @@ func TestBuildConfigChangeDetails(t *testing.T) {
 	expectContains(t, details, "gemini[0].excluded-models: updated (1 -> 2 entries)")
 	expectContains(t, details, "remote-management.allow-remote: false -> true")
 	expectContains(t, details, "remote-management.disable-auto-update-panel: false -> true")
+	expectContains(t, details, "remote-management.public-usage-viewer: false -> true")
 	expectContains(t, details, "remote-management.secret-key: updated")
 	expectContains(t, details, "oauth-excluded-models[providera]: updated (1 -> 2 entries)")
 	expectContains(t, details, "oauth-excluded-models[providerb]: added (1 entries)")

@@ -340,6 +340,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.RemoteManagement.DisableAutoUpdatePanel != newCfg.RemoteManagement.DisableAutoUpdatePanel {
 		changes = append(changes, fmt.Sprintf("remote-management.disable-auto-update-panel: %t -> %t", oldCfg.RemoteManagement.DisableAutoUpdatePanel, newCfg.RemoteManagement.DisableAutoUpdatePanel))
 	}
+	if oldCfg.RemoteManagement.PublicUsageViewer != newCfg.RemoteManagement.PublicUsageViewer {
+		changes = append(changes, fmt.Sprintf("remote-management.public-usage-viewer: %t -> %t", oldCfg.RemoteManagement.PublicUsageViewer, newCfg.RemoteManagement.PublicUsageViewer))
+	}
 	oldPanelRepo := strings.TrimSpace(oldCfg.RemoteManagement.PanelGitHubRepository)
 	newPanelRepo := strings.TrimSpace(newCfg.RemoteManagement.PanelGitHubRepository)
 	if oldPanelRepo != newPanelRepo {

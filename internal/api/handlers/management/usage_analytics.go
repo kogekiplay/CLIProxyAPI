@@ -13,6 +13,10 @@ import (
 
 // PostUsageAnalytics returns aggregated request monitoring data from the usage ledger.
 func (h *Handler) PostUsageAnalytics(c *gin.Context) {
+	h.postUsageAnalytics(c, false)
+}
+
+func (h *Handler) postUsageAnalytics(c *gin.Context, public bool) {
 	store, ok := h.requireUsageLedger(c)
 	if !ok {
 		return
@@ -21,6 +25,9 @@ func (h *Handler) PostUsageAnalytics(c *gin.Context) {
 	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid analytics request"})
 		return
+	}
+	if public {
+		normalizePublicUsageAnalyticsRequest(&req)
 	}
 	req.ModelAliases = h.usageAnalyticsModelAliases()
 	resp, err := store.Analytics(c.Request.Context(), req)
@@ -31,6 +38,9 @@ func (h *Handler) PostUsageAnalytics(c *gin.Context) {
 	h.reclassifyUsageAnalyticsCredentialAPIKeys(&resp)
 	h.enrichUsageAnalyticsAPIKeyStats(&resp)
 	h.enrichUsageAnalyticsCredentialNames(&resp)
+	if public {
+		redactPublicUsageAnalytics(&resp)
+	}
 	c.JSON(http.StatusOK, resp)
 }
 

@@ -556,6 +556,8 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD(legacyManagementControlPanelPath, s.redirectLegacyManagementControlPanel)
 	s.engine.GET("/management-assets/*filepath", s.serveManagementAsset)
 	s.engine.HEAD("/management-assets/*filepath", s.serveManagementAsset)
+	s.engine.GET("/v0/public/usage-viewer", s.mgmt.GetPublicUsageViewer)
+	s.engine.POST("/v0/public/usage-analytics", s.mgmt.PostPublicUsageAnalytics)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)

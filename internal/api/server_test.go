@@ -502,6 +502,38 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	}
 }
 
+func TestPublicUsageViewerRoutesAreOptionalAndDoNotEnableManagement(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		server := newTestServer(t)
+		req := httptest.NewRequest(http.MethodGet, "/v0/public/usage-viewer", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("enabled without management secret", func(t *testing.T) {
+		server := newTestServerWithConfig(t, &proxyconfig.Config{
+			RemoteManagement: proxyconfig.RemoteManagement{PublicUsageViewer: true},
+		}, nil)
+
+		publicReq := httptest.NewRequest(http.MethodGet, "/v0/public/usage-viewer", nil)
+		publicRR := httptest.NewRecorder()
+		server.engine.ServeHTTP(publicRR, publicReq)
+		if publicRR.Code != http.StatusOK {
+			t.Fatalf("public status = %d, want 200; body=%s", publicRR.Code, publicRR.Body.String())
+		}
+
+		managementReq := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+		managementRR := httptest.NewRecorder()
+		server.engine.ServeHTTP(managementRR, managementReq)
+		if managementRR.Code != http.StatusNotFound {
+			t.Fatalf("management status = %d, want 404; body=%s", managementRR.Code, managementRR.Body.String())
+		}
+	})
+}
+
 func TestOpenCodeGoManagementRoutesHitRealServer(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 	modelsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

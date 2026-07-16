@@ -47,6 +47,12 @@ func sanitizeFailureText(text string) string {
 	return truncateFailureText(text)
 }
 
+// SanitizeFailureText removes common credentials and personal identifiers from failure text.
+// It is exported for read-only views that must also sanitize historical ledger rows.
+func SanitizeFailureText(text string) string {
+	return sanitizeFailureText(text)
+}
+
 func failureMessageFromJSON(body string) string {
 	var payload any
 	if err := json.Unmarshal([]byte(body), &payload); err != nil {

@@ -25,6 +25,9 @@ func openManagementUsageStore(t *testing.T) *usageledger.SQLiteStore {
 
 func usageManagementTestRouter(h *Handler) *gin.Engine {
 	router := gin.New()
+	public := router.Group("/v0/public")
+	public.GET("/usage-viewer", h.GetPublicUsageViewer)
+	public.POST("/usage-analytics", h.PostPublicUsageAnalytics)
 	group := router.Group("/v0/management")
 	group.GET("/model-prices", h.GetModelPrices)
 	group.PUT("/model-prices", h.PutModelPrices)
