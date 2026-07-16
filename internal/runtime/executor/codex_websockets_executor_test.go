@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -295,6 +296,22 @@ func TestCodexWebsocketsExecuteStreamFallsBackToHTTPOnMessageTooBigClose(t *test
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !websocket.IsWebSocketUpgrade(r) {
 			httpCalls.Add(1)
+			body, errRead := io.ReadAll(r.Body)
+			if errRead != nil {
+				t.Errorf("read HTTP fallback body: %v", errRead)
+				http.Error(w, "read fallback body", http.StatusInternalServerError)
+				return
+			}
+			if gjson.GetBytes(body, "type").Exists() {
+				t.Errorf("HTTP fallback retained websocket request type: %s", gjson.GetBytes(body, "type").String())
+				http.Error(w, "Unsupported parameter: type", http.StatusBadRequest)
+				return
+			}
+			if got := gjson.GetBytes(body, "input.0.type").String(); got != "message" {
+				t.Errorf("HTTP fallback changed nested input type: %s", got)
+				http.Error(w, "invalid nested input type", http.StatusBadRequest)
+				return
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","item_id":"msg-1","delta":"fallback"}` + "\n\n"))
 			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp-http","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
@@ -329,11 +346,12 @@ func TestCodexWebsocketsExecuteStreamFallsBackToHTTPOnMessageTooBigClose(t *test
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5-codex",
-		Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
+		Payload: []byte(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
 	}
 	opts := cliproxyexecutor.Options{
-		SourceFormat:   sdktranslator.FromString("openai-response"),
-		ResponseFormat: sdktranslator.FromString("openai-response"),
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		ResponseFormat:  sdktranslator.FromString("openai-response"),
+		OriginalRequest: []byte(`{"type":"response.create","model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`),
 		Metadata: map[string]any{
 			cliproxyexecutor.ExecutionSessionMetadataKey: sessionID,
 		},

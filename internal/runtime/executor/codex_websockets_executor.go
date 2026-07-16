@@ -495,7 +495,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
-			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+			return e.executeHTTPStreamFallback(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
 			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
@@ -621,7 +621,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "read_http_fallback", mappedErr)
 					log.Warnf("codex websockets executor: upstream rejected %d-byte message; falling back to HTTP streaming", len(wsReqBody))
 
-					fallback, fallbackErr := e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+					fallback, fallbackErr := e.executeHTTPStreamFallback(ctx, auth, req, opts)
 					if fallbackErr != nil {
 						terminateReason = "http_fallback_error"
 						terminateErr = fallbackErr
@@ -791,6 +791,23 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	fallback := bytes.Clone(body)
 	fallback, _ = sjson.SetBytes(fallback, "type", "response.create")
 	return fallback
+}
+
+func (e *CodexWebsocketsExecutor) executeHTTPStreamFallback(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	req.Payload = stripCodexWebsocketRequestType(req.Payload)
+	opts.OriginalRequest = stripCodexWebsocketRequestType(opts.OriginalRequest)
+	return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+}
+
+func stripCodexWebsocketRequestType(body []byte) []byte {
+	if len(body) == 0 || !gjson.GetBytes(body, "type").Exists() {
+		return body
+	}
+	stripped, errDelete := sjson.DeleteBytes(body, "type")
+	if errDelete != nil {
+		return body
+	}
+	return stripped
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
