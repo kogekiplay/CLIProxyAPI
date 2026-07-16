@@ -198,3 +198,33 @@ func TestReasoningEffortMetadataUsesOriginalRequestedModelAcrossExecutionPaths(t
 		}
 	})
 }
+
+func TestSetGenerateMetadataDefaultsWhenMissing(t *testing.T) {
+	meta := make(map[string]any)
+
+	setGenerateMetadata(meta, []byte(`{"model":"gpt-5.4"}`))
+
+	if got := meta[coreexecutor.GenerateMetadataKey]; got != true {
+		t.Fatalf("GenerateMetadataKey = %v, want true", got)
+	}
+}
+
+func TestSetGenerateMetadataPreservesTrue(t *testing.T) {
+	meta := make(map[string]any)
+
+	setGenerateMetadata(meta, []byte(`{"generate":true}`))
+
+	if got := meta[coreexecutor.GenerateMetadataKey]; got != true {
+		t.Fatalf("GenerateMetadataKey = %v, want true", got)
+	}
+}
+
+func TestSetGenerateMetadataHonorsExplicitFalse(t *testing.T) {
+	meta := make(map[string]any)
+
+	setGenerateMetadata(meta, []byte(`{"generate":false}`))
+
+	if got := meta[coreexecutor.GenerateMetadataKey]; got != false {
+		t.Fatalf("GenerateMetadataKey = %v, want false", got)
+	}
+}
