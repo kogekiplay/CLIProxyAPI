@@ -237,10 +237,11 @@ type Manager struct {
 	stopOnce sync.Once
 	cancel   context.CancelFunc
 
-	mu     sync.Mutex
-	cond   *sync.Cond
-	queue  []queueItem
-	closed bool
+	mu        sync.Mutex
+	cond      *sync.Cond
+	queue     []queueItem
+	queueHead int
+	closed    bool
 
 	pluginsMu sync.RWMutex
 	plugins   []Plugin
@@ -249,7 +250,10 @@ type Manager struct {
 
 // NewManager constructs a manager with a buffered queue.
 func NewManager(buffer int) *Manager {
-	m := &Manager{}
+	if buffer < 0 {
+		buffer = 0
+	}
+	m := &Manager{queue: make([]queueItem, 0, buffer)}
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -332,6 +336,12 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		m.mu.Unlock()
 		return
 	}
+	if m.queueHead > 0 && len(m.queue) == cap(m.queue) {
+		remaining := copy(m.queue, m.queue[m.queueHead:])
+		clear(m.queue[remaining:])
+		m.queue = m.queue[:remaining]
+		m.queueHead = 0
+	}
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
 	m.mu.Unlock()
 	m.cond.Signal()
@@ -347,8 +357,13 @@ func (m *Manager) run(ctx context.Context) {
 			m.mu.Unlock()
 			return
 		}
-		item := m.queue[0]
-		m.queue = m.queue[1:]
+		item := m.queue[m.queueHead]
+		m.queue[m.queueHead] = queueItem{}
+		m.queueHead++
+		if m.queueHead == len(m.queue) {
+			m.queue = m.queue[:0]
+			m.queueHead = 0
+		}
 		m.mu.Unlock()
 		m.dispatch(item)
 	}

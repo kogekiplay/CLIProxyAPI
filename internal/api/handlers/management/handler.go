@@ -4,6 +4,7 @@ package management
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/singleflight"
 )
 
 type attemptInfo struct {
@@ -37,6 +39,14 @@ const attemptCleanupInterval = 1 * time.Hour
 // attemptMaxIdleTime controls how long an IP can be idle before cleanup
 const attemptMaxIdleTime = 2 * time.Hour
 
+const managementAuthCacheTTL = 5 * time.Minute
+
+type managementAuthCacheEntry struct {
+	secretHash string
+	keyDigest  [sha256.Size]byte
+	expiresAt  time.Time
+}
+
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
 	cfg                     *config.Config
@@ -47,6 +57,9 @@ type Handler struct {
 	appliedReloadGeneration uint64
 	attemptsMu              sync.Mutex
 	failedAttempts          map[string]*attemptInfo // keyed by client IP
+	managementAuthCacheMu   sync.RWMutex
+	managementAuthCache     managementAuthCacheEntry
+	managementAuthVerify    singleflight.Group
 	authManager             *coreauth.Manager
 	tokenStore              coreauth.Store
 	localPassword           string
@@ -255,7 +268,14 @@ func (h *Handler) reloadConfigAfterManagementSaveAsync(ctx context.Context, snap
 }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
-func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
+func (h *Handler) SetLocalPassword(password string) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.localPassword = password
+	h.mu.Unlock()
+}
 
 // SetLogDirectory updates the directory where main.log should be looked up.
 func (h *Handler) SetLogDirectory(dir string) {
@@ -326,15 +346,18 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		return false, http.StatusForbidden, "remote management disabled"
 	}
 
-	cfg := h.cfg
 	var (
-		allowRemote bool
-		secretHash  string
+		allowRemote   bool
+		secretHash    string
+		localPassword string
 	)
-	if cfg != nil {
-		allowRemote = cfg.RemoteManagement.AllowRemote
-		secretHash = cfg.RemoteManagement.SecretKey
+	h.mu.Lock()
+	if h.cfg != nil {
+		allowRemote = h.cfg.RemoteManagement.AllowRemote
+		secretHash = h.cfg.RemoteManagement.SecretKey
 	}
+	localPassword = h.localPassword
+	h.mu.Unlock()
 	if h.allowRemoteOverride {
 		allowRemote = true
 	}
@@ -394,7 +417,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	if localClient {
-		if lp := h.localPassword; lp != "" {
+		if lp := localPassword; lp != "" {
 			if subtle.ConstantTimeCompare([]byte(provided), []byte(lp)) == 1 {
 				reset()
 				return true, 0, ""
@@ -407,7 +430,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		return true, 0, ""
 	}
 
-	if secretHash == "" || bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
+	if secretHash == "" || !h.authenticateManagementKeyHash(secretHash, provided, now) {
 		fail()
 		return false, http.StatusUnauthorized, "invalid management key"
 	}
@@ -415,6 +438,52 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	reset()
 
 	return true, 0, ""
+}
+
+func (h *Handler) authenticateManagementKeyHash(secretHash, provided string, now time.Time) bool {
+	if h == nil || secretHash == "" || provided == "" {
+		return false
+	}
+	digest := sha256.Sum256([]byte(provided))
+
+	h.managementAuthCacheMu.RLock()
+	cached := h.managementAuthCache.matches(secretHash, digest, now)
+	h.managementAuthCacheMu.RUnlock()
+	if cached {
+		return true
+	}
+
+	// Collapse only identical cache misses. Invalid keys with different digests
+	// remain independent and cannot hold a global verification lock.
+	verifyKey := secretHash + "\x00" + string(digest[:])
+	verified, _, _ := h.managementAuthVerify.Do(verifyKey, func() (any, error) {
+		now = time.Now()
+		h.managementAuthCacheMu.RLock()
+		cached := h.managementAuthCache.matches(secretHash, digest, now)
+		h.managementAuthCacheMu.RUnlock()
+		if cached {
+			return true, nil
+		}
+		if bcrypt.CompareHashAndPassword([]byte(secretHash), []byte(provided)) != nil {
+			return false, nil
+		}
+		h.managementAuthCacheMu.Lock()
+		h.managementAuthCache = managementAuthCacheEntry{
+			secretHash: secretHash,
+			keyDigest:  digest,
+			expiresAt:  now.Add(managementAuthCacheTTL),
+		}
+		h.managementAuthCacheMu.Unlock()
+		return true, nil
+	})
+	ok, _ := verified.(bool)
+	return ok
+}
+
+func (entry managementAuthCacheEntry) matches(secretHash string, digest [sha256.Size]byte, now time.Time) bool {
+	return entry.secretHash == secretHash &&
+		!entry.expiresAt.IsZero() && now.Before(entry.expiresAt) &&
+		subtle.ConstantTimeCompare(entry.keyDigest[:], digest[:]) == 1
 }
 
 // persist saves the current in-memory config to disk.

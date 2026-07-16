@@ -38,10 +38,14 @@ func newResponsesStreamState() *ResponsesStreamState {
 }
 
 func (s *ResponsesStreamState) observeEvent(payload []byte) {
+	s.observeEventType(payload, responseEventType(payload))
+}
+
+func (s *ResponsesStreamState) observeEventType(payload []byte, eventType string) {
 	if s == nil {
 		return
 	}
-	switch responseEventType(payload) {
+	switch eventType {
 	case "response.output_item.added":
 		s.recordOutputItemAdded(payload)
 	case "response.content_part.added":

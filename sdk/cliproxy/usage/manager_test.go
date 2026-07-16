@@ -41,6 +41,34 @@ func TestManagerAddsBoundedDeadlineToPluginContext(t *testing.T) {
 	}
 }
 
+func TestManagerReusesConfiguredQueueBuffer(t *testing.T) {
+	manager := NewManager(4)
+	defer manager.Stop()
+	if got := cap(manager.queue); got != 4 {
+		t.Fatalf("initial queue capacity = %d, want 4", got)
+	}
+
+	plugin := &usageContextCapturePlugin{ctxs: make(chan context.Context, 1)}
+	manager.Register(plugin)
+	for i := 0; i < 12; i++ {
+		manager.Publish(context.Background(), Record{Model: "gpt-test"})
+		select {
+		case <-plugin.ctxs:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for usage plugin context")
+		}
+	}
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if len(manager.queue) != 0 || manager.queueHead != 0 {
+		t.Fatalf("drained queue state = len %d head %d", len(manager.queue), manager.queueHead)
+	}
+	if got := cap(manager.queue); got < 4 {
+		t.Fatalf("drained queue capacity = %d, want at least 4", got)
+	}
+}
+
 func TestGenerateEnabledDefaultsNilToTrue(t *testing.T) {
 	if !GenerateEnabled(nil) {
 		t.Fatalf("GenerateEnabled(nil) = false, want true")

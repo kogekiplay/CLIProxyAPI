@@ -177,6 +177,9 @@ func TestSQLiteStoreAnalyticsEventsOnlyPaginatesNewestFirst(t *testing.T) {
 	if err := store.db.QueryRowContext(context.Background(), `SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'usage_events_time_idx'`).Scan(&indexName); err != nil {
 		t.Fatalf("lookup usage events time index: %v", err)
 	}
+	if err := store.db.QueryRowContext(context.Background(), `SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'usage_events_provider_time_idx'`).Scan(&indexName); err != nil {
+		t.Fatalf("lookup usage events provider time index: %v", err)
+	}
 }
 
 func TestSQLiteStoreAnalyticsEventsReadsModelAlias(t *testing.T) {

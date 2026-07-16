@@ -95,7 +95,12 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 }
 
 func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
-	for _, repaired := range f.repairFrame(frame) {
+	repairedFrames := f.repairFrame(frame)
+	if len(repairedFrames) == 0 {
+		writeResponsesSSEChunk(w, frame)
+		return
+	}
+	for _, repaired := range repairedFrames {
 		writeResponsesSSEChunk(w, repaired)
 	}
 }
@@ -103,13 +108,16 @@ func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
 func (f *responsesSSEFramer) repairFrame(frame []byte) [][]byte {
 	payload, ok := responsesSSEDataPayload(frame)
 	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
-		return [][]byte{frame}
+		return nil
 	}
 	if f.repairer == nil {
 		f.repairer = newResponsesEventRepairer()
 	}
 
-	repairedPayloads := f.repairer.repair(payload)
+	repairedPayloads := f.repairer.repairChanged(payload)
+	if len(repairedPayloads) == 0 {
+		return nil
+	}
 	frames := make([][]byte, 0, len(repairedPayloads))
 	for index, repairedPayload := range repairedPayloads {
 		if index == len(repairedPayloads)-1 {

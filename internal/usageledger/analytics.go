@@ -50,6 +50,29 @@ const analyticsEventsSelect = `SELECT
 		failed
 		FROM usage_events `
 
+const analyticsAggregateEventsSelect = `SELECT
+		ts_ns,
+		provider,
+		model,
+		model_alias,
+		auth_index,
+		auth_file_name,
+		api_key_hash,
+		credential_key_hash,
+		account_ref,
+		auth_type,
+		service_tier,
+		output_tokens,
+		reasoning_tokens,
+		normalized_cached_tokens,
+		normalized_cache_read_tokens,
+		normalized_cache_creation_tokens,
+		uncached_input_tokens,
+		total_input_tokens,
+		total_tokens,
+		failed
+		FROM usage_events `
+
 type analyticsEvent struct {
 	id            int64
 	event         Event
@@ -63,14 +86,12 @@ type analyticsEvent struct {
 }
 
 type analyticsAggregate struct {
-	calls    int64
-	success  int64
-	failure  int64
-	tokens   TokenUsage
-	cost     float64
-	hasCost  bool
-	allCost  bool
-	initCost bool
+	calls   int64
+	success int64
+	failure int64
+	tokens  TokenUsage
+	cost    float64
+	hasCost bool
 }
 
 // Analytics returns management-facing request monitoring aggregates.
@@ -82,55 +103,55 @@ func (s *SQLiteStore) Analytics(ctx context.Context, req AnalyticsRequest) (Anal
 		return AnalyticsResponse{}, errors.New("from_ms and to_ms are required and from_ms must be less than to_ms")
 	}
 
+	resp := AnalyticsResponse{GeneratedAtMS: time.Now().UnixMilli()}
+	hasAggregates := analyticsIncludesAggregates(req.Include)
+	if !hasAggregates && req.Include.EventsPage == nil {
+		return resp, nil
+	}
+
 	prices, err := s.ListModelPrices(ctx)
 	if err != nil {
 		return AnalyticsResponse{}, err
 	}
 	priceIndex := compileModelPriceIndex(prices)
 	modelAliases := compileModelAliasIndex(req.ModelAliases)
-	resp := AnalyticsResponse{GeneratedAtMS: time.Now().UnixMilli()}
-	if canUseAnalyticsEventsFastPath(req) {
-		resp.Events, err = s.analyticsEventsPageWithModelAliasIndex(ctx, req, priceIndex, modelAliases)
-		if err != nil {
-			return AnalyticsResponse{}, err
+
+	// Alias-aware model filters require post-resolution matching. Keep their
+	// strict full-event path so pagination and totals remain exact.
+	if len(cleanedAnalyticsValues(req.Filters.Models)) > 0 {
+		events, queryErr := s.analyticsEventsWithModelAliasIndex(ctx, req, priceIndex, modelAliases)
+		if queryErr != nil {
+			return AnalyticsResponse{}, queryErr
+		}
+		acc := newAnalyticsAccumulator(req.Include)
+		for _, event := range events {
+			acc.add(event)
+		}
+		acc.apply(&resp)
+		if req.Include.EventsPage != nil {
+			resp.Events = buildAnalyticsEventsPage(events, *req.Include.EventsPage)
 		}
 		return resp, nil
 	}
 
-	events, err := s.analyticsEventsWithModelAliasIndex(ctx, req, priceIndex, modelAliases)
-	if err != nil {
-		return AnalyticsResponse{}, err
-	}
-
-	if req.Include.Summary {
-		resp.Summary = buildAnalyticsSummary(events)
-	}
-	if req.Include.Timeline {
-		resp.Timeline = buildAnalyticsTimeline(events)
-	}
-	if req.Include.ModelStats {
-		resp.ModelStats = buildAnalyticsModelStats(events)
-	}
-	if req.Include.APIKeyStats {
-		resp.APIKeyStats = buildAnalyticsAPIKeyStats(events)
-	}
-	if req.Include.CredentialStats {
-		resp.CredentialStats = buildAnalyticsCredentialStats(events)
+	if hasAggregates {
+		acc := newAnalyticsAccumulator(req.Include)
+		if err = s.scanAnalyticsAggregateEvents(ctx, req, priceIndex, modelAliases, acc.add); err != nil {
+			return AnalyticsResponse{}, err
+		}
+		acc.apply(&resp)
 	}
 	if req.Include.EventsPage != nil {
-		resp.Events = buildAnalyticsEventsPage(events, *req.Include.EventsPage)
+		resp.Events, err = s.analyticsEventsPageWithModelAliasIndex(ctx, req, priceIndex, modelAliases)
+		if err != nil {
+			return AnalyticsResponse{}, err
+		}
 	}
 	return resp, nil
 }
 
-func canUseAnalyticsEventsFastPath(req AnalyticsRequest) bool {
-	return req.Include.EventsPage != nil &&
-		!req.Include.Summary &&
-		!req.Include.Timeline &&
-		!req.Include.ModelStats &&
-		!req.Include.APIKeyStats &&
-		!req.Include.CredentialStats &&
-		len(cleanedAnalyticsValues(req.Filters.Models)) == 0
+func analyticsIncludesAggregates(include AnalyticsInclude) bool {
+	return include.Summary || include.Timeline || include.ModelStats || include.APIKeyStats || include.CredentialStats
 }
 
 func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest, prices []ModelPrice) ([]analyticsEvent, error) {
@@ -140,6 +161,28 @@ func (s *SQLiteStore) analyticsEvents(ctx context.Context, req AnalyticsRequest,
 func (s *SQLiteStore) analyticsEventsWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices modelPriceIndex, modelAliases modelAliasIndex) ([]analyticsEvent, error) {
 	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
 	return s.queryAnalyticsEvents(ctx, analyticsEventsSelect+where+` ORDER BY ts_ns ASC, id ASC`, args, prices, modelAliases, cleanedAnalyticsValues(req.Filters.Models))
+}
+
+func (s *SQLiteStore) scanAnalyticsAggregateEvents(ctx context.Context, req AnalyticsRequest, prices modelPriceIndex, modelAliases modelAliasIndex, add func(analyticsEvent)) error {
+	where, args := buildAnalyticsWhereWithModelAliasIndex(req, modelAliases)
+	rows, err := s.db.QueryContext(ctx, analyticsAggregateEventsSelect+where+` ORDER BY ts_ns ASC, id ASC`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	requestedModels := cleanedAnalyticsValues(req.Filters.Models)
+	for rows.Next() {
+		item, scanErr := scanAnalyticsAggregateEvent(rows, prices, modelAliases)
+		if scanErr != nil {
+			return scanErr
+		}
+		if !matchesAnalyticsModelFilter(requestedModels, item.event.Model, item.upstreamModel) {
+			continue
+		}
+		add(item)
+	}
+	return rows.Err()
 }
 
 func (s *SQLiteStore) analyticsEventsPageWithModelAliasIndex(ctx context.Context, req AnalyticsRequest, prices modelPriceIndex, modelAliases modelAliasIndex) (*AnalyticsEventsResponse, error) {
@@ -240,6 +283,45 @@ func scanAnalyticsEvent(scanner analyticsRowScanner, prices modelPriceIndex, mod
 	); err != nil {
 		return analyticsEvent{}, err
 	}
+	finalizeAnalyticsEvent(&item, failed, prices, modelAliases)
+	return item, nil
+}
+
+func scanAnalyticsAggregateEvent(scanner analyticsRowScanner, prices modelPriceIndex, modelAliases modelAliasIndex) (analyticsEvent, error) {
+	var item analyticsEvent
+	var failed int
+	if err := scanner.Scan(
+		&item.unixNano,
+		&item.event.Provider,
+		&item.event.Model,
+		&item.event.ModelAlias,
+		&item.event.AuthIndex,
+		&item.event.AuthFileName,
+		&item.event.APIKeyHash,
+		&item.event.CredentialKeyHash,
+		&item.event.AccountRef,
+		&item.event.AuthType,
+		&item.event.ServiceTier,
+		&item.tokens.OutputTokens,
+		&item.tokens.ReasoningTokens,
+		&item.tokens.CachedTokens,
+		&item.tokens.CacheReadTokens,
+		&item.tokens.CacheCreationTokens,
+		&item.tokens.UncachedInputTokens,
+		&item.tokens.TotalInputTokens,
+		&item.tokens.TotalTokens,
+		&failed,
+	); err != nil {
+		return analyticsEvent{}, err
+	}
+	finalizeAnalyticsEvent(&item, failed, prices, modelAliases)
+	return item, nil
+}
+
+func finalizeAnalyticsEvent(item *analyticsEvent, failed int, prices modelPriceIndex, modelAliases modelAliasIndex) {
+	if item == nil {
+		return
+	}
 	item.tokens.InputTokens = item.tokens.TotalInputTokens
 	item.event.NormalizedCached = item.tokens.CachedTokens
 	item.event.NormalizedRead = item.tokens.CacheReadTokens
@@ -259,7 +341,6 @@ func scanAnalyticsEvent(scanner analyticsRowScanner, prices modelPriceIndex, mod
 	} else if len(missing) > 0 {
 		item.missing = missing[0]
 	}
-	return item, nil
 }
 
 func addAnalyticsEventsPageCursor(where string, args []any, page AnalyticsEventsPage) (string, []any) {
@@ -373,177 +454,6 @@ func cleanedAnalyticsValues(values []string) []string {
 	return out
 }
 
-func buildAnalyticsSummary(events []analyticsEvent) *AnalyticsSummary {
-	agg := aggregateAnalyticsEvents(events)
-	summary := &AnalyticsSummary{
-		TotalCalls:          agg.calls,
-		SuccessCalls:        agg.success,
-		FailureCalls:        agg.failure,
-		InputTokens:         agg.tokens.InputTokens,
-		UncachedInputTokens: agg.tokens.UncachedInputTokens,
-		TotalInputTokens:    agg.tokens.TotalInputTokens,
-		OutputTokens:        agg.tokens.OutputTokens,
-		ReasoningTokens:     agg.tokens.ReasoningTokens,
-		CachedTokens:        agg.tokens.CachedTokens,
-		CacheReadTokens:     agg.tokens.CacheReadTokens,
-		CacheCreationTokens: agg.tokens.CacheCreationTokens,
-		TotalTokens:         agg.tokens.TotalTokens,
-		CacheHitRate:        CacheHitRate(agg.tokens),
-	}
-	if agg.hasCost {
-		summary.TotalCost = floatPtr(agg.cost)
-	}
-	return summary
-}
-
-func buildAnalyticsTimeline(events []analyticsEvent) []AnalyticsTimelinePoint {
-	byBucket := make(map[int64]analyticsAggregate)
-	for _, event := range events {
-		bucket := event.event.Timestamp.UTC().Truncate(time.Hour).UnixMilli()
-		agg := byBucket[bucket]
-		addAnalyticsEvent(&agg, event)
-		byBucket[bucket] = agg
-	}
-	keys := make([]int64, 0, len(byBucket))
-	for key := range byBucket {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	out := make([]AnalyticsTimelinePoint, 0, len(keys))
-	for _, key := range keys {
-		agg := byBucket[key]
-		point := AnalyticsTimelinePoint{
-			BucketMS:            key,
-			Calls:               agg.calls,
-			Success:             agg.success,
-			Failure:             agg.failure,
-			InputTokens:         agg.tokens.InputTokens,
-			UncachedInputTokens: agg.tokens.UncachedInputTokens,
-			TotalInputTokens:    agg.tokens.TotalInputTokens,
-			OutputTokens:        agg.tokens.OutputTokens,
-			ReasoningTokens:     agg.tokens.ReasoningTokens,
-			CachedTokens:        agg.tokens.CachedTokens,
-			CacheReadTokens:     agg.tokens.CacheReadTokens,
-			CacheCreationTokens: agg.tokens.CacheCreationTokens,
-			TotalTokens:         agg.tokens.TotalTokens,
-			CacheHitRate:        CacheHitRate(agg.tokens),
-		}
-		if agg.hasCost {
-			point.Cost = floatPtr(agg.cost)
-		}
-		out = append(out, point)
-	}
-	return out
-}
-
-func buildAnalyticsModelStats(events []analyticsEvent) []AnalyticsModelStat {
-	grouped := make(map[string]analyticsAggregate)
-	for _, event := range events {
-		key := event.event.Model
-		agg := grouped[key]
-		addAnalyticsEvent(&agg, event)
-		grouped[key] = agg
-	}
-	keys := sortedAnalyticsStatKeys(grouped)
-	out := make([]AnalyticsModelStat, 0, len(keys))
-	for _, key := range keys {
-		agg := grouped[key]
-		row := AnalyticsModelStat{
-			Model:               key,
-			Calls:               agg.calls,
-			SuccessCalls:        agg.success,
-			FailureCalls:        agg.failure,
-			InputTokens:         agg.tokens.InputTokens,
-			UncachedInputTokens: agg.tokens.UncachedInputTokens,
-			TotalInputTokens:    agg.tokens.TotalInputTokens,
-			OutputTokens:        agg.tokens.OutputTokens,
-			ReasoningTokens:     agg.tokens.ReasoningTokens,
-			CachedTokens:        agg.tokens.CachedTokens,
-			CacheReadTokens:     agg.tokens.CacheReadTokens,
-			CacheCreationTokens: agg.tokens.CacheCreationTokens,
-			TotalTokens:         agg.tokens.TotalTokens,
-			CacheHitRate:        CacheHitRate(agg.tokens),
-		}
-		if agg.hasCost {
-			row.Cost = floatPtr(agg.cost)
-		}
-		out = append(out, row)
-	}
-	return out
-}
-
-func buildAnalyticsAPIKeyStats(events []analyticsEvent) []AnalyticsAPIKeyStat {
-	type apiKeyMeta struct {
-		hash       string
-		provider   string
-		accountRef string
-		providers  map[string]struct{}
-	}
-	grouped := make(map[string]analyticsAggregate)
-	meta := make(map[string]apiKeyMeta)
-	for _, event := range events {
-		if !isAnalyticsAPIKeyCredentialEvent(event.event) {
-			continue
-		}
-		provider := strings.TrimSpace(event.event.Provider)
-		hash := analyticsAPIKeyCredentialHash(event.event)
-		key := hash
-		agg := grouped[key]
-		addAnalyticsEvent(&agg, event)
-		grouped[key] = agg
-		item := meta[key]
-		if item.hash == "" {
-			item = apiKeyMeta{
-				hash:       hash,
-				provider:   provider,
-				accountRef: strings.TrimSpace(event.event.AccountRef),
-				providers:  make(map[string]struct{}),
-			}
-		}
-		if item.provider == "" {
-			item.provider = provider
-		}
-		if item.accountRef == "" {
-			item.accountRef = strings.TrimSpace(event.event.AccountRef)
-		}
-		if provider != "" {
-			item.providers[provider] = struct{}{}
-		}
-		meta[key] = item
-	}
-	keys := sortedAnalyticsStatKeys(grouped)
-	out := make([]AnalyticsAPIKeyStat, 0, len(keys))
-	for _, key := range keys {
-		agg := grouped[key]
-		item := meta[key]
-		providers := sortedStringSet(item.providers)
-		row := AnalyticsAPIKeyStat{
-			Provider:            item.provider,
-			Providers:           providers,
-			APIKeyHash:          item.hash,
-			AccountRef:          item.accountRef,
-			Calls:               agg.calls,
-			SuccessCalls:        agg.success,
-			FailureCalls:        agg.failure,
-			InputTokens:         agg.tokens.InputTokens,
-			UncachedInputTokens: agg.tokens.UncachedInputTokens,
-			TotalInputTokens:    agg.tokens.TotalInputTokens,
-			OutputTokens:        agg.tokens.OutputTokens,
-			ReasoningTokens:     agg.tokens.ReasoningTokens,
-			CachedTokens:        agg.tokens.CachedTokens,
-			CacheReadTokens:     agg.tokens.CacheReadTokens,
-			CacheCreationTokens: agg.tokens.CacheCreationTokens,
-			TotalTokens:         agg.tokens.TotalTokens,
-			CacheHitRate:        CacheHitRate(agg.tokens),
-		}
-		if agg.hasCost {
-			row.Cost = floatPtr(agg.cost)
-		}
-		out = append(out, row)
-	}
-	return out
-}
-
 func isAnalyticsAPIKeyCredentialEvent(event Event) bool {
 	authType := normalizedAnalyticsAuthType(event.AuthType)
 	switch authType {
@@ -600,71 +510,6 @@ func normalizedAnalyticsAuthType(value string) string {
 	default:
 		return ""
 	}
-}
-
-func buildAnalyticsCredentialStats(events []analyticsEvent) []AnalyticsCredentialStat {
-	type credentialMeta struct {
-		provider     string
-		authIndex    string
-		authFileName string
-		accountRef   string
-	}
-	grouped := make(map[string]analyticsAggregate)
-	meta := make(map[string]credentialMeta)
-	for _, event := range events {
-		if isAnalyticsAPIKeyCredentialEvent(event.event) {
-			continue
-		}
-		if strings.TrimSpace(event.event.AuthIndex) == "" && strings.TrimSpace(event.event.AuthFileName) == "" {
-			continue
-		}
-		keyParts := []string{event.event.Provider, event.event.AuthIndex, event.event.AuthFileName, event.event.AccountRef}
-		key := strings.Join(keyParts, "\x00")
-		if key == "\x00\x00\x00" {
-			key = "unknown"
-		}
-		agg := grouped[key]
-		addAnalyticsEvent(&agg, event)
-		grouped[key] = agg
-		if _, ok := meta[key]; !ok {
-			meta[key] = credentialMeta{
-				provider:     event.event.Provider,
-				authIndex:    event.event.AuthIndex,
-				authFileName: event.event.AuthFileName,
-				accountRef:   event.event.AccountRef,
-			}
-		}
-	}
-	keys := sortedAnalyticsStatKeys(grouped)
-	out := make([]AnalyticsCredentialStat, 0, len(keys))
-	for _, key := range keys {
-		agg := grouped[key]
-		item := meta[key]
-		row := AnalyticsCredentialStat{
-			Provider:            item.provider,
-			AuthIndex:           item.authIndex,
-			AuthFileName:        item.authFileName,
-			AccountRef:          item.accountRef,
-			Calls:               agg.calls,
-			SuccessCalls:        agg.success,
-			FailureCalls:        agg.failure,
-			InputTokens:         agg.tokens.InputTokens,
-			UncachedInputTokens: agg.tokens.UncachedInputTokens,
-			TotalInputTokens:    agg.tokens.TotalInputTokens,
-			OutputTokens:        agg.tokens.OutputTokens,
-			ReasoningTokens:     agg.tokens.ReasoningTokens,
-			CachedTokens:        agg.tokens.CachedTokens,
-			CacheReadTokens:     agg.tokens.CacheReadTokens,
-			CacheCreationTokens: agg.tokens.CacheCreationTokens,
-			TotalTokens:         agg.tokens.TotalTokens,
-			CacheHitRate:        CacheHitRate(agg.tokens),
-		}
-		if agg.hasCost {
-			row.Cost = floatPtr(agg.cost)
-		}
-		out = append(out, row)
-	}
-	return out
 }
 
 func buildAnalyticsEventsPage(events []analyticsEvent, page AnalyticsEventsPage) *AnalyticsEventsResponse {
@@ -773,14 +618,6 @@ func normalizeAnalyticsEventsLimit(limit int) int {
 	return limit
 }
 
-func aggregateAnalyticsEvents(events []analyticsEvent) analyticsAggregate {
-	var agg analyticsAggregate
-	for _, event := range events {
-		addAnalyticsEvent(&agg, event)
-	}
-	return agg
-}
-
 func addAnalyticsEvent(agg *analyticsAggregate, event analyticsEvent) {
 	if agg == nil {
 		return
@@ -792,15 +629,9 @@ func addAnalyticsEvent(agg *analyticsAggregate, event analyticsEvent) {
 		agg.success++
 	}
 	agg.tokens = agg.tokens.Add(event.tokens)
-	if !agg.initCost {
-		agg.allCost = true
-		agg.initCost = true
-	}
 	if event.hasCost {
 		agg.cost += event.cost
 		agg.hasCost = true
-	} else {
-		agg.allCost = false
 	}
 }
 
