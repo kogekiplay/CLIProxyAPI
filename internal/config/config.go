@@ -174,6 +174,10 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+
+	// ThinkTagParsing controls how <think> tags in OpenAI-compatible responses are handled.
+	// Supported values: "auto" (default, parse tags when detected), "on" (always parse), "off" (never parse).
+	ThinkTagParsing string `yaml:"think-tag-parsing" json:"think-tag-parsing"`
 }
 
 // PluginsConfig holds dynamic plugin system settings.
@@ -828,6 +832,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.TransientErrorCooldownSeconds = 0
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.WebsocketAuth = true
+	cfg.ThinkTagParsing = "auto"
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
@@ -923,6 +928,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	// Validate think-tag-parsing value.
+	cfg.SanitizeThinkTagParsing()
+
 	// Return the populated configuration struct.
 	return &cfg, nil
 }
@@ -1005,6 +1013,21 @@ func payloadRawString(value any) ([]byte, bool) {
 		return typed, true
 	default:
 		return nil, false
+	}
+}
+
+// SanitizeThinkTagParsing validates and normalizes the think-tag-parsing config value.
+// Valid values are "auto", "on", "off". Invalid values are reset to "auto".
+func (cfg *Config) SanitizeThinkTagParsing() {
+	if cfg == nil {
+		return
+	}
+	cfg.ThinkTagParsing = strings.ToLower(strings.TrimSpace(cfg.ThinkTagParsing))
+	switch cfg.ThinkTagParsing {
+	case "auto", "on", "off":
+		// valid
+	default:
+		cfg.ThinkTagParsing = "auto"
 	}
 }
 

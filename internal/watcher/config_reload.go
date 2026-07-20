@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	"gopkg.in/yaml.v3"
@@ -120,6 +121,11 @@ func (w *Watcher) reloadConfig() bool {
 	util.SetLogLevel(newConfig)
 	if oldConfig != nil && oldConfig.Debug != newConfig.Debug {
 		log.Debugf("log level updated - debug mode changed from %t to %t", oldConfig.Debug, newConfig.Debug)
+	}
+
+	responses.SetThinkTagParsingMode(newConfig.ThinkTagParsing)
+	if oldConfig != nil && oldConfig.ThinkTagParsing != newConfig.ThinkTagParsing {
+		log.Debugf("think-tag-parsing updated from %q to %q", oldConfig.ThinkTagParsing, newConfig.ThinkTagParsing)
 	}
 
 	if oldConfig != nil {
