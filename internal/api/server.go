@@ -895,6 +895,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
 
+		mgmt.GET("/think-tag-parsing", s.mgmt.GetThinkTagParsing)
+		mgmt.PUT("/think-tag-parsing", s.mgmt.PutThinkTagParsing)
+		mgmt.PATCH("/think-tag-parsing", s.mgmt.PutThinkTagParsing)
+
 		mgmt.POST("/api-call", s.mgmt.APICall)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)

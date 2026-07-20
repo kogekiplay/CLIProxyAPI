@@ -20,6 +20,9 @@ pgstore/*
 gitstore/*
 objectstore/*
 
+# Docker build artifacts
+docker-build/
+
 # Static assets
 static/*
 

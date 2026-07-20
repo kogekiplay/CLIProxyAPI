@@ -959,3 +959,295 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_Restores
 		t.Fatalf("output input = %q, want pwd; response=%s", got, resp)
 	}
 }
+
+func TestExtractThinkContent(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		content   string
+		wantThink bool
+		wantR     string
+		wantM     string
+	}{
+		{
+			name:      "no tags",
+			content:   "hello world",
+			wantThink: false,
+			wantR:     "",
+			wantM:     "hello world",
+		},
+		{
+			name:      "simple think block",
+			content:   "<think>reasoning</think>answer",
+			wantThink: true,
+			wantR:     "reasoning",
+			wantM:     "answer",
+		},
+		{
+			name:      "think with newlines",
+			content:   "<think>\nstep1\nstep2\n</think>\nThe answer is 42.",
+			wantThink: true,
+			wantR:     "\nstep1\nstep2\n",
+			wantM:     "\nThe answer is 42.",
+		},
+		{
+			name:      "text before think",
+			content:   "prefix<think>reasoning</think>answer",
+			wantThink: true,
+			wantR:     "reasoning",
+			wantM:     "prefixanswer",
+		},
+		{
+			name:      "unclosed think tag",
+			content:   "<think>reasoning without end",
+			wantThink: true,
+			wantR:     "reasoning without end",
+			wantM:     "",
+		},
+		{
+			name:      "empty think block",
+			content:   "<think></think>answer",
+			wantThink: true,
+			wantR:     "",
+			wantM:     "answer",
+		},
+		{
+			name:      "multiple think blocks",
+			content:   "<think>first</think>middle<think>second</think>end",
+			wantThink: true,
+			wantR:     "firstsecond",
+			wantM:     "middleend",
+		},
+		{
+			name:      "empty content",
+			content:   "",
+			wantThink: false,
+			wantR:     "",
+			wantM:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, m, hasThink := extractThinkContent(tt.content)
+			if hasThink != tt.wantThink {
+				t.Fatalf("hasThink = %v, want %v", hasThink, tt.wantThink)
+			}
+			if r != tt.wantR {
+				t.Fatalf("reasoning = %q, want %q", r, tt.wantR)
+			}
+			if m != tt.wantM {
+				t.Fatalf("message = %q, want %q", m, tt.wantM)
+			}
+		})
+	}
+}
+
+func TestProcessThinkTagStream(t *testing.T) {
+	t.Parallel()
+
+	t.Run("simple think then message", func(t *testing.T) {
+		st := &thinkTagStreamState{}
+		chunks := []string{"<think>", "reason", "ing", "</think>", "answer"}
+		var gotR, gotM string
+		for _, c := range chunks {
+			rd, md := processThinkTagStream(st, c)
+			gotR += rd
+			gotM += md
+		}
+		if gotR != "reasoning" {
+			t.Fatalf("reasoning = %q, want %q", gotR, "reasoning")
+		}
+		if gotM != "answer" {
+			t.Fatalf("message = %q, want %q", gotM, "answer")
+		}
+	})
+
+	t.Run("tag split across chunks", func(t *testing.T) {
+		st := &thinkTagStreamState{}
+		chunks := []string{"<thi", "nk>", "content", "</thi", "nk>", "msg"}
+		var gotR, gotM string
+		for _, c := range chunks {
+			rd, md := processThinkTagStream(st, c)
+			gotR += rd
+			gotM += md
+		}
+		if gotR != "content" {
+			t.Fatalf("reasoning = %q, want %q", gotR, "content")
+		}
+		if gotM != "msg" {
+			t.Fatalf("message = %q, want %q", gotM, "msg")
+		}
+	})
+
+	t.Run("no think tags", func(t *testing.T) {
+		st := &thinkTagStreamState{}
+		rd, md := processThinkTagStream(st, "plain text")
+		if rd != "" {
+			t.Fatalf("reasoning = %q, want empty", rd)
+		}
+		if md != "plain text" {
+			t.Fatalf("message = %q, want %q", md, "plain text")
+		}
+	})
+
+	t.Run("text before think tag", func(t *testing.T) {
+		st := &thinkTagStreamState{}
+		chunks := []string{"prefix", "<think>", "reason", "</think>", "suffix"}
+		var gotR, gotM string
+		for _, c := range chunks {
+			rd, md := processThinkTagStream(st, c)
+			gotR += rd
+			gotM += md
+		}
+		if gotR != "reason" {
+			t.Fatalf("reasoning = %q, want %q", gotR, "reason")
+		}
+		if gotM != "prefixsuffix" {
+			t.Fatalf("message = %q, want %q", gotM, "prefixsuffix")
+		}
+	})
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_SplitsThinkTags(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"minimax-m3"}`)
+	raw := []byte(`{
+		"id":"resp_think_test",
+		"object":"chat.completion",
+		"created":1773896263,
+		"model":"minimax-m3",
+		"choices":[{
+			"index":0,
+			"message":{"role":"assistant","content":"<think>\nLet me think.\n</think>\nThe answer is 42."},
+			"finish_reason":"stop"
+		}],
+		"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}
+	}`)
+
+	resp := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "minimax-m3", request, request, raw, nil)
+	data := gjson.ParseBytes(resp)
+
+	outputs := data.Get("output").Array()
+	if len(outputs) < 2 {
+		t.Fatalf("expected at least 2 output items (reasoning + message), got %d; response=%s", len(outputs), resp)
+	}
+
+	var gotReasoning, gotMessage string
+	for _, item := range outputs {
+		switch item.Get("type").String() {
+		case "reasoning":
+			gotReasoning = item.Get("summary.0.text").String()
+		case "message":
+			gotMessage = item.Get("content.0.text").String()
+		}
+	}
+
+	if !strings.Contains(gotReasoning, "Let me think.") {
+		t.Fatalf("reasoning = %q, want it to contain 'Let me think.'", gotReasoning)
+	}
+	if !strings.Contains(gotMessage, "The answer is 42.") {
+		t.Fatalf("message = %q, want it to contain 'The answer is 42.'", gotMessage)
+	}
+	if strings.Contains(gotMessage, "<think>") {
+		t.Fatalf("message should not contain <think> tag: %q", gotMessage)
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_StreamingSplitsThinkTags(t *testing.T) {
+	SetThinkTagParsingMode("auto")
+	defer SetThinkTagParsingMode("auto")
+
+	request := []byte(`{"model":"minimax-m3"}`)
+	chunks := []string{
+		`data: {"id":"resp_stream_think","object":"chat.completion.chunk","created":1773896263,"model":"minimax-m3","choices":[{"index":0,"delta":{"role":"assistant","content":"<think>\n"},"finish_reason":null}]}`,
+		`data: {"id":"resp_stream_think","object":"chat.completion.chunk","created":1773896263,"model":"minimax-m3","choices":[{"index":0,"delta":{"content":"Let me think.\n"},"finish_reason":null}]}`,
+		`data: {"id":"resp_stream_think","object":"chat.completion.chunk","created":1773896263,"model":"minimax-m3","choices":[{"index":0,"delta":{"content":"</think>\n"},"finish_reason":null}]}`,
+		`data: {"id":"resp_stream_think","object":"chat.completion.chunk","created":1773896263,"model":"minimax-m3","choices":[{"index":0,"delta":{"content":"The answer is 42."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	var out [][]byte
+	for _, line := range chunks {
+		out = append(out, ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "minimax-m3", request, request, []byte(line), &param)...)
+	}
+
+	var gotReasoning, gotMessage string
+	for _, chunk := range out {
+		ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+		switch ev {
+		case "response.reasoning_summary_text.delta":
+			gotReasoning += data.Get("delta").String()
+		case "response.output_text.delta":
+			gotMessage += data.Get("delta").String()
+		}
+	}
+
+	if !strings.Contains(gotReasoning, "Let me think.") {
+		t.Fatalf("reasoning = %q, want it to contain 'Let me think.'", gotReasoning)
+	}
+	if !strings.Contains(gotMessage, "The answer is 42.") {
+		t.Fatalf("message = %q, want it to contain 'The answer is 42.'", gotMessage)
+	}
+	if strings.Contains(gotMessage, "<think>") {
+		t.Fatalf("message should not contain <think> tag: %q", gotMessage)
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_ThinkTagParsingOff(t *testing.T) {
+	SetThinkTagParsingMode("off")
+	defer SetThinkTagParsingMode("auto")
+
+	request := []byte(`{"model":"minimax-m3"}`)
+	raw := []byte(`{
+		"id":"resp_think_off",
+		"object":"chat.completion",
+		"created":1773896263,
+		"model":"minimax-m3",
+		"choices":[{
+			"index":0,
+			"message":{"role":"assistant","content":"<think>reasoning</think>answer"},
+			"finish_reason":"stop"
+		}],
+		"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}
+	}`)
+
+	resp := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "minimax-m3", request, request, raw, nil)
+	data := gjson.ParseBytes(resp)
+
+	outputs := data.Get("output").Array()
+	if len(outputs) != 1 {
+		t.Fatalf("expected 1 output item when think-tag-parsing=off, got %d; response=%s", len(outputs), resp)
+	}
+	if outputs[0].Get("type").String() != "message" {
+		t.Fatalf("output type = %q, want message", outputs[0].Get("type").String())
+	}
+	got := outputs[0].Get("content.0.text").String()
+	if got != "<think>reasoning</think>answer" {
+		t.Fatalf("content = %q, want raw content with think tags", got)
+	}
+}
+
+func TestShouldParseThinkTags(t *testing.T) {
+	tests := []struct {
+		mode string
+		want bool
+	}{
+		{"auto", true},
+		{"on", true},
+		{"off", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.mode, func(t *testing.T) {
+			SetThinkTagParsingMode(tt.mode)
+			defer SetThinkTagParsingMode("auto")
+			if got := shouldParseThinkTags(); got != tt.want {
+				t.Fatalf("shouldParseThinkTags() = %v, want %v for mode %q", got, tt.want, tt.mode)
+			}
+		})
+	}
+}

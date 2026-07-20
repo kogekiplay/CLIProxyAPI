@@ -59,6 +59,7 @@ type oaiToResponsesState struct {
 	TotalTokens      int64
 	ReasoningTokens  int64
 	UsageSeen        bool
+	ThinkTagStream   thinkTagStreamState
 }
 
 // responseIDCounter provides a process-wide unique counter for synthesized response identifiers.
@@ -210,6 +211,98 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 		completed, _ = sjson.SetBytes(completed, "response.usage.total_tokens", total)
 	}
 	return emitRespEvent("response.completed", completed)
+}
+
+const (
+	thinkOpenTag  = "<think>"
+	thinkCloseTag = "</think>"
+)
+
+// extractThinkContent parses <think>...</think> tags from content and separates
+// reasoning from message text. Returns (reasoning, message, hasThink).
+// Supports multiple think blocks; unclosed tags are treated as reasoning.
+func extractThinkContent(content string) (reasoning string, message string, hasThink bool) {
+	var reasoningBuf, messageBuf strings.Builder
+	s := content
+	for {
+		openIdx := strings.Index(s, thinkOpenTag)
+		if openIdx < 0 {
+			messageBuf.WriteString(s)
+			break
+		}
+		messageBuf.WriteString(s[:openIdx])
+		afterOpen := s[openIdx+len(thinkOpenTag):]
+		closeIdx := strings.Index(afterOpen, thinkCloseTag)
+		if closeIdx < 0 {
+			reasoningBuf.WriteString(afterOpen)
+			hasThink = true
+			break
+		}
+		reasoningBuf.WriteString(afterOpen[:closeIdx])
+		s = afterOpen[closeIdx+len(thinkCloseTag):]
+		hasThink = true
+	}
+	return reasoningBuf.String(), messageBuf.String(), hasThink
+}
+
+// thinkTagStreamState tracks the parsing state for streaming content with <think> tags.
+// InThink indicates whether we're currently inside a think block.
+// Pending holds partial tag content that might span chunk boundaries.
+type thinkTagStreamState struct {
+	InThink bool
+	Pending string
+}
+
+// processThinkTagStream processes a streaming chunk and separates reasoning from message deltas.
+// Handles tags that span multiple chunks by buffering partial tags in state.Pending.
+// Returns (reasoningDelta, messageDelta) for the current chunk.
+func processThinkTagStream(st *thinkTagStreamState, chunk string) (reasoningDelta, messageDelta string) {
+	s := st.Pending + chunk
+	st.Pending = ""
+	for {
+		if !st.InThink {
+			idx := strings.Index(s, thinkOpenTag)
+			if idx >= 0 {
+				messageDelta += s[:idx]
+				s = s[idx+len(thinkOpenTag):]
+				st.InThink = true
+				continue
+			}
+			partialLen := 0
+			for i := 1; i < len(thinkOpenTag) && i <= len(s); i++ {
+				if strings.HasPrefix(thinkOpenTag, s[len(s)-i:]) {
+					partialLen = i
+				}
+			}
+			if partialLen > 0 {
+				messageDelta += s[:len(s)-partialLen]
+				st.Pending = s[len(s)-partialLen:]
+			} else {
+				messageDelta += s
+			}
+			return
+		}
+		idx := strings.Index(s, thinkCloseTag)
+		if idx >= 0 {
+			reasoningDelta += s[:idx]
+			s = s[idx+len(thinkCloseTag):]
+			st.InThink = false
+			continue
+		}
+		partialLen := 0
+		for i := 1; i < len(thinkCloseTag) && i <= len(s); i++ {
+			if strings.HasPrefix(thinkCloseTag, s[len(s)-i:]) {
+				partialLen = i
+			}
+		}
+		if partialLen > 0 {
+			reasoningDelta += s[:len(s)-partialLen]
+			st.Pending = s[len(s)-partialLen:]
+		} else {
+			reasoningDelta += s
+		}
+		return
+	}
 }
 
 // ConvertOpenAIChatCompletionsResponseToOpenAIResponses converts OpenAI Chat Completions streaming chunks
@@ -392,6 +485,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.UsageSeen = false
 		st.CompletionPending = false
 		st.CompletedEmitted = false
+		st.ThinkTagStream = thinkTagStreamState{}
 		// response.created
 		created := []byte(`{"type":"response.created","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"in_progress","background":false,"error":null,"output":[]}}`)
 		created, _ = sjson.SetBytes(created, "sequence_number", nextSeq())
@@ -439,45 +533,79 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			delta := choice.Get("delta")
 			if delta.Exists() {
 				if c := delta.Get("content"); c.Exists() && c.String() != "" {
-					// Ensure the message item and its first content part are announced before any text deltas
-					if st.ReasoningID != "" {
-						stopReasoning(st.ReasoningBuf.String())
-						st.ReasoningBuf.Reset()
-					}
-					if _, exists := st.MsgOutputIx[idx]; !exists {
-						st.MsgOutputIx[idx] = allocOutputIndex()
-					}
-					msgOutputIndex := st.MsgOutputIx[idx]
-					if !st.MsgItemAdded[idx] {
-						item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`)
-						item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
-						item, _ = sjson.SetBytes(item, "output_index", msgOutputIndex)
-						item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
-						out = append(out, emitRespEvent("response.output_item.added", item))
-						st.MsgItemAdded[idx] = true
-					}
-					if !st.MsgContentAdded[idx] {
-						part := []byte(`{"type":"response.content_part.added","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
-						part, _ = sjson.SetBytes(part, "sequence_number", nextSeq())
-						part, _ = sjson.SetBytes(part, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
-						part, _ = sjson.SetBytes(part, "output_index", msgOutputIndex)
-						part, _ = sjson.SetBytes(part, "content_index", 0)
-						out = append(out, emitRespEvent("response.content_part.added", part))
-						st.MsgContentAdded[idx] = true
+					contentStr := c.String()
+					var reasoningDelta, messageDelta string
+
+					if shouldParseThinkTags() {
+						reasoningDelta, messageDelta = processThinkTagStream(&st.ThinkTagStream, contentStr)
+					} else {
+						// When think tag parsing is disabled, treat all content as message
+						messageDelta = contentStr
 					}
 
-					msg := []byte(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
-					msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
-					msg, _ = sjson.SetBytes(msg, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
-					msg, _ = sjson.SetBytes(msg, "output_index", msgOutputIndex)
-					msg, _ = sjson.SetBytes(msg, "content_index", 0)
-					msg, _ = sjson.SetBytes(msg, "delta", c.String())
-					out = append(out, emitRespEvent("response.output_text.delta", msg))
-					// aggregate for response.output
-					if st.MsgTextBuf[idx] == nil {
-						st.MsgTextBuf[idx] = &strings.Builder{}
+					if reasoningDelta != "" {
+						if st.ReasoningID == "" {
+							st.ReasoningID = fmt.Sprintf("rs_%s_%d", st.ResponseID, idx)
+							st.ReasoningIndex = allocOutputIndex()
+							item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"reasoning","status":"in_progress","summary":[]}}`)
+							item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
+							item, _ = sjson.SetBytes(item, "output_index", st.ReasoningIndex)
+							item, _ = sjson.SetBytes(item, "item.id", st.ReasoningID)
+							out = append(out, emitRespEvent("response.output_item.added", item))
+							part := []byte(`{"type":"response.reasoning_summary_part.added","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`)
+							part, _ = sjson.SetBytes(part, "sequence_number", nextSeq())
+							part, _ = sjson.SetBytes(part, "item_id", st.ReasoningID)
+							part, _ = sjson.SetBytes(part, "output_index", st.ReasoningIndex)
+							out = append(out, emitRespEvent("response.reasoning_summary_part.added", part))
+						}
+						st.ReasoningBuf.WriteString(reasoningDelta)
+						msg := []byte(`{"type":"response.reasoning_summary_text.delta","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"delta":""}`)
+						msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
+						msg, _ = sjson.SetBytes(msg, "item_id", st.ReasoningID)
+						msg, _ = sjson.SetBytes(msg, "output_index", st.ReasoningIndex)
+						msg, _ = sjson.SetBytes(msg, "delta", reasoningDelta)
+						out = append(out, emitRespEvent("response.reasoning_summary_text.delta", msg))
 					}
-					st.MsgTextBuf[idx].WriteString(c.String())
+
+					if messageDelta != "" {
+						if st.ReasoningID != "" {
+							stopReasoning(st.ReasoningBuf.String())
+							st.ReasoningBuf.Reset()
+						}
+						if _, exists := st.MsgOutputIx[idx]; !exists {
+							st.MsgOutputIx[idx] = allocOutputIndex()
+						}
+						msgOutputIndex := st.MsgOutputIx[idx]
+						if !st.MsgItemAdded[idx] {
+							item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`)
+							item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
+							item, _ = sjson.SetBytes(item, "output_index", msgOutputIndex)
+							item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+							out = append(out, emitRespEvent("response.output_item.added", item))
+							st.MsgItemAdded[idx] = true
+						}
+						if !st.MsgContentAdded[idx] {
+							part := []byte(`{"type":"response.content_part.added","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
+							part, _ = sjson.SetBytes(part, "sequence_number", nextSeq())
+							part, _ = sjson.SetBytes(part, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+							part, _ = sjson.SetBytes(part, "output_index", msgOutputIndex)
+							part, _ = sjson.SetBytes(part, "content_index", 0)
+							out = append(out, emitRespEvent("response.content_part.added", part))
+							st.MsgContentAdded[idx] = true
+						}
+
+						msg := []byte(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
+						msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
+						msg, _ = sjson.SetBytes(msg, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+						msg, _ = sjson.SetBytes(msg, "output_index", msgOutputIndex)
+						msg, _ = sjson.SetBytes(msg, "content_index", 0)
+						msg, _ = sjson.SetBytes(msg, "delta", messageDelta)
+						out = append(out, emitRespEvent("response.output_text.delta", msg))
+						if st.MsgTextBuf[idx] == nil {
+							st.MsgTextBuf[idx] = &strings.Builder{}
+						}
+						st.MsgTextBuf[idx].WriteString(messageDelta)
+					}
 				}
 
 				// reasoning_content (OpenAI reasoning incremental text)
@@ -801,7 +929,18 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	outputsWrapper := []byte(`{"arr":[]}`)
 	// Detect and capture reasoning content if present
 	rcText := gjson.GetBytes(rawJSON, "choices.0.message.reasoning_content").String()
+	// Also check for <think> tags in content as a fallback reasoning source (if enabled)
+	contentText := gjson.GetBytes(rawJSON, "choices.0.message.content").String()
+	var thinkReasoning string
+	var hasThinkTag bool
+	if shouldParseThinkTags() {
+		thinkReasoning, _, hasThinkTag = extractThinkContent(contentText)
+	}
 	includeReasoning := rcText != ""
+	if !includeReasoning && hasThinkTag && thinkReasoning != "" {
+		rcText = thinkReasoning
+		includeReasoning = true
+	}
 	if !includeReasoning && len(requestRawJSON) > 0 {
 		includeReasoning = gjson.GetBytes(requestRawJSON, "reasoning").Exists()
 	}
@@ -826,10 +965,29 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 			if msg.Exists() {
 				// Text message part
 				if c := msg.Get("content"); c.Exists() && c.String() != "" {
-					item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
-					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("msg_%s_%d", id, int(choice.Get("index").Int())))
-					item, _ = sjson.SetBytes(item, "content.0.text", c.String())
-					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+					contentStr := c.String()
+					// Check if content has <think> tags that need to be split (if enabled)
+					if shouldParseThinkTags() {
+						if _, _, hasThink := extractThinkContent(contentStr); hasThink {
+							_, messagePart, _ := extractThinkContent(contentStr)
+							if messagePart != "" {
+								item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
+								item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("msg_%s_%d", id, int(choice.Get("index").Int())))
+								item, _ = sjson.SetBytes(item, "content.0.text", messagePart)
+								outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+							}
+						} else {
+							item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
+							item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("msg_%s_%d", id, int(choice.Get("index").Int())))
+							item, _ = sjson.SetBytes(item, "content.0.text", contentStr)
+							outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+						}
+					} else {
+						item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
+						item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("msg_%s_%d", id, int(choice.Get("index").Int())))
+						item, _ = sjson.SetBytes(item, "content.0.text", contentStr)
+						outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
+					}
 				}
 
 				// Function/tool calls

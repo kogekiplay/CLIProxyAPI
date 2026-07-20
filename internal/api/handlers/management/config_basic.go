@@ -408,3 +408,29 @@ func (h *Handler) DeleteProxyURL(c *gin.Context) {
 	h.cfg.ProxyURL = ""
 	h.persist(c)
 }
+
+// ThinkTagParsing
+func (h *Handler) GetThinkTagParsing(c *gin.Context) {
+	c.JSON(200, gin.H{"think-tag-parsing": h.cfg.ThinkTagParsing})
+}
+func (h *Handler) PutThinkTagParsing(c *gin.Context) {
+	var body struct {
+		Value *string `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	normalized := normalizeThinkTagParsing(*body.Value)
+	h.cfg.ThinkTagParsing = normalized
+	h.persist(c)
+}
+
+func normalizeThinkTagParsing(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "auto", "on", "off":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "auto"
+	}
+}
