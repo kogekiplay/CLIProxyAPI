@@ -224,6 +224,15 @@ nonstream-keepalive-interval: 0
 # When false (default), only checks R/E prefix + base64 + first byte 0x12.
 # antigravity-signature-bypass-strict: false
 
+# Think tag parsing mode for OpenAI-compatible responses.
+# Controls how <think>...</think> tags in response content are handled when converting to Responses format.
+# "auto" (default): automatically detect and parse think tags, separating reasoning from message content.
+# "on": always parse think tags (same as auto but explicit).
+# "off": never parse think tags, keep them as raw content in the message.
+# This is useful for models like minimax-m3 that embed thinking in <think> tags rather than using
+# the standard reasoning_content field.
+think-tag-parsing: "auto"
+
 # Gemini API keys
 # gemini-api-key:
 #   - api-key: "AIzaSy...01"
