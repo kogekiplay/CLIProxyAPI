@@ -3,6 +3,7 @@ package management
 import (
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +21,16 @@ const (
 	publicUsageAnalyticsMaxFilter = 32
 	publicUsageAnalyticsMaxValue  = 256
 )
+
+type publicUsageAnalyticsAPIKeyOption struct {
+	APIKeyHash    string `json:"api_key_hash"`
+	APIKeyPreview string `json:"api_key_preview"`
+}
+
+type publicUsageAnalyticsResponse struct {
+	usageledger.AnalyticsResponse
+	ClientAPIKeyOptions []publicUsageAnalyticsAPIKeyOption `json:"client_api_key_options,omitempty"`
+}
 
 // GetPublicUsageViewer reports whether the redacted usage viewer is enabled.
 func (h *Handler) GetPublicUsageViewer(c *gin.Context) {
@@ -59,6 +70,44 @@ func (h *Handler) setPublicUsageViewerHeaders(c *gin.Context) {
 	c.Header("X-CPA-COMMIT", buildinfo.Commit)
 	c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
 	c.Header("X-CPA-SUPPORT-PLUGIN", pluginhost.SupportPluginHeaderValue())
+}
+
+func (h *Handler) publicUsageAnalyticsClientAPIKeyOptions() []publicUsageAnalyticsAPIKeyOption {
+	if h == nil {
+		return nil
+	}
+
+	h.mu.Lock()
+	var apiKeys []string
+	if h.cfg != nil {
+		apiKeys = append(apiKeys, h.cfg.APIKeys...)
+	}
+	h.mu.Unlock()
+
+	options := make([]publicUsageAnalyticsAPIKeyOption, 0, len(apiKeys))
+	seen := make(map[string]struct{}, len(apiKeys))
+	for _, apiKey := range apiKeys {
+		apiKey = strings.TrimSpace(apiKey)
+		if apiKey == "" {
+			continue
+		}
+		hash := usageledger.HashAPIKey(apiKey)
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		options = append(options, publicUsageAnalyticsAPIKeyOption{
+			APIKeyHash:    hash,
+			APIKeyPreview: redactedAPIKeyAccessLabel(apiKey),
+		})
+	}
+	sort.Slice(options, func(i, j int) bool {
+		if options[i].APIKeyPreview != options[j].APIKeyPreview {
+			return options[i].APIKeyPreview < options[j].APIKeyPreview
+		}
+		return options[i].APIKeyHash < options[j].APIKeyHash
+	})
+	return options
 }
 
 func normalizePublicUsageAnalyticsRequest(req *usageledger.AnalyticsRequest) {

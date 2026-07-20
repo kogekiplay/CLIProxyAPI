@@ -176,6 +176,77 @@ func TestPublicUsageAnalyticsRedactsSensitiveEventFields(t *testing.T) {
 	}
 }
 
+func TestPublicUsageAnalyticsReturnsMaskedClientAPIKeyFilterOptions(t *testing.T) {
+	store := openManagementUsageStore(t)
+	const apiKey = "sk-public-client-secret-1234"
+	apiKeyHash := usageledger.HashAPIKey(apiKey)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		SDKConfig:        config.SDKConfig{APIKeys: []string{apiKey, " " + apiKey + " "}},
+		RemoteManagement: config.RemoteManagement{PublicUsageViewer: true},
+	}, nil)
+	h.SetUsageLedger(store)
+	router := usageManagementTestRouter(h)
+
+	now := time.Now().UTC().Add(-time.Minute)
+	for i, hash := range []string{apiKeyHash, usageledger.HashAPIKey("another-client-key")} {
+		if _, err := store.InsertEvent(context.Background(), usageledger.Event{
+			RequestID:  "req-public-key-filter-" + string(rune('a'+i)),
+			Timestamp:  now.Add(time.Duration(i) * time.Second),
+			Provider:   "codex",
+			Model:      "gpt-5.6",
+			APIKeyHash: hash,
+			StatusCode: http.StatusOK,
+			Tokens:     usageledger.TokenUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		}); err != nil {
+			t.Fatalf("insert event %d: %v", i, err)
+		}
+	}
+
+	rec := performUsageManagementJSON(http.MethodPost, "/v0/public/usage-analytics", map[string]any{
+		"from_ms": now.Add(-time.Minute).UnixMilli(),
+		"to_ms":   now.Add(time.Minute).UnixMilli(),
+		"include": map[string]any{"summary": true},
+	}, router)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), apiKey) {
+		t.Fatal("public analytics response leaked a raw client API key")
+	}
+
+	var response publicUsageAnalyticsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.ClientAPIKeyOptions) != 1 {
+		t.Fatalf("client api key options = %#v, want one deduplicated option", response.ClientAPIKeyOptions)
+	}
+	option := response.ClientAPIKeyOptions[0]
+	if option.APIKeyHash != apiKeyHash {
+		t.Fatalf("api key hash = %q, want %q", option.APIKeyHash, apiKeyHash)
+	}
+	if option.APIKeyPreview == "" || option.APIKeyPreview == apiKey {
+		t.Fatalf("api key preview = %q, want a masked value", option.APIKeyPreview)
+	}
+
+	filtered := performUsageManagementJSON(http.MethodPost, "/v0/public/usage-analytics", map[string]any{
+		"from_ms": now.Add(-time.Minute).UnixMilli(),
+		"to_ms":   now.Add(time.Minute).UnixMilli(),
+		"filters": map[string]any{"api_key_hashes": []string{option.APIKeyHash}},
+		"include": map[string]any{"summary": true},
+	}, router)
+	if filtered.Code != http.StatusOK {
+		t.Fatalf("filtered status = %d, want 200; body=%s", filtered.Code, filtered.Body.String())
+	}
+	var filteredResponse publicUsageAnalyticsResponse
+	if err := json.Unmarshal(filtered.Body.Bytes(), &filteredResponse); err != nil {
+		t.Fatalf("decode filtered response: %v", err)
+	}
+	if filteredResponse.Summary == nil || filteredResponse.Summary.TotalCalls != 1 {
+		t.Fatalf("filtered summary = %#v, want one matching request", filteredResponse.Summary)
+	}
+}
+
 func TestRedactPublicUsageAnalyticsRemovesCredentialPathsAndFallbackLabels(t *testing.T) {
 	resp := usageledger.AnalyticsResponse{
 		CredentialStats: []usageledger.AnalyticsCredentialStat{{

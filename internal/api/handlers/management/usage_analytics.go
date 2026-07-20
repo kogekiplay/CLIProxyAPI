@@ -40,6 +40,11 @@ func (h *Handler) postUsageAnalytics(c *gin.Context, public bool) {
 	h.enrichUsageAnalyticsCredentialNames(&resp)
 	if public {
 		redactPublicUsageAnalytics(&resp)
+		c.JSON(http.StatusOK, publicUsageAnalyticsResponse{
+			AnalyticsResponse:   resp,
+			ClientAPIKeyOptions: h.publicUsageAnalyticsClientAPIKeyOptions(),
+		})
+		return
 	}
 	c.JSON(http.StatusOK, resp)
 }
