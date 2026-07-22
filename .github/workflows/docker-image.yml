@@ -12,6 +12,8 @@ env:
 jobs:
   docker_amd64:
     runs-on: ubuntu-latest
+    # Skip on forks that do not have DockerHub credentials configured.
+    if: github.repository == 'router-for-me/CLIProxyAPI' || (secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,6 +52,8 @@ jobs:
 
   docker_arm64:
     runs-on: ubuntu-24.04-arm
+    # Skip on forks that do not have DockerHub credentials configured.
+    if: github.repository == 'router-for-me/CLIProxyAPI' || (secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,6 +92,8 @@ jobs:
 
   docker_manifest:
     runs-on: ubuntu-latest
+    # Skip on forks that do not have DockerHub credentials configured.
+    if: github.repository == 'router-for-me/CLIProxyAPI' || (secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '')
     needs:
       - docker_amd64
       - docker_arm64
